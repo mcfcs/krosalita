@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
+import { difficultyColorClass } from '../utils/difficulty';
 
 const ManualEditor = ({
   manualGrid,
@@ -47,15 +48,6 @@ const ManualEditor = ({
   const [aiError, setAiError] = useState('');
   const [showAiClues, setShowAiClues] = useState(false);
 
-  const getDifficultyClass = (difficulty) => {
-    const d = (difficulty || '').toUpperCase();
-    if (d === 'EASY') return 'text-inkblue';
-    if (d === 'FAIR') return 'text-grass';
-    if (d === 'MODERATE') return 'text-gold';
-    if (d === 'HARD') return 'text-accent';
-    if (d === 'DIFFICULT') return 'text-accent-deep';
-    return 'text-ink-soft';
-  };
 
   const currentWord = getCurrentWord();
   const cluesContainerRef = useRef(null);
@@ -135,7 +127,7 @@ const ManualEditor = ({
               {difficultyInfo?.label && (
                 <span className="inline-flex items-center gap-2 border border-ink/20 bg-paper-sunken px-3 py-1.5 rounded-sm">
                   <span className="eyebrow">Difficulty</span>
-                  <span className={`font-display font-semibold ${getDifficultyClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
+                  <span className={`font-display font-semibold ${difficultyColorClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
                   {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
                 </span>
               )}
@@ -241,7 +233,7 @@ const ManualEditor = ({
                     <div className="flex flex-col gap-0.5 text-xs text-ink-soft pt-1">
                       <div>Date appeared: <span className="text-gold font-semibold font-mono">{dateInfo.formatted}</span></div>
                       {dateInfo.difficulty && (
-                        <div>Difficulty: <span className={`font-semibold ${getDifficultyClass(dateInfo.difficulty)}`}>{dateInfo.difficulty}</span></div>
+                        <div>Difficulty: <span className={`font-semibold ${difficultyColorClass(dateInfo.difficulty)}`}>{dateInfo.difficulty}</span></div>
                       )}
                     </div>
                   ) : null;
@@ -318,7 +310,7 @@ const ManualEditor = ({
               {dateInfo && (
                 <div className="text-[11px] text-ink-faint mt-0.5 space-y-0.5">
                   <div>Date: <span className="text-gold font-mono">{dateInfo.formatted}</span></div>
-                  {dateInfo.difficulty && <div>Difficulty: <span className={getDifficultyClass(dateInfo.difficulty)}>{dateInfo.difficulty}</span></div>}
+                  {dateInfo.difficulty && <div>Difficulty: <span className={difficultyColorClass(dateInfo.difficulty)}>{dateInfo.difficulty}</span></div>}
                 </div>
               )}
             </div>;
@@ -339,7 +331,7 @@ const ManualEditor = ({
               {dateInfo && (
                 <div className="text-[11px] text-ink-faint mt-0.5 space-y-0.5">
                   <div>Date: <span className="text-gold font-mono">{dateInfo.formatted}</span></div>
-                  {dateInfo.difficulty && <div>Difficulty: <span className={getDifficultyClass(dateInfo.difficulty)}>{dateInfo.difficulty}</span></div>}
+                  {dateInfo.difficulty && <div>Difficulty: <span className={difficultyColorClass(dateInfo.difficulty)}>{dateInfo.difficulty}</span></div>}
                 </div>
               )}
             </div>;
