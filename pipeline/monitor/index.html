@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Krosalita pipeline</title>
+<style>
+  :root{
+    --bg:#faf8f4; --panel:#fff; --line:#e2ddd3; --ink:#1c1a17; --soft:#6b645a; --faint:#9a9288;
+    --accent:#b4442a; --ok:#3f7d4f; --warn:#c08a1e; --blue:#2d5b9e;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#15130f; --panel:#1f1c17; --line:#332e26; --ink:#f0ebe2; --soft:#a89f92; --faint:#6e6659;
+           --accent:#e06844; --ok:#6fae7a; --warn:#e0b04a; --blue:#7aa5e8; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.45 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+       padding:12px;padding-bottom:40px;-webkit-text-size-adjust:100%}
+  h1{font-size:15px;margin:0;letter-spacing:.14em;text-transform:uppercase;font-weight:700}
+  .head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+  .dot.live{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent)}
+  .dot.paused{background:var(--warn)} .dot.err{background:var(--accent)}
+  .grow{flex:1}
+  button{font:inherit;font-weight:600;padding:7px 13px;border-radius:6px;cursor:pointer;
+         border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+  button:active{transform:translateY(1px)}
+  button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  button.danger{border-color:var(--accent);color:var(--accent)}
+  button[disabled]{opacity:.5;cursor:default}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:11px 12px;margin-bottom:10px}
+  .card h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--soft);
+           margin:0 0 9px;font-weight:700}
+  .stage{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:8px 0;border-bottom:1px solid var(--line)}
+  .stage:last-child{border-bottom:0}
+  .stage .nm{font-weight:650}
+  .stage .meta{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--soft);text-align:right;white-space:nowrap}
+  .bar{grid-column:1/-1;height:5px;background:color-mix(in srgb,var(--ink) 9%,transparent);
+       border-radius:3px;overflow:hidden;margin-top:5px}
+  .bar i{display:block;height:100%;background:var(--blue);transition:width .4s}
+  .bar i.done{background:var(--ok)} .bar i.err{background:var(--accent)}
+  .msg{grid-column:1/-1;font-size:11px;color:var(--faint);margin-top:3px;
+       overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .msg.error{color:var(--accent);white-space:normal}
+  .badge{font:10px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.08em;
+         padding:3px 6px;border-radius:4px;border:1px solid var(--line);color:var(--soft)}
+  .badge.running{color:var(--blue);border-color:var(--blue)}
+  .badge.done{color:var(--ok);border-color:var(--ok)}
+  .badge.error{color:var(--accent);border-color:var(--accent)}
+  .badge.paused{color:var(--warn);border-color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td,th{padding:4px 5px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font:10px/1 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)}
+  tr:last-child td{border-bottom:0}
+  .w{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:650;white-space:nowrap}
+  .sc{font-family:ui-monospace,monospace;text-align:right;white-space:nowrap;font-weight:650}
+  .clue{color:var(--soft)}
+  .scroll{max-height:44vh;overflow:auto;-webkit-overflow-scrolling:touch}
+  .wide{overflow-x:auto}
+  .hist{display:flex;align-items:flex-end;gap:2px;height:44px;margin-top:4px}
+  .hist div{flex:1;background:var(--blue);border-radius:2px 2px 0 0;min-height:1px}
+  .histx{display:flex;gap:2px;font:9px/1 ui-monospace,monospace;color:var(--faint);margin-top:3px}
+  .histx span{flex:1;text-align:center}
+  .spark{display:flex;align-items:flex-end;gap:1px;height:18px;margin-top:5px;grid-column:1/-1}
+  .spark div{flex:1;background:color-mix(in srgb,var(--blue) 55%,transparent);border-radius:1px;min-height:1px}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:12px}
+  .kv b{font-family:ui-monospace,monospace;font-weight:650}
+  .empty{color:var(--faint);font-size:12px;font-style:italic}
+</style>
+</head>
+<body>
+<div class="head">
+  <span class="dot" id="dot"></span>
+  <h1>Krosalita pipeline</h1>
+  <span class="grow"></span>
+  <button id="pause">Pause</button>
+  <button id="stop" class="danger">Stop</button>
+</div>
+
+<div class="card"><h2>Stages</h2><div id="stages"><div class="empty">loading&hellip;</div></div></div>
+<div class="card" id="valCard" hidden><h2>Validation</h2><div id="val"></div></div>
+<div class="card" id="labCard" hidden><h2>Labels <span id="labN" class="badge"></span></h2>
+  <div id="histWrap"></div>
+  <div class="scroll wide"><table><thead><tr><th>Answer</th><th>Clue</th><th>Diff</th></tr></thead>
+  <tbody id="labels"></tbody></table></div>
+</div>
+<div class="card" id="dropCard" hidden><h2>Clue filter drops</h2>
+  <div class="wide"><table><thead><tr><th>Rule</th><th>N</th><th>Example</th></tr></thead>
+  <tbody id="drops"></tbody></table></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const nf=n=>(n==null?'—':Number(n).toLocaleString());
+function dur(s){
+  if(s==null||!isFinite(s))return '—';
+  s=Math.max(0,Math.round(s));
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+String(s%60).padStart(2,'0')+'s';
+  return Math.floor(s/3600)+'h '+String(Math.floor(s%3600/60)).padStart(2,'0')+'m';
+}
+function rateStr(r){
+  if(r==null)return '';
+  if(r>=1)return r.toFixed(1)+'/s';
+  if(r*60>=1)return (r*60).toFixed(1)+'/min';
+  return (r*3600).toFixed(0)+'/hr';
+}
+
+function renderStages(st){
+  if(!st.length){$('stages').innerHTML='<div class="empty">no stages yet</div>';return;}
+  $('stages').innerHTML=st.map(s=>{
+    const pct=s.total>0?Math.min(100,100*s.done/s.total):(s.status==='done'?100:0);
+    const cls=s.status==='done'?'done':s.status==='error'?'err':'';
+    const bits=[];
+    if(s.total>0)bits.push(nf(s.done)+' / '+nf(s.total));
+    else if(s.done)bits.push(nf(s.done));
+    if(s.rate)bits.push(rateStr(s.rate));
+    if(s.eta_s)bits.push('ETA '+dur(s.eta_s));
+    else if(s.status==='done'&&s.elapsed_s)bits.push(dur(s.elapsed_s));
+    let spark='';
+    if(s.spark&&s.spark.length>2){
+      const mx=Math.max.apply(null,s.spark)||1;
+      spark='<div class="spark">'+s.spark.map(v=>'<div style="height:'+Math.max(1,100*v/mx)+'%"></div>').join('')+'</div>';
+    }
+    return '<div class="stage">'+
+      '<div class="nm">'+esc(s.label)+' <span class="badge '+s.status+'">'+esc(s.status)+'</span></div>'+
+      '<div class="meta">'+esc(bits.join(' · '))+'</div>'+
+      '<div class="bar"><i class="'+cls+'" style="width:'+pct+'%"></i></div>'+
+      spark+
+      (s.error?'<div class="msg error">'+esc(s.error)+'</div>'
+             :s.message?'<div class="msg">'+esc(s.message)+'</div>':'')+
+    '</div>';
+  }).join('');
+}
+
+function renderLabels(d){
+  const show=d.label_count>0;
+  $('labCard').hidden=!show;
+  if(!show)return;
+  const b=d.batches||{};
+  $('labN').textContent=nf(d.label_count)+' labelled'+
+    (b.n?' · '+nf(b.n)+' batches':'')+(b.bad?' · '+nf(b.bad)+' failed':'')+
+    (b.avg_s?' · '+b.avg_s+'s avg':'');
+  const h=d.label_hist||[];
+  if(h.length){
+    const mx=Math.max.apply(null,h.map(x=>x.n))||1;
+    const by={};h.forEach(x=>by[x.bucket]=x.n);
+    const buckets=[];for(let i=0;i<=90;i+=10)buckets.push(i);
+    $('histWrap').innerHTML='<div class="hist">'+buckets.map(bk=>
+      '<div style="height:'+Math.max(1,100*(by[bk]||0)/mx)+'%" title="'+bk+'-'+(bk+9)+': '+(by[bk]||0)+'"></div>').join('')+
+      '</div><div class="histx">'+buckets.map(bk=>'<span>'+bk+'</span>').join('')+'</div>';
+  }
+  $('labels').innerHTML=(d.labels||[]).map(l=>
+    '<tr><td class="w">'+esc(l.word)+'</td><td class="clue">'+esc(l.clue)+'</td>'+
+    '<td class="sc">'+Math.round(l.score)+'</td></tr>').join('');
+}
+
+function renderDrops(d){
+  const rows=d.filter_drops||[];
+  $('dropCard').hidden=!rows.length;
+  $('drops').innerHTML=rows.map(r=>
+    '<tr><td class="w">'+esc(r.rule)+'</td><td class="sc">'+nf(r.n)+'</td>'+
+    '<td class="clue">'+esc(r.sample||'')+'</td></tr>').join('');
+}
+
+function renderVal(d){
+  const v=d.validation||{},ks=Object.keys(v);
+  $('valCard').hidden=!ks.length;
+  $('val').innerHTML=ks.map(k=>{
+    const val=v[k];
+    const s=(typeof val==='number')?(Number.isInteger(val)?val:val.toFixed(4)):
+            (typeof val==='object'?JSON.stringify(val):String(val));
+    return '<div class="kv"><span>'+esc(k)+'</span><b>'+esc(s)+'</b></div>';
+  }).join('');
+}
+
+let failures=0;
+async function tick(){
+  try{
+    const d=await (await fetch('/status',{cache:'no-store'})).json();
+    failures=0;
+    renderStages(d.stages||[]);renderLabels(d);renderDrops(d);renderVal(d);
+    const c=d.control||{};
+    const running=(d.stages||[]).some(s=>s.status==='running');
+    const errored=(d.stages||[]).some(s=>s.status==='error');
+    $('dot').className='dot '+(errored||c.stop?'err':c.pause?'paused':running?'live':'');
+    $('pause').textContent=c.pause?'Resume':'Pause';
+    $('pause').className=c.pause?'on':'';
+    $('stop').disabled=!!c.stop;
+    $('stop').textContent=c.stop?'Stopping…':'Stop';
+    const cur=(d.stages||[]).find(s=>s.status==='running');
+    document.title=cur?('▶ '+cur.label+' — pipeline'):'Krosalita pipeline';
+  }catch(e){
+    if(++failures>2)$('dot').className='dot err';
+  }
+}
+async function ctl(body){
+  await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+                          body:JSON.stringify(body)});
+  tick();
+}
+$('pause').onclick=()=>ctl({pause:$('pause').textContent==='Pause'});
+$('stop').onclick =()=>{
+  if(confirm('Stop the pipeline? Progress is checkpointed, so --resume picks up where it left off.'))
+    ctl({stop:true});
+};
+tick();setInterval(tick,2000);
+</script>
+</body>
+</html>

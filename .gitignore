@@ -40,3 +40,10 @@ venv
 
 .vercel
 .env*
+
+# Pipeline: live SQLite state (held open by the monitor) and bulk intermediates
+pipeline/state.sqlite*
+pipeline/out/
+pipeline/__pycache__/
+**/__pycache__/
+scripts/generate-e2e.png
