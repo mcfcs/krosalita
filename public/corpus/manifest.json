@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "file": "corpus.bin",
+  "bytes": 5591092,
+  "totalWords": 62866,
+  "totalClues": 209427,
+  "difficultySource": "provisional-weekday",
+  "qualitySource": "corpus+english",
+  "maxCluesPerWord": 5,
+  "byLength": {
+    "3": 2476,
+    "4": 6302,
+    "5": 10584,
+    "6": 12642,
+    "7": 11994,
+    "8": 8031,
+    "9": 4616,
+    "10": 2729,
+    "11": 1268,
+    "12": 407,
+    "13": 349,
+    "14": 196,
+    "15": 1272
+  },
+  "createdAt": 1789145767
+}

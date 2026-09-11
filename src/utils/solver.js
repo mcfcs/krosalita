@@ -1,454 +1,1168 @@
-// Crossword solver — Wave-Function-Collapse with AC-3 style constraint
-// propagation and backtracking. Pure and synchronous (no React, no yields):
-// it is meant to run inside a Web Worker so it can execute flat-out while the
-// UI stays responsive.
+// Crossword fill — bitset CSP with MRV/dom-wdeg ordering, incremental AC-3,
+// trail-based undo, conflict-directed backjumping and Luby restarts.
 //
-// Optimizations over the original inline version:
-//  - Cell possibilities are 26-bit integer masks instead of Set<char>.
-//    Intersection is a single `&`, membership a single `&`, size a popcount,
-//    and a checkpoint of all cell masks is one Int32Array.slice() (no per-cell
-//    Set cloning in the hot path).
-//  - A word -> dictionary-item Map replaces the per-placement linear scan.
+// Replaces the wave-function-collapse solver, which hung for the full 120s budget on
+// hard layouts. Three compounding causes, all addressed here:
 //
-// Returns the same shape the app consumed before:
-//   { grid, placements:[{slot,word,clue}], complete, attempts, requiredPlaced, failedWord }
+//   1. Candidate sets were Sets of strings rebuilt per slot per attempt from RAW CSV
+//      ROWS (156,013 entries for 6,301 distinct 4-letter words) — ~33.5M string ops of
+//      setup per attempt for the Classic layout, before placing anything. Now: domains
+//      are bitset windows in one arena, and a restart is a 77 KB TypedArray.set().
+//   2. saveState() deep-cloned all ~78 candidate Sets on every decision AND every
+//      backtrack. Now: a trail records only the bits actually cleared.
+//   3. Chronological backtracking enumerated all ~10,000 candidates of the deepest slot
+//      when the real conflict was 10 levels up — literally "tries all the other words".
+//      Now: conflict-directed backjumping goes straight to the culprit.
+//
+// Plus: a preflight pass that fails in milliseconds with an actionable reason instead of
+// spinning (a hand-drawn 2-letter slot was a guaranteed 120s hang — the dictionary has
+// zero 2-letter words), structural dedup so an answer can never repeat, and a seeded
+// PRNG so daily puzzles are reproducible and failures replayable.
 
 import { findSlots } from './crosswordUtils.js';
+import { mulberry32, randInt } from './rng.js';
+import {
+  popcount32, ctz32, popcountRange, anyAnd,
+  andCountCapped, nextSetBit, firstNonZeroWord, lastNonZeroWord,
+} from './bitset.js';
+import { addAdHocWord, resetAdHoc } from './wordIndex.js';
 
+const MAXLEN = 15;
 const A_CODE = 65;
-const FULL = (1 << 26) - 1;
-const bitOf = (ch) => 1 << (ch.charCodeAt(0) - A_CODE);
-const popcount = (n) => {
-  n = n - ((n >> 1) & 0x55555555);
-  n = (n & 0x33333333) + ((n >> 2) & 0x33333333);
-  n = (n + (n >> 4)) & 0x0f0f0f0f;
-  return (n * 0x01010101) >> 24;
-};
 
+// Tunables. Defaults chosen so a 15x15 fills in well under a second; see
+// scripts/bench-solver.mjs for the measurements behind them.
+const K_TOP = 48;              // best-by-quality candidates considered per node
+const K_RAND = 16;             // extra random candidates, for variety across seeds
+const LOOKAHEAD_WORDS = 32;    // u32 words scanned when sizing a crossing domain
+const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted work
+const REVISE_MAX_LETTERS = 12; // skip arcs that barely prune (sound: pruning is optional)
+const LUBY_BASE = 200;         // backtracks per restart unit
+const ALPHA_QUALITY = 2.5;     // weight of static word quality in value ordering
+const DEFAULT_BETA_DIFF = 3.0; // weight of difficulty-target matching
+
+const ABORT = Symbol('abort');
+
+function luby(i) {
+  // 1,1,2,1,1,2,4,1,1,2,1,1,2,4,8,...
+  let k = 1;
+  while (k <= i + 1) {
+    if (k === i + 1) return (k >>> 1) || 1;
+    k <<= 1;
+  }
+  k >>>= 1;
+  return luby(i + 1 - k);
+}
+
+function err(code, message, detail) {
+  return { code, message, detail: detail || null };
+}
+
+const dirLabel = (d) => (d === 'across' ? 'Across' : 'Down');
+
+/**
+ * @param {Object} opts
+ * @param {Object} opts.index        CorpusIndex from wordIndex.js
+ * @param {string[][]|string[]} opts.layout
+ * @param {number} [opts.seed]
+ * @param {number} [opts.difficultyTarget] 0..1, or null to ignore difficulty
+ */
 export function solveCrossword(opts) {
   const {
-    wordList,
+    index,
     layout,
     presetGrid = null,
     requiredWordsList = [],
     requiredModeArg = 'anchor',
-    presetClues = {},
-    timeoutMs = 120000,
+    timeoutMs = 10000,
+    seed = 1,
+    difficultyTarget = null,
+    difficultyWeight = DEFAULT_BETA_DIFF,
     onProgress = () => {},
     onBest = () => {},
     now = () => Date.now(),
     isCancelled = () => false,
   } = opts;
 
-  const slots = findSlots(layout);
-  const rows = layout.length;
-  const cols = layout[0].length;
-  const requiredSet = new Set(requiredWordsList.map((w) => w.toUpperCase()));
-  const requiredModeLocal = requiredModeArg || 'anchor';
+  const t0 = now();
+  const rng = mulberry32(seed >>> 0);
+  const stats = {
+    nodes: 0, backtracks: 0, backjumps: 0, restarts: 0,
+    propagations: 0, seed: seed >>> 0, ms: 0,
+  };
 
-  if (slots.length === 0) {
-    return { grid: null, placements: [], attempts: 0, complete: false, requiredPlaced: 0, failedWord: null };
+  // ---- layout / topology -------------------------------------------------
+  const rowsArr = (layout || []).map((r) => (Array.isArray(r) ? r : String(r).split('')));
+  const rows = rowsArr.length;
+  const cols = rows ? rowsArr[0].length : 0;
+
+  const fail = (e) => ({
+    grid: null, placements: [], complete: false, attempts: 0, requiredPlaced: 0,
+    failedWord: null, failedSlot: null, difficultyScore: null,
+    error: e, stats: { ...stats, ms: now() - t0 },
+  });
+
+  if (!rows || !cols) return fail(err('BAD_LAYOUT', 'The layout is empty.'));
+  for (let r = 0; r < rows; r++) {
+    if (rowsArr[r].length !== cols) {
+      return fail(err('BAD_LAYOUT',
+        `Layout row ${r + 1} has ${rowsArr[r].length} cells, expected ${cols}.`));
+    }
   }
 
-  // word -> first dictionary item (for clue lookup)
-  const wordItemMap = new Map();
-  for (const it of wordList) if (!wordItemMap.has(it.word)) wordItemMap.set(it.word, it);
-
-  // candidate words bucketed by length
-  const wordsByLength = {};
-  for (const item of wordList) {
-    const len = item.word.length;
-    (wordsByLength[len] || (wordsByLength[len] = [])).push(item);
+  const slots = findSlots(rowsArr);
+  const S = slots.length;
+  if (S === 0) {
+    return fail(err('NO_SLOTS',
+      'This layout has no word slots — every run of white cells is a single square.'));
   }
 
+  const CELLS = rows * cols;
   const cellIndex = (r, c) => r * cols + c;
 
-  // per slot: the cells it covers (with flat index + position)
-  const slotCells = new Map();
-  for (const slot of slots) {
-    const cells = [];
-    for (let i = 0; i < slot.length; i++) {
-      const r = slot.direction === 'across' ? slot.row : slot.row + i;
-      const c = slot.direction === 'across' ? slot.col + i : slot.col;
-      cells.push({ r, c, index: i, cell: cellIndex(r, c) });
+  const slotLen = new Int32Array(S);
+  const slotCellOf = new Int32Array(S * MAXLEN).fill(-1);
+  const crossSlot = new Int32Array(S * MAXLEN).fill(-1);
+  const crossPos = new Int32Array(S * MAXLEN).fill(-1);
+  // At most two slots cross any cell (one across, one down).
+  const cellSlot = new Int32Array(CELLS * 2).fill(-1);
+  const cellSlotPos = new Int32Array(CELLS * 2).fill(-1);
+
+  for (let s = 0; s < S; s++) {
+    const sl = slots[s];
+    slotLen[s] = sl.length;
+    for (let i = 0; i < sl.length; i++) {
+      const r = sl.direction === 'across' ? sl.row : sl.row + i;
+      const c = sl.direction === 'across' ? sl.col + i : sl.col;
+      const ci = cellIndex(r, c);
+      slotCellOf[s * MAXLEN + i] = ci;
+      const k = cellSlot[ci * 2] === -1 ? 0 : 1;
+      cellSlot[ci * 2 + k] = s;
+      cellSlotPos[ci * 2 + k] = i;
     }
-    slotCells.set(slot.id, cells);
+  }
+  for (let s = 0; s < S; s++) {
+    for (let i = 0; i < slotLen[s]; i++) {
+      const ci = slotCellOf[s * MAXLEN + i];
+      const a = cellSlot[ci * 2];
+      const b = cellSlot[ci * 2 + 1];
+      const other = a === s ? b : a;
+      crossSlot[s * MAXLEN + i] = other;
+      if (other >= 0) {
+        crossPos[s * MAXLEN + i] = cellSlot[ci * 2] === s ? cellSlotPos[ci * 2 + 1]
+                                                          : cellSlotPos[ci * 2];
+      }
+    }
   }
 
-  // per cell: which slots cross it (and at what position)
-  const cellToSlots = new Map();
-  for (const slot of slots) {
-    for (const cell of slotCells.get(slot.id)) {
-      let arr = cellToSlots.get(cell.cell);
-      if (!arr) cellToSlots.set(cell.cell, (arr = []));
-      arr.push({ slot, index: cell.index });
+  const clueNumbers = numberSlots(slots);
+  const slotName = (s) => `${clueNumbers[s]}-${dirLabel(slots[s].direction)}`;
+
+  // ---- ad-hoc words (required + fully-preset, off-dictionary) ------------
+  const requiredWords = [...new Set(requiredWordsList.map((w) => String(w).toUpperCase().trim()))]
+    .filter(Boolean);
+  const requiredMode = requiredModeArg || 'anchor';
+
+  resetAdHoc(index);
+  const cleanup = () => resetAdHoc(index);
+
+  for (const w of requiredWords) {
+    if (!/^[A-Z]+$/.test(w) || w.length < 3 || w.length > MAXLEN) {
+      cleanup();
+      return fail(err('REQUIRED_WORD_UNKNOWN',
+        `"${w}" can't be placed — required words must be 3–15 letters, A–Z only.`, { word: w }));
+    }
+    if (!index.byLen[w.length] || index.lookup[w.length]?.get(w) === undefined) {
+      if (addAdHocWord(index, w) < 0) {
+        cleanup();
+        return fail(err('TOO_MANY_CUSTOM_WORDS',
+          `At most 32 custom ${w.length}-letter words are supported per puzzle.`, { word: w }));
+      }
     }
   }
 
+  // Preset letters, and fully-preset slot strings that aren't in the dictionary.
   const presetCharAt = (r, c) => {
-    if (presetGrid && presetGrid[r] && presetGrid[r][c] && presetGrid[r][c] !== '#') {
-      return presetGrid[r][c].toUpperCase();
+    const v = presetGrid && presetGrid[r] && presetGrid[r][c];
+    return v && v !== '#' ? String(v).toUpperCase() : null;
+  };
+  const presetWordOfSlot = [];
+  if (presetGrid) {
+    for (let s = 0; s < S; s++) {
+      let str = '';
+      for (let i = 0; i < slotLen[s]; i++) {
+        const ci = slotCellOf[s * MAXLEN + i];
+        const ch = presetCharAt((ci / cols) | 0, ci % cols);
+        if (!ch || !/^[A-Z]$/.test(ch)) { str = ''; break; }
+        str += ch;
+      }
+      presetWordOfSlot[s] = str || null;
+      if (str && index.lookup[str.length]?.get(str) === undefined) {
+        if (addAdHocWord(index, str) < 0) {
+          cleanup();
+          return fail(err('TOO_MANY_CUSTOM_WORDS',
+            `At most 32 custom ${str.length}-letter words are supported per puzzle.`,
+            { word: str }));
+        }
+      }
     }
-    return null;
+    // Two identical fully-preset entries can never both stand — answers must be distinct.
+    const seen = new Map();
+    for (let s = 0; s < S; s++) {
+      const w = presetWordOfSlot[s];
+      if (!w) continue;
+      if (seen.has(w)) {
+        cleanup();
+        return fail(err('DUPLICATE_PRESET_WORD',
+          `"${w}" appears twice in the grid (${slotName(seen.get(w))} and ${slotName(s)}).`,
+          { word: w }));
+      }
+      seen.set(w, s);
+    }
+  }
+
+  // ---- preflight: length availability ------------------------------------
+  const slotsOfLength = new Map();
+  for (let s = 0; s < S; s++) {
+    slotsOfLength.set(slotLen[s], (slotsOfLength.get(slotLen[s]) || 0) + 1);
+  }
+  for (const [len, n] of slotsOfLength) {
+    const li = index.byLen[len];
+    const have = li ? li.count + li.extra : 0;
+    if (have === 0) {
+      cleanup();
+      return fail(err('NO_WORDS_FOR_LENGTH',
+        `This layout needs ${n} ${len}-letter ${n === 1 ? 'word' : 'words'}, but the word list has none.`,
+        { len, need: n, have }));
+    }
+    if (have < n) {
+      cleanup();
+      return fail(err('INSUFFICIENT_WORDS_FOR_LENGTH',
+        `This layout needs ${n} different ${len}-letter words but only ${have} ${have === 1 ? 'is' : 'are'} available — answers can't repeat.`,
+        { len, need: n, have }));
+    }
+  }
+  const reqByLen = new Map();
+  for (const w of requiredWords) reqByLen.set(w.length, (reqByLen.get(w.length) || 0) + 1);
+  for (const [len, k] of reqByLen) {
+    const n = slotsOfLength.get(len) || 0;
+    if (n === 0) {
+      const w = requiredWords.find((x) => x.length === len);
+      cleanup();
+      return fail(err('REQUIRED_WORD_NO_SLOT',
+        `"${w}" is ${len} letters, but this layout has no ${len}-letter slot.`, { word: w, len }));
+    }
+    if (k > n) {
+      cleanup();
+      return fail(err('REQUIRED_WORDS_OVERSUBSCRIBED',
+        `${k} required words are ${len} letters, but there ${n === 1 ? 'is' : 'are'} only ${n} ${len}-letter ${n === 1 ? 'slot' : 'slots'}.`,
+        { len, need: k, have: n }));
+    }
+  }
+  if (timeoutMs <= 0) {
+    cleanup();
+    return fail(err('NO_TIME', 'Out of time budget before the search could start.'));
+  }
+
+  // ---- domain arena ------------------------------------------------------
+  const domOff = new Int32Array(S);
+  const domW = new Int32Array(S);
+  let arenaWords = 0;
+  for (let s = 0; s < S; s++) {
+    domW[s] = index.byLen[slotLen[s]].W;
+    domOff[s] = arenaWords;
+    arenaWords += domW[s];
+  }
+  const domArena = new Uint32Array(arenaWords);
+  const dom0 = new Uint32Array(arenaWords);
+  const domCount = new Int32Array(S);
+  const domCount0 = new Int32Array(S);
+  const domFirst = new Int32Array(S);
+  const domLast = new Int32Array(S);
+  const domVersion = new Int32Array(S);
+  let tick = 1;
+
+  const cellMask = new Int32Array(CELLS);
+  const cellMask0 = new Int32Array(CELLS);
+  const cellLevel = new Int32Array(CELLS);
+  const cellWeight = new Float32Array(CELLS).fill(1);
+
+  const posCache = new Int32Array(S * MAXLEN);
+  const posStamp = new Int32Array(S * MAXLEN).fill(-1);
+
+  const assign = new Int32Array(S).fill(-1);
+  const assignOrder = new Int32Array(S + 2).fill(-1);
+  const assignVal = new Int32Array(S + 2).fill(-1);
+  const countStamp = new Int32Array(S).fill(-1);
+
+  const CW = Math.ceil(S / 32) || 1;
+  const conflict = new Uint32Array(S * CW);
+
+  // Trail: three flat arrays, grown by doubling.
+  let trailW = new Int32Array(1 << 16); let twTop = 0;
+  let trailC = new Int32Array(1 << 12); let tcTop = 0;
+  let trailM = new Int32Array(1 << 14); let tmTop = 0;
+  const markW = new Int32Array(S + 2);
+  const markC = new Int32Array(S + 2);
+  const markM = new Int32Array(S + 2);
+
+  const grow = (a, need) => {
+    if (need <= a.length) return a;
+    let n = a.length;
+    while (n < need) n <<= 1;
+    const b = new Int32Array(n);
+    b.set(a);
+    return b;
   };
 
-  const shuffleArray = (arr) => {
-    const a = [...arr];
-    for (let i = a.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
-    }
-    return a;
-  };
+  // Scratch, reused; never allocated in the hot path.
+  const maxW = Math.max(...Array.from(domW));
+  const scratch = new Uint32Array(maxW);
+  const candBuf = new Int32Array(K_TOP + K_RAND);
+  const valBuf = new Int32Array(K_TOP + K_RAND);
+  const valQ = new Float64Array(K_TOP + K_RAND);
+  const queue = new Int32Array(CELLS * 4);
+  const inQueue = new Uint8Array(CELLS);
 
-  const buildEmptyGrid = () => {
+  let level = 0;
+  let placedCount = 0;
+  let placedDiffSum = 0;
+  const valueStack = new Array(S + 2);
+  const valueStackN = new Int32Array(S + 2);
+  const valueStackI = new Int32Array(S + 2);
+
+  // ---- clock -------------------------------------------------------------
+  function checkClock() {
+    if (isCancelled() || now() - t0 > timeoutMs) throw ABORT;
+  }
+
+  // ---- domain helpers ----------------------------------------------------
+  function recomputeWindow(s) {
+    const off = domOff[s];
+    const f = firstNonZeroWord(domArena, off, 0, domW[s] - 1);
+    if (f < 0) { domFirst[s] = 0; domLast[s] = -1; return; }
+    domFirst[s] = f;
+    domLast[s] = lastNonZeroWord(domArena, off, f, domW[s] - 1);
+  }
+
+  function noteCountChange(s) {
+    if (countStamp[s] !== level) {
+      countStamp[s] = level;
+      trailC = grow(trailC, tcTop + 2);
+      trailC[tcTop++] = s;
+      trailC[tcTop++] = domCount[s];
+    }
+  }
+
+  /** dom[s] &= src, trailed. Returns bits removed. */
+  function andIntoTrailed(s, src, sOff) {
+    const off = domOff[s];
+    const first = domFirst[s];
+    const last = domLast[s];
+    let removed = 0;
+    for (let i = first; i <= last; i++) {
+      const o = domArena[off + i];
+      if (o === 0) continue;
+      const n = o & src[sOff + i];
+      if (n !== o) {
+        if (removed === 0) noteCountChange(s);
+        trailW = grow(trailW, twTop + 2);
+        trailW[twTop++] = off + i;
+        trailW[twTop++] = o;
+        domArena[off + i] = n;
+        removed += popcount32(o & ~n);
+      }
+    }
+    if (removed > 0) {
+      domCount[s] -= removed;
+      domVersion[s] = ++tick;
+      recomputeWindow(s);
+    }
+    return removed;
+  }
+
+  function removeValueTrailed(s, w) {
+    const off = domOff[s] + (w >>> 5);
+    const bit = 1 << (w & 31);
+    const o = domArena[off];
+    if ((o & bit) === 0) return false;
+    noteCountChange(s);
+    trailW = grow(trailW, twTop + 2);
+    trailW[twTop++] = off;
+    trailW[twTop++] = o;
+    domArena[off] = o & ~bit;
+    domCount[s] -= 1;
+    domVersion[s] = ++tick;
+    recomputeWindow(s);
+    return true;
+  }
+
+  function narrowToSingleton(s, w) {
+    const off = domOff[s];
+    const kw = w >>> 5;
+    const bit = 1 << (w & 31);
+    let removed = 0;
+    for (let i = domFirst[s]; i <= domLast[s]; i++) {
+      const o = domArena[off + i];
+      if (o === 0) continue;
+      const n = i === kw ? (o & bit) : 0;
+      if (n !== o) {
+        if (removed === 0) noteCountChange(s);
+        trailW = grow(trailW, twTop + 2);
+        trailW[twTop++] = off + i;
+        trailW[twTop++] = o;
+        domArena[off + i] = n;
+        removed += popcount32(o & ~n);
+      }
+    }
+    if (removed > 0) {
+      domCount[s] -= removed;
+      domVersion[s] = ++tick;
+      recomputeWindow(s);
+    }
+    return domCount[s] > 0;
+  }
+
+  function setCellMask(ci, nm) {
+    const o = cellMask[ci];
+    if (o === nm) return;
+    trailM = grow(trailM, tmTop + 3);
+    trailM[tmTop++] = ci;
+    trailM[tmTop++] = o;
+    trailM[tmTop++] = cellLevel[ci];
+    cellMask[ci] = nm;
+    cellLevel[ci] = level;
+  }
+
+  function undoToMark(mw, mc, mm) {
+    for (let t = twTop - 2; t >= mw; t -= 2) domArena[trailW[t]] = trailW[t + 1];
+    twTop = mw;
+    for (let t = tcTop - 2; t >= mc; t -= 2) {
+      const s = trailC[t];
+      domCount[s] = trailC[t + 1];
+      recomputeWindow(s);
+      // Bumped, never restored — this is what invalidates posCache for free.
+      domVersion[s] = ++tick;
+      countStamp[s] = -1;
+    }
+    tcTop = mc;
+    for (let t = tmTop - 3; t >= mm; t -= 3) {
+      cellMask[trailM[t]] = trailM[t + 1];
+      cellLevel[trailM[t]] = trailM[t + 2];
+    }
+    tmTop = mm;
+  }
+
+  // ---- propagation -------------------------------------------------------
+
+  /**
+   * 26-bit mask of letters that can sit at position `i` of slot `s`, given its current
+   * domain. Memoised on domVersion, and deliberately NOT masked by cellMask — that would
+   * make the memo unsound.
+   */
+  function lettersAt(s, i) {
+    const k = s * MAXLEN + i;
+    if (posStamp[k] === domVersion[s]) return posCache[k];
+    const li = index.byLen[slotLen[s]];
+    const W = li.W;
+    const off = domOff[s];
+    const base = i * 26 * W;
+    const first = domFirst[s];
+    const last = domLast[s];
+    let m = 0;
+    let cand = li.posAlphabet[i];
+    while (cand !== 0) {
+      const l = ctz32(cand);
+      cand &= cand - 1;
+      if (anyAnd(domArena, off, li.byLetter, base + l * W, first, last)) m |= (1 << l);
+    }
+    posStamp[k] = domVersion[s];
+    posCache[k] = m;
+    return m;
+  }
+
+  const WIPEOUT = -1, NO_CHANGE = 0, CHANGED = 1;
+
+  function reviseSlot(s, i, allowed) {
+    if (allowed === 0) return WIPEOUT;
+    const n = popcount32(allowed);
+    // A near-full letter set prunes almost nothing; skipping the arc is sound because
+    // propagation is optional pruning, never a source of solutions.
+    if (n >= REVISE_MAX_LETTERS) return NO_CHANGE;
+    const li = index.byLen[slotLen[s]];
+    const W = li.W;
+    const base = i * 26 * W;
+    let removed;
+    if (n === 1) {
+      removed = andIntoTrailed(s, li.byLetter, base + ctz32(allowed) * W);
+    } else {
+      const first = domFirst[s];
+      const last = domLast[s];
+      if (last < first) return WIPEOUT;
+      scratch.fill(0, first, last + 1);
+      let cand = allowed;
+      while (cand !== 0) {
+        const l = ctz32(cand);
+        cand &= cand - 1;
+        const o = base + l * W;
+        for (let w = first; w <= last; w++) scratch[w] |= li.byLetter[o + w];
+      }
+      removed = andIntoTrailed(s, scratch, 0);
+    }
+    if (domCount[s] === 0) return WIPEOUT;
+    return removed > 0 ? CHANGED : NO_CHANGE;
+  }
+
+  let wipeoutSlot = -1;
+
+  function propagate(seedSlot) {
+    stats.propagations++;
+    let qh = 0, qt = 0;
+    const push = (ci) => {
+      if (inQueue[ci]) return;
+      inQueue[ci] = 1;
+      queue[qt++ % queue.length] = ci;
+    };
+    for (let i = 0; i < slotLen[seedSlot]; i++) push(slotCellOf[seedSlot * MAXLEN + i]);
+
+    let ops = 0;
+    while (qh !== qt) {
+      if ((++ops & 255) === 0) checkClock();
+      const ci = queue[qh++ % queue.length];
+      inQueue[ci] = 0;
+      const m = cellMask[ci];
+      if (m === 0) {
+        wipeoutSlot = cellSlot[ci * 2] >= 0 ? cellSlot[ci * 2] : cellSlot[ci * 2 + 1];
+        return false;
+      }
+      for (let k = 0; k < 2; k++) {
+        const s = cellSlot[ci * 2 + k];
+        if (s < 0 || assign[s] >= 0) continue;
+        const r = reviseSlot(s, cellSlotPos[ci * 2 + k], m);
+        if (r === WIPEOUT) { wipeoutSlot = s; return false; }
+        if (r !== CHANGED) continue;
+        // Push the slot's newly narrowed letter sets back onto its cells.
+        for (let j = 0; j < slotLen[s]; j++) {
+          const c2 = slotCellOf[s * MAXLEN + j];
+          const nm = cellMask[c2] & lettersAt(s, j);
+          if (nm !== cellMask[c2]) {
+            setCellMask(c2, nm);
+            if (nm === 0) { wipeoutSlot = s; return false; }
+            push(c2);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  // ---- placement ---------------------------------------------------------
+  function placeValue(s, w) {
+    if (!narrowToSingleton(s, w)) { wipeoutSlot = s; return false; }
+    assign[s] = w;
+    placedCount++;
+    const li = index.byLen[slotLen[s]];
+    placedDiffSum += li.diff[w] / 255;
+
+    // Structural dedup: strike this answer from every other unassigned slot of the same
+    // length. Trailed, so it unwinds on backtrack. Because every placement path routes
+    // through here — anchors and preset fills included — an answer cannot repeat.
+    const kw = w >>> 5;
+    const bit = 1 << (w & 31);
+    for (let t = 0; t < S; t++) {
+      if (t === s || assign[t] >= 0 || slotLen[t] !== slotLen[s]) continue;
+      const off = domOff[t] + kw;
+      const o = domArena[off];
+      if ((o & bit) === 0) continue;
+      noteCountChange(t);
+      trailW = grow(trailW, twTop + 2);
+      trailW[twTop++] = off;
+      trailW[twTop++] = o;
+      domArena[off] = o & ~bit;
+      domCount[t] -= 1;
+      domVersion[t] = ++tick;
+      recomputeWindow(t);
+      if (domCount[t] === 0) { wipeoutSlot = t; return false; }
+    }
+
+    for (let i = 0; i < slotLen[s]; i++) {
+      setCellMask(slotCellOf[s * MAXLEN + i], 1 << li.letters[w * slotLen[s] + i]);
+    }
+    return propagate(s);
+  }
+
+  function unassign(s) {
+    if (assign[s] < 0) return;
+    const li = index.byLen[slotLen[s]];
+    placedDiffSum -= li.diff[assign[s]] / 255;
+    assign[s] = -1;
+    placedCount--;
+  }
+
+  // ---- ordering ----------------------------------------------------------
+  const requiredIdx = new Map(); // len -> Set(wordIdx)
+  for (const w of requiredWords) {
+    const i = index.lookup[w.length]?.get(w);
+    if (i === undefined) continue;
+    let set = requiredIdx.get(w.length);
+    if (!set) requiredIdx.set(w.length, (set = new Set()));
+    set.add(i);
+  }
+  const usedRequired = new Set();
+
+  function slotHasRequired(s) {
+    const set = requiredIdx.get(slotLen[s]);
+    if (!set) return false;
+    const off = domOff[s];
+    for (const wi of set) {
+      if (usedRequired.has(wi)) continue;
+      if ((domArena[off + (wi >>> 5)] & (1 << (wi & 31))) !== 0) return true;
+    }
+    return false;
+  }
+
+  function residualDiffTarget() {
+    if (difficultyTarget == null) return null;
+    const remaining = S - placedCount;
+    if (remaining <= 0) return difficultyTarget;
+    const want = difficultyTarget * S - placedDiffSum;
+    return Math.max(0, Math.min(1, want / remaining));
+  }
+
+  function selectSlot() {
+    let best = -1;
+    let bestScore = Infinity;
+    let bestCross = -1;
+    for (let s = 0; s < S; s++) {
+      if (assign[s] >= 0) continue;
+      if (domCount[s] === 0) return s; // wipeout — caller handles
+      let w = 0;
+      let nCross = 0;
+      for (let i = 0; i < slotLen[s]; i++) {
+        const t = crossSlot[s * MAXLEN + i];
+        if (t >= 0 && assign[t] < 0) {
+          w += cellWeight[slotCellOf[s * MAXLEN + i]];
+          nCross++;
+        }
+      }
+      if (w < 1) w = 1;
+      let sc = domCount[s] / w;
+      if (requiredMode !== 'off' && slotHasRequired(s)) {
+        sc *= requiredMode === 'anchor' ? 0.001 : 0.05;
+      }
+      sc *= 1 + 0.02 * rng();
+      if (sc < bestScore || (sc === bestScore && nCross > bestCross)) {
+        bestScore = sc; best = s; bestCross = nCross;
+      }
+    }
+    return best;
+  }
+
+  function orderValues(s) {
+    const li = index.byLen[slotLen[s]];
+    const off = domOff[s];
+    const W = li.W;
+    const len = slotLen[s];
+
+    let nc = 0;
+
+    // Required words first, unconditionally. They can sit anywhere in the index — and
+    // ad-hoc (off-dictionary) words are appended at the very END — so the top-K scan
+    // below would never reach them.
+    const reqHere = requiredIdx.get(len);
+    if (reqHere) {
+      for (const wi of reqHere) {
+        if (usedRequired.has(wi)) continue;
+        if ((domArena[off + (wi >>> 5)] & (1 << (wi & 31))) !== 0) {
+          candBuf[nc++] = wi;
+          if (nc >= candBuf.length) break;
+        }
+      }
+    }
+
+    // Indices are stored in descending quality order, so the best candidates are simply
+    // the first set bits — an O(K) scan instead of ranking the whole domain.
+    let b = nextSetBit(domArena, off, W, 0);
+    while (b >= 0 && nc < K_TOP) {
+      let dup = false;
+      for (let j = 0; j < nc; j++) if (candBuf[j] === b) { dup = true; break; }
+      if (!dup) candBuf[nc++] = b;
+      b = nextSetBit(domArena, off, W, b + 1);
+    }
+    const total = domCount[s];
+    if (total > nc) {
+      for (let k = 0; k < K_RAND && nc < candBuf.length; k++) {
+        const target = randInt(rng, total);
+        let hit = nextSetBit(domArena, off, W, 0);
+        for (let j = 0; j < target && hit >= 0; j++) hit = nextSetBit(domArena, off, W, hit + 1);
+        if (hit < 0) continue;
+        let dup = false;
+        for (let j = 0; j < nc; j++) if (candBuf[j] === hit) { dup = true; break; }
+        if (!dup) candBuf[nc++] = hit;
+      }
+    }
+
+    const target = residualDiffTarget();
+    const reqSet = requiredIdx.get(len);
+    let n = 0;
+    for (let ci = 0; ci < nc; ci++) {
+      if ((ci & 63) === 63) checkClock();
+      const w = candBuf[ci];
+      let supp = 0;
+      let ok = true;
+      for (let i = 0; i < len; i++) {
+        const t = crossSlot[s * MAXLEN + i];
+        if (t < 0 || assign[t] >= 0) continue;
+        const l = li.letters[w * len + i];
+        const lt = index.byLen[slotLen[t]];
+        const row = (crossPos[s * MAXLEN + i] * 26 + l) * lt.W;
+        const c = andCountCapped(domArena, domOff[t], lt.byLetter, row,
+                                 domFirst[t], domLast[t], LOOKAHEAD_WORDS, LOOKAHEAD_CAP);
+        if (c === 0) { ok = false; break; } // would wipe a crossing slot
+        supp += Math.log1p(c);
+      }
+      if (!ok) { removeValueTrailed(s, w); continue; }
+      let q = supp + ALPHA_QUALITY * (li.score[w] / 65535);
+      if (reqSet && reqSet.has(w) && !usedRequired.has(w)) q += 1000;
+      if (target != null) q -= difficultyWeight * Math.abs(li.diff[w] / 255 - target);
+      // insertion sort, descending
+      let j = n++;
+      while (j > 0 && valQ[j - 1] < q) { valQ[j] = valQ[j - 1]; valBuf[j] = valBuf[j - 1]; j--; }
+      valQ[j] = q; valBuf[j] = w;
+    }
+    return n;
+  }
+
+  // ---- failure handling --------------------------------------------------
+  function conflictAdd(dst, src) {
+    const a = dst * CW, b = src * CW;
+    for (let i = 0; i < CW; i++) conflict[a + i] |= conflict[b + i];
+  }
+  const conflictSet = (s, other) => { conflict[s * CW + (other >>> 5)] |= 1 << (other & 31); };
+  const conflictClear = (s) => { for (let i = 0; i < CW; i++) conflict[s * CW + i] = 0; };
+  function conflictMaxLevel(s) {
+    let m = 0;
+    for (let i = 0; i < CW; i++) {
+      let v = conflict[s * CW + i];
+      while (v !== 0) {
+        const b = (i << 5) + ctz32(v);
+        v &= v - 1;
+        for (let lv = 1; lv <= level; lv++) if (assignOrder[lv] === b && lv > m) m = lv;
+      }
+    }
+    return m;
+  }
+
+  /** @returns {boolean} false when this restart is exhausted. */
+  function handleFailure(t) {
+    if (t < 0) return false;
+    for (let i = 0; i < slotLen[t]; i++) cellWeight[slotCellOf[t * MAXLEN + i]] += 1;
+
+    let jump = 0;
+    for (let i = 0; i < slotLen[t]; i++) {
+      const lv = cellLevel[slotCellOf[t * MAXLEN + i]];
+      if (lv > jump) jump = lv;
+    }
+    const cj = conflictMaxLevel(t);
+    if (cj > jump) jump = cj;
+    if (jump <= 0 || jump > level) return false;
+
+    if (jump < level) stats.backjumps++;
+    while (level > jump) {
+      undoToMark(markW[level], markC[level], markM[level]);
+      const s = assignOrder[level];
+      if (s >= 0) {
+        if (assign[s] >= 0 && requiredIdx.has(slotLen[s])) usedRequired.delete(assign[s]);
+        unassign(s);
+      }
+      valueStack[level] = null;
+      level--;
+    }
+
+    const d = assignOrder[jump];
+    if (d < 0) return false;
+    conflictAdd(d, t);
+    for (let i = 0; i < slotLen[t]; i++) {
+      const ci = slotCellOf[t * MAXLEN + i];
+      for (let k = 0; k < 2; k++) {
+        const o = cellSlot[ci * 2 + k];
+        if (o >= 0 && o !== d && assign[o] >= 0) conflictSet(d, o);
+      }
+    }
+    conflict[d * CW + (d >>> 5)] &= ~(1 << (d & 31));
+
+    // Undo the failed decision at `jump` and try its next alternative.
+    undoToMark(markW[jump], markC[jump], markM[jump]);
+    if (assign[d] >= 0) { usedRequired.delete(assign[d]); unassign(d); }
+    removeValueTrailed(d, assignVal[jump]);
+
+    const vals = valueStack[jump];
+    let next = -1;
+    while (valueStackI[jump] < valueStackN[jump]) {
+      const cand = vals[valueStackI[jump]++];
+      if ((domArena[domOff[d] + (cand >>> 5)] & (1 << (cand & 31))) !== 0) { next = cand; break; }
+    }
+    if (next < 0) {
+      level = jump;
+      const lower = jump - 1;
+      if (lower <= 0) return false;
+      level = jump;
+      return handleFailureAt(d, jump);
+    }
+    assignVal[jump] = next;
+    level = jump;
+    if (!placeValue(d, next)) {
+      stats.backtracks++;
+      return handleFailure(wipeoutSlot);
+    }
+    if (requiredIdx.get(slotLen[d])?.has(next)) usedRequired.add(next);
+    return true;
+  }
+
+  /** All values at `lv` are exhausted — propagate the failure one level further up. */
+  function handleFailureAt(d, lv) {
+    undoToMark(markW[lv], markC[lv], markM[lv]);
+    if (assign[d] >= 0) { usedRequired.delete(assign[d]); unassign(d); }
+    valueStack[lv] = null;
+    level = lv - 1;
+    if (level <= 0) return false;
+    const parent = assignOrder[level];
+    if (parent < 0) return false;
+    conflictAdd(parent, d);
+    conflictClear(d);
+    return handleFailure(parent);
+  }
+
+  // ---- initial arc consistency ------------------------------------------
+  function initialise() {
+    domArena.fill(0);
+    for (let s = 0; s < S; s++) {
+      const li = index.byLen[slotLen[s]];
+      domArena.set(li.all, domOff[s]);
+      domCount[s] = popcountRange(domArena, domOff[s], domW[s]);
+      recomputeWindow(s);
+      domVersion[s] = ++tick;
+    }
+    for (let ci = 0; ci < CELLS; ci++) {
+      cellMask[ci] = cellSlot[ci * 2] >= 0 ? 0x3ffffff : 0;
+      cellLevel[ci] = 0;
+    }
+    // Preset letters pin their cells; the AC pass below turns fully-preset slots into
+    // singletons on its own, so no special-case pre-placement loop is needed.
+    if (presetGrid) {
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const ch = presetCharAt(r, c);
+          if (!ch || !/^[A-Z]$/.test(ch)) continue;
+          const ci = cellIndex(r, c);
+          if (cellSlot[ci * 2] < 0) continue;
+          cellMask[ci] = 1 << (ch.charCodeAt(0) - A_CODE);
+        }
+      }
+    }
+  }
+
+  function initialAC() {
+    // Run every slot's letter sets into its cells, then fixpoint.
+    let changed = true;
+    let guard = 0;
+    while (changed && guard++ < 64) {
+      changed = false;
+      for (let s = 0; s < S; s++) {
+        checkClock();
+        for (let i = 0; i < slotLen[s]; i++) {
+          const ci = slotCellOf[s * MAXLEN + i];
+          const nm = cellMask[ci] & lettersAt(s, i);
+          if (nm !== cellMask[ci]) {
+            cellMask[ci] = nm;
+            changed = true;
+            if (nm === 0) return { ok: false, cell: ci, slot: s };
+          }
+        }
+      }
+      for (let s = 0; s < S; s++) {
+        for (let i = 0; i < slotLen[s]; i++) {
+          const r = reviseSlot(s, i, cellMask[slotCellOf[s * MAXLEN + i]]);
+          if (r === WIPEOUT) return { ok: false, slot: s, cell: -1 };
+          if (r === CHANGED) changed = true;
+        }
+      }
+    }
+    return { ok: true };
+  }
+
+  function patternOf(s) {
+    let out = '';
+    for (let i = 0; i < slotLen[s]; i++) {
+      const m = cellMask[slotCellOf[s * MAXLEN + i]];
+      out += popcount32(m) === 1 ? String.fromCharCode(A_CODE + ctz32(m)) : '_';
+    }
+    return out;
+  }
+
+  // ---- best-partial tracking --------------------------------------------
+  let bestPlaced = -1;
+  let bestSnapshot = null;
+
+  function snapshotGrid() {
     const g = [];
     for (let r = 0; r < rows; r++) {
       const row = [];
       for (let c = 0; c < cols; c++) {
-        if (layout[r][c] === '#') row.push('#');
-        else row.push(presetCharAt(r, c) || null);
+        if (rowsArr[r][c] === '#') { row.push('#'); continue; }
+        const m = cellMask[cellIndex(r, c)];
+        row.push(popcount32(m) === 1 ? String.fromCharCode(A_CODE + ctz32(m)) : null);
       }
       g.push(row);
     }
     return g;
-  };
+  }
 
-  const wfcSolve = (startTime, attemptNum) => {
-    const grid = buildEmptyGrid();
-
-    // cell letter possibilities as bitmasks
-    const cellMask = new Int32Array(rows * cols);
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        if (layout[r][c] === '#') continue;
-        const p = presetCharAt(r, c);
-        cellMask[cellIndex(r, c)] = p ? bitOf(p) : FULL;
-      }
+  function collectPlacements() {
+    const out = [];
+    for (let s = 0; s < S; s++) {
+      if (assign[s] < 0) continue;
+      const li = index.byLen[slotLen[s]];
+      out.push({ slot: slots[s], word: li.words[assign[s]], wordIndex: assign[s], clue: '' });
     }
+    return out;
+  }
 
-    // per-slot remaining candidate words
-    const slotPossibilities = new Map();
-    for (const slot of slots) {
-      const cands = wordsByLength[slot.length] || [];
-      slotPossibilities.set(slot.id, new Set(shuffleArray(cands.map((c) => c.word))));
-    }
-
-    const usedWords = new Set();
-    const usedRequired = new Set();
-    const placements = [];
-    const placedSlotIds = new Set();
-    let lastPlacedWord = null;
-    let lastConflictWord = null;
-
-    const getActiveConflictWord = () =>
-      lastConflictWord || (placements.length ? placements[placements.length - 1].word : lastPlacedWord) || null;
-
-    // OR of the letters that can sit at `position` across a slot's words
-    const posLetters = (slotId, position) => {
-      let m = 0;
-      for (const w of slotPossibilities.get(slotId)) m |= bitOf(w[position]);
-      return m;
-    };
-
-    const updateCell = (r, c) => {
-      const cell = cellIndex(r, c);
-      const using = cellToSlots.get(cell);
-      if (!using || using.length === 0) return true;
-      let mask = FULL;
-      for (const { slot, index } of using) {
-        if (placedSlotIds.has(slot.id)) continue;
-        mask &= posLetters(slot.id, index);
-      }
-      const ch = grid[r][c];
-      if (ch !== null && ch !== '#') mask = bitOf(ch);
-      cellMask[cell] = mask;
-      return mask !== 0;
-    };
-
-    const filterSlot = (slot) => {
-      const cells = slotCells.get(slot.id);
-      const next = new Set();
-      for (const w of slotPossibilities.get(slot.id)) {
-        if (usedWords.has(w)) continue;
-        let ok = true;
-        for (const cell of cells) {
-          const ch = grid[cell.r][cell.c];
-          if (ch !== null && ch !== '#') {
-            if (ch !== w[cell.index]) { ok = false; break; }
-          } else if ((cellMask[cell.cell] & bitOf(w[cell.index])) === 0) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) next.add(w);
-      }
-      slotPossibilities.set(slot.id, next);
-      return next.size > 0;
-    };
-
-    // AC-3 fixpoint propagation. Returns false on contradiction.
-    const propagate = () => {
-      let changed = true;
-      let iterations = 0;
-      while (changed && iterations < 500) {
-        changed = false;
-        iterations++;
-        for (let r = 0; r < rows; r++) {
-          for (let c = 0; c < cols; c++) {
-            if (layout[r][c] === '#') continue;
-            const cell = cellIndex(r, c);
-            const old = cellMask[cell];
-            if (!updateCell(r, c)) return false;
-            if (cellMask[cell] !== old) changed = true;
-          }
-        }
-        for (const slot of slots) {
-          if (placedSlotIds.has(slot.id)) continue;
-          const before = slotPossibilities.get(slot.id).size;
-          if (!filterSlot(slot)) return false;
-          if (slotPossibilities.get(slot.id).size !== before) changed = true;
-        }
-      }
-      return true;
-    };
-
-    const getSlotEntropy = (slot) => {
-      const cells = slotCells.get(slot.id);
-      let total = 0;
-      for (const cell of cells) total += popcount(cellMask[cell.cell]);
-      return total / cells.length;
-    };
-
-    const findLowestEntropySlot = () => {
-      let minEntropy = Infinity;
-      let minSlot = null;
-      for (const slot of slots) {
-        if (placedSlotIds.has(slot.id)) continue;
-        const words = slotPossibilities.get(slot.id);
-        if (words.size === 0) continue;
-        const entropy = getSlotEntropy(slot);
-        let hasRequiredCandidate = false;
-        if (requiredSet.size) {
-          for (const w of words) {
-            if (requiredSet.has(w) && !usedRequired.has(w)) { hasRequiredCandidate = true; break; }
-          }
-        }
-        let adjustedEntropy = entropy + Math.random() * 0.001;
-        if (requiredModeLocal === 'anchor' && hasRequiredCandidate) adjustedEntropy -= 1000;
-        if (requiredModeLocal === 'opportunistic' && hasRequiredCandidate) adjustedEntropy -= 200;
-        if (adjustedEntropy < minEntropy) { minEntropy = adjustedEntropy; minSlot = slot; }
-      }
-      return minSlot;
-    };
-
-    const placeWord = (slot, word, clueOverride = '') => {
-      const cells = slotCells.get(slot.id);
-      for (const cell of cells) {
-        const ex = grid[cell.r][cell.c];
-        if (ex && ex !== word[cell.index] && ex !== '#') return false;
-      }
-      for (const cell of cells) {
-        grid[cell.r][cell.c] = word[cell.index];
-        cellMask[cell.cell] = bitOf(word[cell.index]);
-      }
-      usedWords.add(word);
-      if (requiredSet.has(word)) usedRequired.add(word);
-      placedSlotIds.add(slot.id);
-      lastPlacedWord = word;
-      const presetKey = `${slot.direction}-${slot.row}-${slot.col}`;
-      const item = wordItemMap.get(word) || { word, clue: '' };
-      const finalClue = clueOverride || presetClues[presetKey] || item.clue || '';
-      placements.push({ slot, word, clue: finalClue });
-      return true;
-    };
-
-    const snapshot = () => ({
-      grid: grid.map((row) => [...row]),
-      placements: [...placements],
-      complete: placements.length === slots.length && usedRequired.size === requiredSet.size,
+  function recordBest() {
+    if (placedCount <= bestPlaced) return;
+    bestPlaced = placedCount;
+    bestSnapshot = { grid: snapshotGrid(), placements: collectPlacements() };
+    onBest({
+      grid: bestSnapshot.grid,
+      placements: bestSnapshot.placements,
       requiredPlaced: usedRequired.size,
-      backtracks,
-      failedWord: getActiveConflictWord(),
+      attempts: stats.restarts + 1,
+      complete: false,
+      failedWord: null,
     });
+  }
 
-    const saveState = () => ({
-      grid: grid.map((row) => [...row]),
-      cellMask: cellMask.slice(),
-      slotPossibilities: new Map([...slotPossibilities.entries()].map(([k, v]) => [k, new Set(v)])),
-      usedWords: new Set(usedWords),
-      usedRequired: new Set(usedRequired),
-      placedSlotIds: new Set(placedSlotIds),
-      placements: [...placements],
-    });
-
-    const restoreState = (s) => {
-      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) grid[r][c] = s.grid[r][c];
-      cellMask.set(s.cellMask);
-      slotPossibilities.clear();
-      for (const [k, v] of s.slotPossibilities) slotPossibilities.set(k, new Set(v));
-      usedWords.clear();
-      for (const w of s.usedWords) usedWords.add(w);
-      usedRequired.clear();
-      for (const w of s.usedRequired) usedRequired.add(w);
-      placedSlotIds.clear();
-      for (const id of s.placedSlotIds) placedSlotIds.add(id);
-      placements.length = 0;
-      placements.push(...s.placements);
-    };
-
+  // ---- one search run ----------------------------------------------------
+  function solveOnce(budget) {
+    domArena.set(dom0);
+    domCount.set(domCount0);
+    cellMask.set(cellMask0);
+    for (let s = 0; s < S; s++) { recomputeWindow(s); domVersion[s] = ++tick; countStamp[s] = -1; }
+    for (let ci = 0; ci < CELLS; ci++) cellLevel[ci] = 0;
+    assign.fill(-1);
+    conflict.fill(0);
+    usedRequired.clear();
+    inQueue.fill(0);
+    placedCount = 0;
+    placedDiffSum = 0;
+    level = 0;
+    twTop = tcTop = tmTop = 0;
     let backtracks = 0;
 
-    // initial propagation
-    if (!propagate()) {
-      return { grid, placements, complete: false, backtracks, requiredPlaced: usedRequired.size, failedWord: getActiveConflictWord() };
-    }
+    for (;;) {
+      checkClock();
+      stats.nodes++;
+      if (placedCount === S) return 'SOLVED';
 
-    // anchor required words where they fit current constraints
-    if (requiredModeLocal === 'anchor' && requiredSet.size > 0) {
-      for (const reqWord of shuffleArray([...requiredSet])) {
-        if (usedRequired.has(reqWord)) continue;
-        const candidateSlots = shuffleArray(slots.filter((s) => s.length === reqWord.length && !placedSlotIds.has(s.id)));
-        for (const slot of candidateSlots) {
-          const cells = slotCells.get(slot.id);
-          let fits = true;
-          for (const cell of cells) {
-            const ex = grid[cell.r][cell.c];
-            if (ex && ex !== reqWord[cell.index]) { fits = false; break; }
-          }
-          if (fits) { placeWord(slot, reqWord); break; }
-        }
-      }
-    }
-
-    // pre-place fully-filled preset slots even if not in the dictionary
-    for (const slot of slots) {
-      if (placedSlotIds.has(slot.id)) continue;
-      const cells = slotCells.get(slot.id);
-      let full = true;
-      let str = '';
-      for (const cell of cells) {
-        const ch = grid[cell.r][cell.c];
-        if (!ch || ch === '#') { full = false; break; }
-        str += ch;
-      }
-      if (full) placeWord(slot, str, presetClues[`${slot.direction}-${slot.row}-${slot.col}`] || '');
-    }
-
-    const stateStack = [];
-    let lastTick = startTime;
-
-    while (placements.length < slots.length) {
-      if (isCancelled()) return snapshot();
-      const t = now();
-      if (t - startTime > timeoutMs) return snapshot();
-      if (t - lastTick > 80) {
-        lastTick = t;
-        onProgress(`Attempt ${attemptNum} (${((t - startTime) / 1000).toFixed(1)}s): ${placements.length}/${slots.length} slots, ${backtracks} backtracks…`);
+      if ((stats.nodes & 511) === 0) {
+        onProgress(`${placedCount}/${S} filled · ${stats.backtracks} backtracks · `
+          + `${stats.restarts} restarts · ${((now() - t0) / 1000).toFixed(1)}s`);
       }
 
-      const slot = findLowestEntropySlot();
-      if (!slot) {
-        if (stateStack.length === 0) {
-          lastConflictWord = lastPlacedWord;
-          return { grid, placements, complete: false, backtracks, requiredPlaced: usedRequired.size, failedWord: getActiveConflictWord() };
-        }
-        backtracks++;
-        const prev = stateStack.pop();
-        lastConflictWord = prev.triedWord || lastPlacedWord;
-        restoreState(prev.state);
-        slotPossibilities.get(prev.slot.id).delete(prev.triedWord);
+      const s = selectSlot();
+      if (s < 0) return 'SOLVED';
+      if (domCount[s] === 0) {
+        stats.backtracks++;
+        if (++backtracks > budget) return 'RESTART';
+        if (!handleFailure(s)) return 'EXHAUSTED';
         continue;
       }
 
-      const possibilities = [...slotPossibilities.get(slot.id)];
-      if (possibilities.length === 0) {
-        if (stateStack.length === 0) {
-          lastConflictWord = lastPlacedWord;
-          return { grid, placements, complete: false, backtracks, requiredPlaced: usedRequired.size, failedWord: getActiveConflictWord() };
-        }
-        backtracks++;
-        const prev = stateStack.pop();
-        lastConflictWord = prev.triedWord || lastPlacedWord;
-        restoreState(prev.state);
-        slotPossibilities.get(prev.slot.id).delete(prev.triedWord);
+      level++;
+      markW[level] = twTop; markC[level] = tcTop; markM[level] = tmTop;
+      assignOrder[level] = s;
+      conflictClear(s);
+
+      const n = orderValues(s);
+      if (n === 0) {
+        level--;
+        stats.backtracks++;
+        if (++backtracks > budget) return 'RESTART';
+        if (!handleFailure(s)) return 'EXHAUSTED';
         continue;
       }
+      valueStack[level] = Int32Array.from(valBuf.subarray(0, n));
+      valueStackN[level] = n;
+      valueStackI[level] = 1;
+      assignVal[level] = valBuf[0];
 
-      const savedState = saveState();
-      const requiredOption = possibilities.find((w) => requiredSet.has(w) && !usedRequired.has(w));
-      const chosenWord = requiredOption || possibilities[0];
-      stateStack.push({ slot, triedWord: chosenWord, state: savedState });
-
-      if (!placeWord(slot, chosenWord)) {
-        slotPossibilities.get(slot.id).delete(chosenWord);
-        stateStack.pop();
-        continue;
+      if (!placeValue(s, valBuf[0])) {
+        stats.backtracks++;
+        if (++backtracks > budget) return 'RESTART';
+        if (!handleFailure(wipeoutSlot)) return 'EXHAUSTED';
+      } else {
+        if (requiredIdx.get(slotLen[s])?.has(valBuf[0])) usedRequired.add(valBuf[0]);
+        if (placedCount > bestPlaced) recordBest();
       }
-
-      if (!propagate()) {
-        backtracks++;
-        lastConflictWord = chosenWord;
-        restoreState(savedState);
-        slotPossibilities.get(slot.id).delete(chosenWord);
-        stateStack.pop();
-      }
-    }
-
-    return {
-      grid,
-      placements,
-      complete: placements.length === slots.length && usedRequired.size === requiredSet.size,
-      backtracks,
-      requiredPlaced: usedRequired.size,
-      failedWord: getActiveConflictWord(),
-    };
-  };
-
-  // ===== attempts loop =====
-  const startTime = now();
-  let attempts = 0;
-  let bestResult = { grid: buildEmptyGrid(), placements: [], requiredPlaced: 0, failedWord: null };
-  let bestScore = 0;
-  let bestRequired = 0;
-  let lastResult = null;
-
-  while (!isCancelled() && now() - startTime <= timeoutMs) {
-    attempts++;
-    const result = wfcSolve(startTime, attempts);
-    lastResult = result;
-
-    if (result.complete) {
-      onProgress(`Complete! Solved in ${((now() - startTime) / 1000).toFixed(1)}s (attempt ${attempts}, ${result.backtracks} backtracks)`);
-      return { ...result, attempts, complete: true, failedWord: null };
-    }
-
-    if (result.requiredPlaced > bestRequired || (result.requiredPlaced === bestRequired && result.placements.length > bestScore)) {
-      bestRequired = result.requiredPlaced;
-      bestScore = result.placements.length;
-      const fallbackFailed = result.placements.length
-        ? result.placements[result.placements.length - 1].word
-        : result.failedWord || bestResult.failedWord || null;
-      bestResult = {
-        grid: result.grid.map((row) => [...row]),
-        placements: [...result.placements],
-        requiredPlaced: result.requiredPlaced,
-        failedWord: fallbackFailed,
-      };
-      onBest({ grid: bestResult.grid, placements: bestResult.placements, requiredPlaced: bestResult.requiredPlaced, attempts, failedWord: bestResult.failedWord || null, complete: false });
     }
   }
 
+  // ---- drive -------------------------------------------------------------
+  let outcome = 'EXHAUSTED';
+  let preflightError = null;
+
+  try {
+    initialise();
+    const ac = initialAC();
+    if (!ac.ok) {
+      if (ac.cell >= 0) {
+        const r = (ac.cell / cols) | 0;
+        const c = ac.cell % cols;
+        const a = cellSlot[ac.cell * 2];
+        const b = cellSlot[ac.cell * 2 + 1];
+        const names = [a, b].filter((x) => x >= 0).map(slotName).join(' and ');
+        preflightError = err('CELL_NO_LETTER',
+          `No letter works for both ${names} at row ${r + 1}, column ${c + 1}.`,
+          { row: r, col: c });
+      } else {
+        preflightError = err('SLOT_EMPTY_AFTER_AC',
+          `${slotName(ac.slot)} (${slotLen[ac.slot]} letters) has no possible answer given the crossing letters "${patternOf(ac.slot)}".`,
+          { slot: ac.slot });
+      }
+    }
+
+    if (!preflightError) {
+      // Preset letter that no word of that length can carry — a clearer message than a
+      // generic empty-domain failure.
+      for (let s = 0; s < S && !preflightError; s++) {
+        if (domCount[s] !== 0) continue;
+        preflightError = err('SLOT_EMPTY_AFTER_AC',
+          `${slotName(s)} (${slotLen[s]} letters) has no possible answer given the crossing letters "${patternOf(s)}".`,
+          { slot: s });
+      }
+    }
+
+    if (!preflightError) {
+      for (const w of requiredWords) {
+        const wi = index.lookup[w.length]?.get(w);
+        let placeable = false;
+        if (wi !== undefined) {
+          for (let s = 0; s < S; s++) {
+            if (slotLen[s] !== w.length) continue;
+            if ((domArena[domOff[s] + (wi >>> 5)] & (1 << (wi & 31))) !== 0) { placeable = true; break; }
+          }
+        }
+        if (!placeable) {
+          preflightError = err('REQUIRED_WORD_UNPLACEABLE',
+            `"${w}" doesn't fit any ${w.length}-letter slot with the current letters in the grid.`,
+            { word: w });
+          break;
+        }
+      }
+    }
+
+    if (!preflightError) {
+      dom0.set(domArena);
+      domCount0.set(domCount);
+      cellMask0.set(cellMask);
+
+      for (let run = 0; ; run++) {
+        checkClock();
+        if (run > 0) stats.restarts++;
+        outcome = solveOnce(LUBY_BASE * luby(run));
+        if (outcome === 'SOLVED') break;
+        if (outcome === 'EXHAUSTED' && run > 0) break;
+        if (now() - t0 > timeoutMs) break;
+      }
+    }
+  } catch (e) {
+    if (e !== ABORT) { cleanup(); throw e; }
+    outcome = 'ABORTED';
+  }
+
+  stats.ms = now() - t0;
+
+  if (preflightError) {
+    cleanup();
+    return {
+      grid: null, placements: [], complete: false, attempts: 0, requiredPlaced: 0,
+      failedWord: null, failedSlot: preflightError.detail?.slot ?? null,
+      difficultyScore: null, error: preflightError, stats,
+    };
+  }
+
+  const complete = outcome === 'SOLVED' && placedCount === S;
+  const placements = complete ? collectPlacements() : (bestSnapshot?.placements || []);
+  const grid = complete ? snapshotGrid() : (bestSnapshot?.grid || snapshotGrid());
+
+  // Puzzle difficulty is not the mean of its answers. A solver's experience is dominated
+  // by the hardest fifth, and worst of all by two hard entries CROSSING each other --
+  // that is where a puzzle stops being solvable rather than merely slow. A flat average
+  // (what this used to be) rates a grid with four brutal crossings the same as one with
+  // four brutal entries scattered safely apart.
+  let difficultyScore = null;
+  if (placements.length) {
+    const diffOf = new Map();
+    const vals = [];
+    for (const p of placements) {
+      const d = index.byLen[p.word.length].diff[p.wordIndex] / 255;
+      diffOf.set(p.slot.id, d);
+      vals.push(d);
+    }
+    vals.sort((a, b) => a - b);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const p80 = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.8))];
+
+    let worstCross = 0;
+    for (let s = 0; s < S; s++) {
+      const ds = diffOf.get(slots[s].id);
+      if (ds === undefined) continue;
+      for (let i = 0; i < slotLen[s]; i++) {
+        const t = crossSlot[s * MAXLEN + i];
+        if (t < 0) continue;
+        const dt = diffOf.get(slots[t].id);
+        if (dt === undefined) continue;
+        const pair = Math.min(ds, dt); // both must be hard for the crossing to be unfair
+        if (pair > worstCross) worstCross = pair;
+      }
+    }
+    difficultyScore = (0.5 * mean + 0.3 * p80 + 0.2 * worstCross) * 100;
+  }
+
+  let failedSlot = null;
+  if (!complete) {
+    let worst = -1;
+    for (let s = 0; s < S; s++) {
+      if (assign[s] < 0 && (worst < 0 || domCount[s] < domCount[worst])) worst = s;
+    }
+    failedSlot = worst >= 0 ? worst : null;
+  }
+
+  cleanup();
   return {
-    grid: bestResult.grid || (lastResult && lastResult.grid) || null,
-    placements: bestResult.placements.length ? bestResult.placements : (lastResult ? lastResult.placements : []),
-    requiredPlaced: bestResult.requiredPlaced || (lastResult ? lastResult.requiredPlaced : 0) || 0,
-    attempts,
-    failedWord:
-      bestResult.failedWord ||
-      (lastResult && lastResult.failedWord) ||
-      (lastResult && lastResult.placements.length ? lastResult.placements[lastResult.placements.length - 1].word : null) ||
-      null,
-    complete: false,
+    grid,
+    placements,
+    complete,
+    attempts: stats.restarts + 1,
+    requiredPlaced: usedRequired.size,
+    failedWord: null,
+    failedSlot: failedSlot != null ? slots[failedSlot]?.id ?? null : null,
+    difficultyScore,
+    error: complete ? null : (outcome === 'ABORTED'
+      ? err('TIMEOUT', `Couldn't fill this grid in ${(timeoutMs / 1000).toFixed(0)}s — got ${placements.length} of ${S} answers. Try another layout, or widen the difficulty.`)
+      : err('NO_SOLUTION', `No complete fill exists for this layout with the current word list — got ${placements.length} of ${S} answers.`)),
+    stats,
   };
+}
+
+/** NYT-style clue numbers, so preflight messages can say "34-Across" not "slot 57". */
+function numberSlots(slots) {
+  const starts = new Map();
+  const ordered = [...slots].sort((a, b) => (a.row - b.row) || (a.col - b.col));
+  let n = 1;
+  for (const s of ordered) {
+    const k = `${s.row},${s.col}`;
+    if (!starts.has(k)) starts.set(k, n++);
+  }
+  return slots.map((s) => starts.get(`${s.row},${s.col}`));
 }
