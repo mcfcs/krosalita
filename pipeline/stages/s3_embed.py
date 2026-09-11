@@ -35,23 +35,52 @@ DEFAULT_MODEL = "qwen3-embedding:0.6b"
 BATCH_TEXTS = 64
 
 
-def embed(base_url, model, texts, timeout=180, retries=4):
+def _embed_once(base_url, model, texts, timeout):
     body = json.dumps({"model": model, "input": texts}).encode()
-    last = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(f"{base_url.rstrip('/')}/api/embed", data=body,
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                out = json.loads(r.read())
-            vecs = out.get("embeddings")
-            if not vecs or len(vecs) != len(texts):
-                raise ValueError(f"expected {len(texts)} vectors, got {len(vecs) if vecs else 0}")
-            return vecs
-        except Exception as e:  # noqa: BLE001 -- network flakiness is expected overnight
-            last = e
-            time.sleep(min(30, 2 ** attempt))
-    raise RuntimeError(f"embedding failed after {retries} tries: {last}")
+    req = urllib.request.Request(f"{base_url.rstrip('/')}/api/embed", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = json.loads(r.read())
+    vecs = out.get("embeddings")
+    if not vecs or len(vecs) != len(texts):
+        raise ValueError(f"expected {len(texts)} vectors, got {len(vecs) if vecs else 0}")
+    return vecs
+
+
+def embed(base_url, model, texts, timeout=180, retries=4):
+    """Embed a list of texts, splitting into server-sized requests.
+
+    Ollama rejects an over-large input array with a bare HTTP 400, and answers here are
+    wildly uneven -- common words like ALE carry hundreds of clues, so a single answer's
+    batch can be far larger than the nominal size. Chunk strictly, and on a 400 halve the
+    chunk rather than giving up: that distinguishes "too big" from "server down" without
+    needing to know the server's actual limit.
+    """
+    out = []
+    i = 0
+    chunk = BATCH_TEXTS
+    while i < len(texts):
+        part = texts[i:i + chunk]
+        last = None
+        for attempt in range(retries):
+            try:
+                out.extend(_embed_once(base_url, model, part, timeout))
+                last = None
+                break
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code == 400 and len(part) > 1:
+                    chunk = max(1, len(part) // 2)
+                    part = texts[i:i + chunk]
+                    continue
+                time.sleep(min(30, 2 ** attempt))
+            except Exception as e:  # noqa: BLE001 -- overnight network flakiness
+                last = e
+                time.sleep(min(30, 2 ** attempt))
+        if last is not None:
+            raise RuntimeError(f"embedding failed after {retries} tries: {last}")
+        i += len(part)
+    return out
 
 
 def _norm(v):

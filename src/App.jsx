@@ -19,7 +19,7 @@ import { parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, ge
 import { loadJSON, saveJSON } from './utils/storage';
 import { todayKey, seedFromString, getStreak, recordDailySolve, isDailySolved } from './utils/daily';
 import { difficultyLabelFromScore, difficultyColorClass, difficultyTargetOf } from './utils/difficulty';
-import { getOllamaConfig, saveOllamaConfig, generateClues } from './utils/ollama';
+import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } from './utils/ollama';
 import { useAuth } from './hooks/useAuth';
 import { savePuzzle } from './lib/puzzles';
 import { sfx, isSoundOn, setSoundOn } from './utils/sound';
@@ -1853,6 +1853,38 @@ const CrosswordGenerator = () => {
     saveOllamaConfig(next);
   };
 
+  // Rate every clue in the finished puzzle with the local model. The precomputed
+  // difficulty is instant but blind to how a specific clue reads, so this is what
+  // actually surfaces a Saturday-hard entry sitting in a Monday grid.
+  const [auditState, setAuditState] = useState({ running: false, done: 0, total: 0, summary: null, error: '' });
+  const auditAbortRef = useRef(null);
+
+  const runDifficultyAudit = async () => {
+    const entries = [...(clues?.across || []), ...(clues?.down || [])]
+      .filter((c) => c.word && c.clue)
+      .map((c) => ({ number: c.number, direction: c.direction, word: c.word, clue: c.clue }));
+    if (!entries.length) {
+      setAuditState({ running: false, done: 0, total: 0, summary: null, error: 'Nothing to audit yet.' });
+      return;
+    }
+    auditAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    auditAbortRef.current = ctrl;
+    setAuditState({ running: true, done: 0, total: entries.length, summary: null, error: '' });
+    try {
+      const { summary } = await auditDifficulty({
+        baseUrl: ollamaConfig.baseUrl,
+        model: ollamaConfig.model,
+        entries,
+        signal: ctrl.signal,
+        onProgress: ({ done, total }) => setAuditState((s) => ({ ...s, done, total })),
+      });
+      setAuditState({ running: false, done: entries.length, total: entries.length, summary, error: '' });
+    } catch (err) {
+      setAuditState({ running: false, done: 0, total: 0, summary: null, error: String(err?.message || err) });
+    }
+  };
+
   const aiGenerateClues = (word, difficulty = 'MODERATE') =>
     generateClues({
       baseUrl: ollamaConfig.baseUrl,
@@ -2354,14 +2386,61 @@ const CrosswordGenerator = () => {
                   <div className="eyebrow">The Puzzle</div>
                   <h2 className="font-display text-2xl font-semibold text-ink leading-tight">Proof Grid</h2>
                 </div>
-                {difficultyInfo?.label && (
-                  <span className="inline-flex items-center gap-2 border border-ink/20 bg-paper-sunken px-3 py-1.5 rounded-sm">
-                    <span className="eyebrow">Difficulty</span>
-                    <span className={`font-display font-semibold ${difficultyColorClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
-                    {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
-                  </span>
-                )}
+                <div className="flex items-center gap-2 flex-wrap">
+                  {difficultyInfo?.label && (
+                    <span className="inline-flex items-center gap-2 border border-ink/20 bg-paper-sunken px-3 py-1.5 rounded-sm">
+                      <span className="eyebrow">Difficulty</span>
+                      <span className={`font-display font-semibold ${difficultyColorClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
+                      {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
+                    </span>
+                  )}
+                  {ollamaConfig.enabled && clues && (clues.across?.length || 0) > 0 && (
+                    <button
+                      onClick={runDifficultyAudit}
+                      disabled={auditState.running}
+                      className="btn btn-sm btn-ghost"
+                      title="Rate every clue with your local model"
+                    >
+                      <Zap size={14} />
+                      {auditState.running
+                        ? `Auditing ${auditState.done}/${auditState.total}…`
+                        : 'AI Audit'}
+                    </button>
+                  )}
+                </div>
               </div>
+
+              {(auditState.summary || auditState.error) && (
+                <div className="mb-4 border border-ink/15 bg-paper-sunken rounded-sm p-3">
+                  {auditState.error ? (
+                    <p className="text-xs text-accent">{auditState.error}</p>
+                  ) : (
+                    <>
+                      <div className="flex items-baseline gap-3 flex-wrap mb-2">
+                        <span className="eyebrow">AI difficulty</span>
+                        <span className="font-display font-semibold text-ink">
+                          {Math.round(auditState.summary.mean)}
+                        </span>
+                        <span className="text-xs text-ink-faint font-mono">
+                          hardest fifth {Math.round(auditState.summary.p80)}
+                          {auditState.summary.unrated > 0 && ` · ${auditState.summary.unrated} unrated`}
+                        </span>
+                      </div>
+                      {/* The average hides the entries that actually stall a solver, so
+                          call out the worst few explicitly. */}
+                      <ul className="text-xs text-ink-soft space-y-0.5">
+                        {auditState.summary.hardest.map((h) => (
+                          <li key={`${h.number}-${h.direction}`}>
+                            <span className="font-mono text-ink-faint mr-1.5">{Math.round(h.difficulty)}</span>
+                            <span className="font-semibold">{h.number} {h.direction === 'across' ? 'A' : 'D'}</span>
+                            {' '}{h.word} — {h.clue}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              )}
               <div className="rule-hair my-4" />
               <div className="overflow-x-auto pb-2"><div className="xw-grid" style={{ '--cols': grid[0]?.length || 15 }}>
                 {grid.map((row, r) => <div key={r} className="flex">{row.map((cell, c) => <div key={c} className={`xw-cell ${cell === '#' ? 'xw-cell--block' : ''}`}>{cell !== '#' && getNumberForCell(r, c) && <span className="xw-num">{getNumberForCell(r, c)}</span>}{cell !== '#' && cell !== null && <span className="xw-letter">{cell}</span>}</div>)}</div>)}
