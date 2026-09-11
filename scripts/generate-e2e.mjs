@@ -7,7 +7,7 @@
 //
 // Run:  npm run build && node scripts/generate-e2e.mjs
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -79,7 +79,16 @@ async function connect(port) {
 let preview, edge, profile;
 function cleanup() {
   try { edge?.kill(); } catch { /* ignore */ }
-  try { preview?.kill(); } catch { /* ignore */ }
+  try {
+    // shell:true means `preview.pid` is the shell, not the node process it
+    // spawned. Killing only the shell leaks a vite preview that keeps the port
+    // AND serves a stale file list, so the next run's new asset hashes 404.
+    if (preview?.pid) {
+      try { spawnSync('taskkill', ['/PID', String(preview.pid), '/T', '/F'], { stdio: 'ignore' }); }
+      catch { /* not windows */ }
+    }
+    preview?.kill();
+  } catch { /* ignore */ }
   try { if (profile) rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 process.on('exit', cleanup);
@@ -87,6 +96,12 @@ process.on('SIGINT', () => { cleanup(); process.exit(1); });
 
 try {
   console.log('starting preview server...');
+  // If a previous run leaked a server, --strictPort makes our spawn fail silently
+  // and we would test against ITS stale dist. Refuse instead.
+  try {
+    const probe = await fetch(BASE);
+    if (probe.ok) throw new Error(`port ${PREVIEW_PORT} already in use — a previous preview leaked; kill it first`);
+  } catch (e) { if (/already in use/.test(e.message)) throw e; }
   preview = spawn('npx', ['vite', 'preview', '--port', String(PREVIEW_PORT), '--strictPort'],
     { cwd: ROOT, shell: true, stdio: 'ignore' });
   for (let i = 0; i < 80; i++) {
@@ -192,6 +207,70 @@ try {
   if (page.console_.length) {
     console.log('  console tail:');
     for (const l of page.console_.slice(-8)) console.log(`    ${l.slice(0, 160)}`);
+  }
+
+  // Optional: the AI difficulty audit, only when the configured Ollama is actually up.
+  // Skipped rather than failed so this harness stays useful offline.
+  const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
+  let ollamaUp = false;
+  try {
+    const c = new AbortController();
+    const to = setTimeout(() => c.abort(), 4000);
+    ollamaUp = (await fetch(`${OLLAMA}/api/tags`, { signal: c.signal })).ok;
+    clearTimeout(to);
+  } catch { ollamaUp = false; }
+
+  if (!ollamaUp) {
+    console.log(`  skip: AI audit (${OLLAMA} unreachable)`);
+  } else {
+    await page.evaluate(`(() => {
+      localStorage.setItem('krosalita:ollama', JSON.stringify(
+        { enabled: true, baseUrl: ${JSON.stringify(OLLAMA)}, model: 'qwen3.5:27b' }));
+      location.reload();
+    })()`);
+    await sleep(2500);
+    // Regenerate after the reload so a puzzle exists again.
+    await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .filter(x => (x.textContent||'').trim().toLowerCase() === 'generate' && !x.disabled)
+        .find(x => /\bbtn\b/.test(x.className || ''));
+      if (b) b.click();
+    })()`);
+    await sleep(700);
+    await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => /^confirm$/i.test((x.textContent||'').trim()) && !x.disabled);
+      if (b) b.click();
+    })()`);
+    for (let i = 0; i < 40; i++) {
+      if (await page.evaluate(`!!document.body.innerText.match(/AI Audit/i)`)) break;
+      await sleep(500);
+    }
+    const started = await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => /ai audit/i.test((x.textContent||'').trim()) && !x.disabled);
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    if (!started) {
+      bad('AI audit button present', 'no enabled "AI Audit" button after enabling Ollama');
+    } else {
+      ok('AI audit button present');
+      let summary = null;
+      for (let i = 0; i < 90; i++) {          // 84 clues ~ 5 batches ~ 2-3 min
+        summary = await page.evaluate(
+          `(document.body.innerText.match(/AI difficulty[\s\S]{0,220}/i) || [''])[0]`);
+        if (summary && !/Auditing/i.test(summary)) break;
+        await sleep(3000);
+      }
+      if (summary && /AI difficulty/i.test(summary)) {
+        ok('AI audit returned a rating');
+        console.log('  ' + summary.split(String.fromCharCode(10)).slice(0, 6).join(' | ').slice(0, 220));
+      } else {
+        bad('AI audit returned a rating', 'no summary rendered in time');
+      }
+    }
   }
 
   const shot = await page.send('Page.captureScreenshot', { format: 'png' });

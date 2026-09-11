@@ -117,6 +117,8 @@ console.log('layout              difficulty   ok      p50     p95    nodes    bt
 
 const allTimes = [];
 let totalRuns = 0, totalOk = 0, dupTotal = 0, badClueTotal = 0, emptyClueTotal = 0, mismatchTotal = 0;
+let gridMismatchTotal = 0, notInDictTotal = 0;
+const dictionary = new Set(corpus.entries.map((e) => e.word));
 
 for (const layout of DEFAULT_LAYOUTS) {
   for (const [dname, dtarget] of DIFFICULTIES) {
@@ -138,6 +140,33 @@ for (const layout of DEFAULT_LAYOUTS) {
         continue;
       }
       ok++; totalOk++;
+
+      // gate: the GRID must agree with the placements, and every entry read off the
+      // grid must be a real dictionary word.
+      //
+      // This is the gate that matters most and the one that was missing: a propagation
+      // bug let two assigned slots disagree on a shared letter, so the grid contained
+      // strings like COATT where the placement said COAST. Duplicate and clue checks
+      // both passed throughout, because they only ever looked at `placements`.
+      const gridOf = (row, col, dir, len) => {
+        let s = '';
+        for (let i = 0; i < len; i++) {
+          const ch = r.grid[dir === 'across' ? row : row + i][dir === 'across' ? col + i : col];
+          if (!ch || ch === '#') return null;
+          s += ch;
+        }
+        return s;
+      };
+      for (const p of r.placements) {
+        const fromGrid = gridOf(p.slot.row, p.slot.col, p.slot.direction, p.slot.length);
+        if (fromGrid !== p.word) {
+          gridMismatchTotal++;
+          note(`${layout.name}/${dname}/seed ${seed}: grid reads ${fromGrid} where the placement says ${p.word}`);
+        } else if (!dictionary.has(p.word)) {
+          notInDictTotal++;
+          note(`${layout.name}/${dname}/seed ${seed}: ${p.word} is not in the word list`);
+        }
+      }
 
       // gate: no repeated answers
       const seen = new Set();
@@ -177,6 +206,7 @@ for (const layout of DEFAULT_LAYOUTS) {
 
 const P50 = pct(allTimes, 0.5), P95 = pct(allTimes, 0.95), PMAX = Math.max(...allTimes);
 console.log(`\noverall  ${totalOk}/${totalRuns} filled · p50 ${P50}ms · p95 ${P95}ms · max ${PMAX}ms`);
+console.log(`         grid/placement mismatches: ${gridMismatchTotal} · answers not in word list: ${notInDictTotal}`);
 console.log(`         duplicate answers: ${dupTotal} · rejected clues: ${badClueTotal} · mismatched clues: ${mismatchTotal} · unclued answers: ${emptyClueTotal}`);
 
 if (P95 > P95_BUDGET) note(`p95 ${P95}ms exceeds ${P95_BUDGET}ms budget`);

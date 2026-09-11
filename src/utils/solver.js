@@ -36,8 +36,13 @@ const K_TOP = 48;              // best-by-quality candidates considered per node
 const K_RAND = 16;             // extra random candidates, for variety across seeds
 const LOOKAHEAD_WORDS = 32;    // u32 words scanned when sizing a crossing domain
 const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted work
-const REVISE_MAX_LETTERS = 12; // skip arcs that barely prune (sound: pruning is optional)
+// Skip an arc whose allowed-letter set is this wide: it prunes little for its cost.
+// Sound because propagation is pure pruning -- and the arc that actually enforces
+// cross-letter agreement is always the singleton one, which is never skipped.
+// Tuned on the full sweep: 8 -> p95 55ms, 12 -> 41ms, 18 -> 31ms / max 107ms, 27 -> 80ms.
+const REVISE_MAX_LETTERS = 18;
 const LUBY_BASE = 200;         // backtracks per restart unit
+const REQUIRED_RETRY_RESTARTS = 24; // restarts spent chasing every required word
 const ALPHA_QUALITY = 2.5;     // weight of static word quality in value ordering
 const DEFAULT_BETA_DIFF = 3.0; // weight of difficulty-target matching
 
@@ -115,6 +120,17 @@ export function solveCrossword(opts) {
   if (S === 0) {
     return fail(err('NO_SLOTS',
       'This layout has no word slots — every run of white cells is a single square.'));
+  }
+
+  // slotCellOf/crossSlot are strided by MAXLEN, so a longer run would write into the
+  // NEXT slot's rows and silently corrupt the topology -- before preflight could reject
+  // it. Unreachable with the shipped 15-wide layouts; reachable with a hand-drawn grid.
+  for (const sl of slots) {
+    if (sl.length > MAXLEN) {
+      return fail(err('NO_WORDS_FOR_LENGTH',
+        `This layout has a ${sl.length}-letter slot, longer than the ${MAXLEN}-letter maximum.`,
+        { len: sl.length }));
+    }
   }
 
   const CELLS = rows * cols;
@@ -294,6 +310,7 @@ export function solveCrossword(opts) {
   const assignOrder = new Int32Array(S + 2).fill(-1);
   const assignVal = new Int32Array(S + 2).fill(-1);
   const countStamp = new Int32Array(S).fill(-1);
+  const domLevel = new Int32Array(S);
 
   const CW = Math.ceil(S / 32) || 1;
   const conflict = new Uint32Array(S * CW);
@@ -348,10 +365,17 @@ export function solveCrossword(opts) {
   function noteCountChange(s) {
     if (countStamp[s] !== level) {
       countStamp[s] = level;
-      trailC = grow(trailC, tcTop + 2);
+      trailC = grow(trailC, tcTop + 3);
       trailC[tcTop++] = s;
       trailC[tcTop++] = domCount[s];
+      trailC[tcTop++] = domLevel[s];
     }
+    // A domain can shrink without any of its cells' masks shrinking -- structural dedup
+    // strikes a word from non-crossing slots, and reviseSlot often halves a domain while
+    // lettersAt() stays the same 26-bit set. cellLevel therefore under-reports who is
+    // responsible, and a backjump computed from it alone can skip the real culprit and
+    // permanently prune a value that was never proven inconsistent.
+    domLevel[s] = level;
   }
 
   /** dom[s] &= src, trailed. Returns bits removed. */
@@ -437,9 +461,10 @@ export function solveCrossword(opts) {
   function undoToMark(mw, mc, mm) {
     for (let t = twTop - 2; t >= mw; t -= 2) domArena[trailW[t]] = trailW[t + 1];
     twTop = mw;
-    for (let t = tcTop - 2; t >= mc; t -= 2) {
+    for (let t = tcTop - 3; t >= mc; t -= 3) {
       const s = trailC[t];
       domCount[s] = trailC[t + 1];
+      domLevel[s] = trailC[t + 2];
       recomputeWindow(s);
       // Bumped, never restored — this is what invalidates posCache for free.
       domVersion[s] = ++tick;
@@ -513,10 +538,33 @@ export function solveCrossword(opts) {
     return removed > 0 ? CHANGED : NO_CHANGE;
   }
 
+  const shuffledRequired = () => {
+    const a = [...requiredList];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = randInt(rng, i + 1);
+      const t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  };
+
   let wipeoutSlot = -1;
+  // Budget state lives here, not in solveOnce: almost all backtracking happens inside
+  // handleFailure's recursion, which only ever bumped the global stat. The Luby restart
+  // schedule -- and with it the carried-forward wdeg weights -- therefore never fired on
+  // exactly the hard instances it exists for.
+  let btCount = 0;
+  let btBudget = Infinity;
+  let needRestart = false;
 
   function propagate(seedSlot) {
     stats.propagations++;
+    // `qh`/`qt` are call-locals but `inQueue` is not, and the three early returns below
+    // (empty cell mask, revise wipeout, emptied cell) all abandon a non-empty queue.
+    // Any flag left set makes that cell permanently un-pushable for the rest of the
+    // restart, which silently disables the ONLY thing enforcing letter agreement between
+    // two assigned slots -- producing grids whose entries are not words at all.
+    // CELLS <= 225, so clearing up front is free.
+    inQueue.fill(0);
     let qh = 0, qt = 0;
     const push = (ci) => {
       if (inQueue[ci]) return;
@@ -608,14 +656,20 @@ export function solveCrossword(opts) {
     if (!set) requiredIdx.set(w.length, (set = new Set()));
     set.add(i);
   }
+  const requiredList = requiredWords
+    .map((w) => ({ word: w, len: w.length, idx: index.lookup[w.length]?.get(w) }))
+    .filter((r) => r.idx !== undefined);
+  // Keyed by length AND index: word indices are per-length, so a bare index would let
+  // the 4-letter word #5 mark the 6-letter word #5 as already used.
   const usedRequired = new Set();
+  const reqKey = (len, wi) => len * 1000000 + wi;
 
   function slotHasRequired(s) {
     const set = requiredIdx.get(slotLen[s]);
     if (!set) return false;
     const off = domOff[s];
     for (const wi of set) {
-      if (usedRequired.has(wi)) continue;
+      if (usedRequired.has(reqKey(slotLen[s], wi))) continue;
       if ((domArena[off + (wi >>> 5)] & (1 << (wi & 31))) !== 0) return true;
     }
     return false;
@@ -672,7 +726,7 @@ export function solveCrossword(opts) {
     const reqHere = requiredIdx.get(len);
     if (reqHere) {
       for (const wi of reqHere) {
-        if (usedRequired.has(wi)) continue;
+        if (usedRequired.has(reqKey(len, wi))) continue;
         if ((domArena[off + (wi >>> 5)] & (1 << (wi & 31))) !== 0) {
           candBuf[nc++] = wi;
           if (nc >= candBuf.length) break;
@@ -723,7 +777,7 @@ export function solveCrossword(opts) {
       }
       if (!ok) { removeValueTrailed(s, w); continue; }
       let q = supp + ALPHA_QUALITY * (li.score[w] / 65535);
-      if (reqSet && reqSet.has(w) && !usedRequired.has(w)) q += 1000;
+      if (reqSet && reqSet.has(w) && !usedRequired.has(reqKey(len, w))) q += 1000;
       if (target != null) q -= difficultyWeight * Math.abs(li.diff[w] / 255 - target);
       // insertion sort, descending
       let j = n++;
@@ -765,6 +819,7 @@ export function solveCrossword(opts) {
     }
     const cj = conflictMaxLevel(t);
     if (cj > jump) jump = cj;
+    if (domLevel[t] > jump) jump = domLevel[t];
     if (jump <= 0 || jump > level) return false;
 
     if (jump < level) stats.backjumps++;
@@ -772,7 +827,7 @@ export function solveCrossword(opts) {
       undoToMark(markW[level], markC[level], markM[level]);
       const s = assignOrder[level];
       if (s >= 0) {
-        if (assign[s] >= 0 && requiredIdx.has(slotLen[s])) usedRequired.delete(assign[s]);
+        if (assign[s] >= 0) usedRequired.delete(reqKey(slotLen[s], assign[s]));
         unassign(s);
       }
       valueStack[level] = null;
@@ -793,7 +848,7 @@ export function solveCrossword(opts) {
 
     // Undo the failed decision at `jump` and try its next alternative.
     undoToMark(markW[jump], markC[jump], markM[jump]);
-    if (assign[d] >= 0) { usedRequired.delete(assign[d]); unassign(d); }
+    if (assign[d] >= 0) { usedRequired.delete(reqKey(slotLen[d], assign[d])); unassign(d); }
     removeValueTrailed(d, assignVal[jump]);
 
     const vals = valueStack[jump];
@@ -813,16 +868,17 @@ export function solveCrossword(opts) {
     level = jump;
     if (!placeValue(d, next)) {
       stats.backtracks++;
+      if (++btCount > btBudget) { needRestart = true; return false; }
       return handleFailure(wipeoutSlot);
     }
-    if (requiredIdx.get(slotLen[d])?.has(next)) usedRequired.add(next);
+    if (requiredIdx.get(slotLen[d])?.has(next)) usedRequired.add(reqKey(slotLen[d], next));
     return true;
   }
 
   /** All values at `lv` are exhausted — propagate the failure one level further up. */
   function handleFailureAt(d, lv) {
     undoToMark(markW[lv], markC[lv], markM[lv]);
-    if (assign[d] >= 0) { usedRequired.delete(assign[d]); unassign(d); }
+    if (assign[d] >= 0) { usedRequired.delete(reqKey(slotLen[d], assign[d])); unassign(d); }
     valueStack[lv] = null;
     level = lv - 1;
     if (level <= 0) return false;
@@ -957,12 +1013,69 @@ export function solveCrossword(opts) {
     placedDiffSum = 0;
     level = 0;
     twTop = tcTop = tmTop = 0;
+    domLevel.fill(0);
+    btCount = 0;
+    btBudget = budget;
+    needRestart = false;
     let backtracks = 0;
+
+    // Anchor the required words as real decisions before the free search starts.
+    // Nudging slot selection and value ordering (the 0.001 multiplier and the +1000
+    // bonus) is not enough on its own: the search can still finish a valid grid that
+    // simply never used one of them. Placing them first makes them part of the problem
+    // rather than a preference, and because these are ordinary trailed decisions the
+    // search can still backjump through them if they turn out to be unsatisfiable.
+    if (requiredMode === 'anchor' && requiredList.length) {
+      for (const req of shuffledRequired()) {
+        if (usedRequired.has(reqKey(req.len, req.idx))) continue;
+        // Most-constrained slot that can still take it, so the tightest corner is
+        // committed while the rest of the grid is still open.
+        let bestSlot = -1;
+        let bestCount = Infinity;
+        for (let t = 0; t < S; t++) {
+          if (assign[t] >= 0 || slotLen[t] !== req.len) continue;
+          if ((domArena[domOff[t] + (req.idx >>> 5)] & (1 << (req.idx & 31))) === 0) continue;
+          if (domCount[t] < bestCount) { bestCount = domCount[t]; bestSlot = t; }
+        }
+        if (bestSlot < 0) continue;
+        level++;
+        markW[level] = twTop; markC[level] = tcTop; markM[level] = tmTop;
+        assignOrder[level] = bestSlot;
+        assignVal[level] = req.idx;
+        valueStack[level] = Int32Array.of(req.idx);
+        valueStackN[level] = 1;
+        valueStackI[level] = 1;
+        conflictClear(bestSlot);
+        if (placeValue(bestSlot, req.idx)) {
+          usedRequired.add(reqKey(req.len, req.idx));
+        } else {
+          // Undo and leave it to value ordering; a later restart will try another slot.
+          undoToMark(markW[level], markC[level], markM[level]);
+          unassign(bestSlot);
+          valueStack[level] = null;
+          level--;
+        }
+      }
+    }
 
     for (;;) {
       checkClock();
       stats.nodes++;
-      if (placedCount === S) return 'SOLVED';
+      if (placedCount === S) {
+        // A full grid that quietly dropped one of the user's required words is not a
+        // success -- "required" has to mean required. Anchoring re-shuffles its order
+        // each restart, so retrying is productive rather than a rerun of the same
+        // search. Bounded so a near-impossible request still returns its best grid
+        // instead of burning the whole budget.
+        if (requiredMode === 'anchor'
+            && usedRequired.size < requiredList.length
+            && stats.restarts < REQUIRED_RETRY_RESTARTS
+            && now() - t0 < timeoutMs * 0.6) {
+          needRestart = true;
+          return 'RESTART';
+        }
+        return 'SOLVED';
+      }
 
       if ((stats.nodes & 511) === 0) {
         onProgress(`${placedCount}/${S} filled · ${stats.backtracks} backtracks · `
@@ -974,7 +1087,7 @@ export function solveCrossword(opts) {
       if (domCount[s] === 0) {
         stats.backtracks++;
         if (++backtracks > budget) return 'RESTART';
-        if (!handleFailure(s)) return 'EXHAUSTED';
+        if (!handleFailure(s)) return needRestart ? 'RESTART' : 'EXHAUSTED';
         continue;
       }
 
@@ -988,7 +1101,7 @@ export function solveCrossword(opts) {
         level--;
         stats.backtracks++;
         if (++backtracks > budget) return 'RESTART';
-        if (!handleFailure(s)) return 'EXHAUSTED';
+        if (!handleFailure(s)) return needRestart ? 'RESTART' : 'EXHAUSTED';
         continue;
       }
       valueStack[level] = Int32Array.from(valBuf.subarray(0, n));
@@ -999,9 +1112,9 @@ export function solveCrossword(opts) {
       if (!placeValue(s, valBuf[0])) {
         stats.backtracks++;
         if (++backtracks > budget) return 'RESTART';
-        if (!handleFailure(wipeoutSlot)) return 'EXHAUSTED';
+        if (!handleFailure(wipeoutSlot)) return needRestart ? 'RESTART' : 'EXHAUSTED';
       } else {
-        if (requiredIdx.get(slotLen[s])?.has(valBuf[0])) usedRequired.add(valBuf[0]);
+        if (requiredIdx.get(slotLen[s])?.has(valBuf[0])) usedRequired.add(reqKey(slotLen[s], valBuf[0]));
         if (placedCount > bestPlaced) recordBest();
       }
     }
