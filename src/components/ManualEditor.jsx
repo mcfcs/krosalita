@@ -165,7 +165,10 @@ const ManualEditor = ({
                 ? ((across && isSlotFilled(across) && failedWord.toUpperCase() === acrossWord) ||
                    (down && isSlotFilled(down) && failedWord.toUpperCase() === downWord))
                 : false;
-              const shouldShowRequiredMissing = inHighlightedWord && missingClue && highlightMissingRequired && !showRequiredHighlights;
+              // `!showRequiredHighlights` used to be in this condition, but inHighlightedWord
+              // already requires it to be TRUE — so the branch could never render and the
+              // "required word that still needs a clue" state was unreachable.
+              const shouldShowRequiredMissing = inHighlightedWord && missingClue && highlightMissingRequired;
               const cellClass = cell === '#'
                 ? 'xw-cell--block'
                 : inFailedWord
