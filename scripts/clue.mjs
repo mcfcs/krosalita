@@ -113,7 +113,7 @@ if (bySense) {
     // Silence would read as approval. An answer with no published clues cannot have any
     // of its meanings corroborated, and the model does invent them -- it placed GHAST in
     // Super Mario -- so say that outright rather than leaving the line blank.
-    const tag = sn.corroborated === null ? '  [unchecked — nothing published to compare against]'
+    const tag = sn.corroborated === null ? `  [unchecked — ${sn.unchecked || 'nothing to compare against'}]`
       : sn.corroborated ? '  [matches published clues]'
         : `  [unverified — check this meaning exists, ${sn.similarity.toFixed(2)}]`;
     console.log(`${NL}  ${sn.label}${tag}`);

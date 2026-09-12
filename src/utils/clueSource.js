@@ -164,7 +164,11 @@ export async function sensesForAnswer(corpus, word, { baseUrl, model, embedUrl, 
   const senses = await discoverSenses({ baseUrl, model, word, known, signal });
   if (!senses.length) return [];
   if (!embedUrl || known.length < 3) {
-    return senses.map((s) => ({ ...s, similarity: null, corroborated: null }));
+    // `unchecked` is not the same as `unverified`: there is simply nothing solid to
+    // compare against. RAZER has two published clues, which is too thin a centroid to
+    // judge a sense by, and that is worth saying differently from "never clued at all".
+    const why = known.length ? 'too few published clues to compare' : 'never clued before';
+    return senses.map((s) => ({ ...s, similarity: null, corroborated: null, unchecked: why }));
   }
   try {
     const vecs = await embedTexts({

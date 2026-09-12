@@ -115,6 +115,12 @@ self.onmessage = async (e) => {
     for (const w of words) {
       const i = cached?.clueStore?.wordIndexOf?.get(w);
       const e = i === undefined ? null : cached.entries?.[i];
+      // An uploaded CSV or Tagalog mode has no packed clue store, only rowIndex. Without
+      // this fallback the Studio showed no candidates at all in those modes -- silently,
+      // since an empty list is indistinguishable from an answer with no clues.
+      const clues = cached?.clueStore
+        ? cluesForWord(cached.clueStore, w)
+        : (cached?.rowIndex?.get(w) || []).slice(0, 8);
       data[w] = {
         answerFeatures: e ? {
           corpusFreqLog: e.corpusFreqLog,
@@ -122,7 +128,7 @@ self.onmessage = async (e) => {
           crosswordese: e.crosswordese,
           distinctClues: e.distinctClues,
         } : null,
-        clues: cluesForWord(cached?.clueStore, w),
+        clues,
       };
     }
     self.postMessage({ type: 'clueDataResult', data });

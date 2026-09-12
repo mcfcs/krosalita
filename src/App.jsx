@@ -1692,8 +1692,11 @@ const CrosswordGenerator = () => {
     setUserClues(next);
     setWords((prev) => (prev.some((e) => e.word === w && e.clue === c)
       ? prev : [...prev, { date, word: w, clue: c, difficulty: '' }]));
-    setUsingCustomWords(true);
-    corpusFpRef.current = null;
+    // Deliberately does NOT set usingCustomWords. That flag swaps the worker off the
+    // packed corpus and onto a structured clone of every CSV row, which has no clue store
+    // -- so accepting a single clue used to blank the Clue Studio that offered it, and
+    // degrade fill quality, for the rest of the session. A saved clue belongs in the
+    // dictionary and the export; it is not a reason to abandon the corpus.
     return true;
   }, [userClues]);
 

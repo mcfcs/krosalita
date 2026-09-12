@@ -227,14 +227,25 @@ try {
   // copy lands a render tick after the tab switch — poll rather than guess a delay.
   // Letters live in <span class="xw-letter"> INSIDE the clickable <div class="xw-cell">,
   // so the leaf-node scan used for the proof grid above finds nothing here.
+  // Wait for the grid to be FULLY copied, not merely non-empty. A partially synced grid
+  // still has gaps, every word containing one is incomplete, and the Clues button stays
+  // disabled — which showed up as an intermittent "no enabled Clues button" failure.
   let createLetters = 0;
-  for (let i = 0; i < 40; i++) {
-    createLetters = await page.evaluate(`document.querySelectorAll('.xw-cell .xw-letter').length`);
-    if (createLetters > 40) break;
+  let openCells = 0;
+  for (let i = 0; i < 60; i++) {
+    const m = await page.evaluate(`JSON.stringify({
+      letters: document.querySelectorAll('.xw-cell .xw-letter').length,
+      open: [...document.querySelectorAll('.xw-cell')].filter(c => !c.classList.contains('xw-cell--block')).length
+    })`);
+    ({ letters: createLetters, open: openCells } = JSON.parse(m));
+    if (openCells > 0 && createLetters >= openCells) break;
     await sleep(250);
   }
-  if (createLetters > 40) ok(`Create grid carries the fill (${createLetters} letters)`);
-  else bad('Create grid carries the fill', `${createLetters} lettered cells in .xw-cell`);
+  if (openCells > 0 && createLetters >= openCells) {
+    ok(`Create grid fully carries the fill (${createLetters}/${openCells} squares)`);
+  } else {
+    bad('Create grid carries the fill', `${createLetters} of ${openCells} open squares filled`);
+  }
 
   // Reads the open ClueStudio panel: header is `<span class="eyebrow">Clues for</span>`
   // then the answer; each candidate row is `<span>percentile</span><button>clue</button>`
@@ -348,6 +359,24 @@ try {
     } else {
       bad('accepted clue applied', `looked for "${stripped.slice(0, 40)}", slot shows "${clueNow.slice(0, 40)}"`);
     }
+
+    // Regression: accepting a clue used to flip usingCustomWords, which swapped the worker
+    // off the packed corpus onto CSV rows with no clue store -- so the Studio went blank
+    // from then on. The existing checks missed it because the audit step reloads the page
+    // in between, which reset the flag. Reopen it here, in the same page session.
+    await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => (x.textContent || '').trim() === 'Clues' && !x.disabled);
+      if (b) b.click();
+    })()`);
+    let again = null;
+    for (let i = 0; i < 30; i++) {
+      again = await page.evaluate(READ_STUDIO);
+      if (again && (again.rows.length || !again.loading)) break;
+      await sleep(400);
+    }
+    if (again?.rows?.length) ok(`Studio still works after accepting (${again.rows.length} candidates)`);
+    else bad('Studio still works after accepting', `panel now shows ${again?.rows?.length ?? 'nothing'}`);
   }
 
   // Optional: the AI difficulty audit, only when the configured Ollama is actually up.
