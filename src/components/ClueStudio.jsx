@@ -1,9 +1,15 @@
 import React, { useState } from 'react';
-import { X, Zap, Check, RefreshCw, Edit3 } from './Icons';
+import { X, Zap, Check, RefreshCw, Edit3, Search } from './Icons';
 import { renderRich } from '../utils/richText';
 import { BANDS } from '../utils/clueSource';
 
 const BAND_ORDER = ['easy', 'medium', 'hard'];
+
+// Mirrors senseText in clueSource so a chip can tell whether it is the selected one.
+const senseTextOf = (sn) => (
+  !sn ? '' : [sn.label, sn.gloss].filter(Boolean).join(' — ')
+    + (sn.domain ? ` (vocabulary: ${sn.domain})` : '')
+);
 
 const bandClass = (band) => (
   band === 'easy' ? 'text-inkblue' : band === 'medium' ? 'text-gold' : 'text-accent'
@@ -30,7 +36,11 @@ export default function ClueStudio({
   aiEnabled,
   sense = '',
   reading = '',
+  senses = null,
+  findingSenses = false,
   onSenseChange = () => {},
+  onDiscoverSenses = () => {},
+  onPickSense = () => {},
   onGenerate,
   onAccept,
   onClose,
@@ -134,6 +144,50 @@ export default function ClueStudio({
 
       {aiEnabled && (
         <div className="px-3 py-2 border-b border-line">
+          {/* An answer usually refers to more than one thing, and the corpus only records
+              the sense it happened to use — RAZER is only ever "Leveler", never the brand.
+              Listing the meanings makes the others reachable. */}
+          <div className="flex items-center gap-2 flex-wrap mb-2">
+            <button onClick={onDiscoverSenses} disabled={findingSenses} className="btn btn-sm btn-ghost">
+              {findingSenses ? <RefreshCw size={13} className="animate-spin" /> : <Search size={13} />}
+              {findingSenses ? 'Looking…' : senses ? 'Find meanings again' : 'What can it mean?'}
+            </button>
+            {senses?.length === 0 && (
+              <span className="text-[11px] text-ink-faint">No distinct meanings came back.</span>
+            )}
+          </div>
+
+          {senses?.length > 0 && (
+            <ul className="mb-2 space-y-1">
+              {senses.map((sn) => {
+                const picked = sense === senseTextOf(sn);
+                return (
+                  <li key={sn.label}>
+                    <button
+                      onClick={() => onPickSense(picked ? null : sn)}
+                      className={`w-full text-left px-2 py-1.5 rounded-sm border text-xs transition ${
+                        picked ? 'border-ink bg-ink text-paper-raised' : 'border-ink/20 hover:bg-ink/5'
+                      }`}
+                    >
+                      <span className="font-semibold">{sn.label}</span>
+                      {sn.corroborated === true && (
+                        <span className="ml-1.5 eyebrow text-[0.55rem] text-grass">as published</span>
+                      )}
+                      {sn.corroborated === false && (
+                        <span className="ml-1.5 eyebrow text-[0.55rem] text-accent" title="This meaning doesn't match how the answer has been clued — check it's real.">unverified</span>
+                      )}
+                      {sn.corroborated === null && (
+                        <span className="ml-1.5 eyebrow text-[0.55rem] text-ink-faint" title={sn.unchecked || ''}>unchecked</span>
+                      )}
+                      {sn.gloss && (
+                        <span className={`block mt-0.5 ${picked ? 'text-paper-raised/80' : 'text-ink-faint'}`}>{sn.gloss}</span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
           <input
             className="field w-full text-sm"
             value={sense}

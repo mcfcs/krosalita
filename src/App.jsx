@@ -17,6 +17,7 @@ import RequiredWordsModal from './components/RequiredWordsModal';
 import SettingsModal from './components/SettingsModal';
 import { DEFAULT_LAYOUTS } from './data/layouts';
 import { parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, getCellNumber } from './utils/crosswordUtils';
+import { isClueUsableFor } from './utils/clueFilters';
 import { loadJSON, saveJSON } from './utils/storage';
 
 // Clues the user writes or accepts. Kept separate from the corpus so they survive the CSV
@@ -29,6 +30,7 @@ import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } fro
 import { loadClueModel, cluePercentile } from './utils/clueScore';
 import {
   BANDS, scoreCandidates, flagImplausible, makeGenerator, recluePuzzle,
+  sensesForAnswer, senseText,
 } from './utils/clueSource';
 import { memoryClueStore } from './utils/clueIndex';
 import { useAuth } from './hooks/useAuth';
@@ -298,13 +300,22 @@ const CrosswordGenerator = () => {
       return cell.toUpperCase();
     }));
     
+    // A clue may only be re-pinned to the slot it was written for. clueIndex returns a
+    // preset verbatim for whatever word now occupies the slot, so sending a clue whose
+    // answer has changed under it drags the old clue onto the new entry (THEME's
+    // "Unifying idea" ending up on THREE). manualClues[].word records the answer the
+    // clue was assigned to, but ordinary typing edits the grid without touching it —
+    // so the letters currently in manualGrid are the source of truth for "unchanged".
     const presetClues = {};
-    manualClues.across.forEach(c => {
-      presetClues[`across-${c.row}-${c.col}`] = c.clue || '';
-    });
-    manualClues.down.forEach(c => {
-      presetClues[`down-${c.row}-${c.col}`] = c.clue || '';
-    });
+    const addPresetClue = (c, direction) => {
+      if (!c.clue) return;
+      const current = getWordFromGrid(presetGrid, c.row, c.col, c.length, direction);
+      if (current.length !== c.length) return;                          // slot no longer complete
+      if (c.word && current !== c.word.toUpperCase()) return;           // answer changed under the clue
+      presetClues[`${direction}-${c.row}-${c.col}`] = c.clue;
+    };
+    manualClues.across.forEach(c => addPresetClue(c, 'across'));
+    manualClues.down.forEach(c => addPresetClue(c, 'down'));
     const requiredMerged = requiredWordsList.map(w => w.toUpperCase());
 
     // Fully-filled squares are passed through as presetGrid; the solver injects any
@@ -402,7 +413,13 @@ const CrosswordGenerator = () => {
       const slots = findSlots(layout);
       const filled = placements ? placements.length : 0;
       setProgress(`Stopped with best result: ${filled}/${slots.length} slots filled. You can keep editing and run again.`);
-      if (filled === 0) setError('Could not place additional words with the current letters.');
+      // Preflight refusals (DUPLICATE_PRESET_WORD, TOO_MANY_CUSTOM_WORDS,
+      // REQUIRED_WORD_NO_SLOT, INSUFFICIENT_WORDS_FOR_LENGTH, NO_CORPUS…) name the
+      // actual blocker. Surface them the way generatePuzzle does instead of collapsing
+      // every one into the generic "current letters" line.
+      const solverMessage = picked?.error?.message;
+      if (solverMessage) setError(solverMessage);
+      else if (filled === 0) setError('Could not place additional words with the current letters.');
       const lastPlaced = placements?.length ? placements[placements.length - 1]?.word : null;
       setFailedWord(lastPlaced || solveFailedWord || null);
     }
@@ -1248,13 +1265,15 @@ const CrosswordGenerator = () => {
   };
 
   const updateClue = (clueText) => {
-    const { slot } = getCurrentWord();
+    const { word, slot } = getCurrentWord();
     if (!slot) return;
     const direction = slot.direction;
     const clueList = direction === 'across' ? [...manualClues.across] : [...manualClues.down];
     const clueIndex = clueList.findIndex(c => c.row === slot.row && c.col === slot.col);
     if (clueIndex !== -1) {
-      clueList[clueIndex] = { ...clueList[clueIndex], clue: clueText };
+      // Record which answer the user wrote this clue for, so generateManualFill can tell
+      // later whether the slot still holds it (see addPresetClue).
+      clueList[clueIndex] = { ...clueList[clueIndex], clue: clueText, word: word.includes('_') ? '' : word };
       setManualClues({ ...manualClues, [direction]: clueList });
     }
     setEditingClue(null);
@@ -1270,16 +1289,34 @@ const CrosswordGenerator = () => {
     return a;
   };
 
+  // Answers already committed elsewhere in the grid. The solver forbids duplicate
+  // entries, so offering one of these as a suggestion sets up "Generate Remaining" to
+  // hard-fail with DUPLICATE_PRESET_WORD. Only fully-filled slots count — a partial
+  // slot is not yet an answer.
+  const answersInGrid = (excludeSlot = null) => {
+    const used = new Set();
+    const layout = layouts[currentLayoutIndex]?.grid;
+    if (!layout || !manualGrid) return used;
+    for (const s of findSlots(layout)) {
+      if (excludeSlot && s.direction === excludeSlot.direction
+        && s.row === excludeSlot.row && s.col === excludeSlot.col) continue;
+      const w = getWordFromGrid(manualGrid, s.row, s.col, s.length, s.direction);
+      if (w.length === s.length) used.add(w.toUpperCase());
+    }
+    return used;
+  };
+
   const findSuggestionsForSlot = () => {
     const { word, slot } = getCurrentWord();
     if (!slot || words.length === 0) return [];
 
     const pattern = word.replace(/_/g, '.');
     const regex = new RegExp(`^${pattern}$`, 'i');
+    const used = answersInGrid(slot);
 
-    // Step 1: find all matches
+    // Step 1: find all matches, minus answers already elsewhere in the grid
     const matches = words.filter(
-      w => w.word.length === slot.length && regex.test(w.word)
+      w => w.word.length === slot.length && regex.test(w.word) && !used.has(w.word.toUpperCase())
     );
 
     if (matches.length === 0) return [];
@@ -1287,26 +1324,37 @@ const CrosswordGenerator = () => {
     // 🔀 Randomize matches first
     const shuffledMatches = shuffle(matches);
 
-    // Step 2: group by Word (already randomized)
-    const byWord = shuffledMatches.reduce((acc, item) => {
-      if (!acc[item.word]) acc[item.word] = [];
-      acc[item.word].push(item);
-      return acc;
-    }, {});
+    // Step 2: group by Word (already randomized), keeping only clues that can stand
+    // alone in a generated puzzle. Rows pointing at another grid ("See 63 Down") or at
+    // a theme this puzzle does not have would be written straight into manualClues and
+    // then re-sent as a presetClue, surviving into the export. A word whose every clue
+    // is unusable is still a legal fill, so it is still offered — with an empty clue
+    // rather than a poisoned one.
+    const byWord = new Map();
+    for (const item of shuffledMatches) {
+      const key = item.word.toUpperCase();
+      if (!byWord.has(key)) byWord.set(key, []);
+      if (isClueUsableFor(item.clue, item.word)) byWord.get(key).push(item);
+    }
 
-    const uniqueWords = Object.keys(byWord);
+    const optionsFor = (w) => {
+      const list = byWord.get(w);
+      return list.length ? list : [{ word: w, clue: '' }];
+    };
+
+    const uniqueWords = [...byWord.keys()];
 
     // Step 3: decision logic
     if (uniqueWords.length === 1) {
-      // One word → show all clues (already randomized)
-      return shuffle(byWord[uniqueWords[0]]);
+      // One word → show all its usable clues (already randomized)
+      return shuffle(optionsFor(uniqueWords[0]));
     }
 
-    // Multiple words → one random clue per word
+    // Multiple words → one random usable clue per word
     return shuffle(
-      uniqueWords.map(word => {
-        const clues = byWord[word];
-        return clues[Math.floor(Math.random() * clues.length)];
+      uniqueWords.map(w => {
+        const options = optionsFor(w);
+        return options[Math.floor(Math.random() * options.length)];
       })
     ).slice(0, 10);
 
@@ -2038,7 +2086,7 @@ const CrosswordGenerator = () => {
   const openClueStudio = async (word, currentClue, band = 'medium') => {
     if (!word || /_/.test(word)) return;
     setClueStudio({ word, currentClue, band, candidates: [], loading: true, generating: false,
-      error: '', range: null, sense: '', reading: '' });
+      error: '', range: null, sense: '', reading: '', senses: null, findingSenses: false });
     try {
       const [model, data] = await Promise.all([loadScorer(), requestClueData([word])]);
       const entry = data[word];
@@ -2074,6 +2122,34 @@ const CrosswordGenerator = () => {
       .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile);
     return { ...st, band, candidates };
   });
+
+  // Ask what the answer can mean before asking for clues. The corpus only records the
+  // sense it happens to have used — RAZER is only ever "Leveler" — so without this the
+  // brand, the character or the game reading is unreachable.
+  const discoverStudioSenses = async () => {
+    const st = clueStudio;
+    if (!st) return;
+    setClueStudio((s0) => (s0 ? { ...s0, findingSenses: true, error: '' } : s0));
+    try {
+      const senses = await sensesForAnswer(
+        { clueStore: { __mem: new Map([[st.word, st.candidates
+          .filter((c) => c.source === 'corpus').map((c) => ({ clue: c.clue }))]]) } },
+        st.word,
+        {
+          baseUrl: ollamaConfig.baseUrl,
+          model: ollamaConfig.model,
+          embedUrl: ollamaConfig.baseUrl,
+        },
+      );
+      setClueStudio((s0) => (s0?.word !== st.word ? s0 : { ...s0, findingSenses: false, senses }));
+    } catch (err) {
+      setClueStudio((s0) => (s0 ? { ...s0, findingSenses: false, error: String(err?.message || err) } : s0));
+    }
+  };
+
+  const pickStudioSense = (sn) => {
+    setClueStudio((s0) => (s0 ? { ...s0, sense: sn ? senseText(sn) : '' } : s0));
+  };
 
   const generateStudioClues = async () => {
     const st = clueStudio;
@@ -2794,6 +2870,8 @@ const CrosswordGenerator = () => {
             onCloseClueStudio={() => setClueStudio(null)}
             onClueStudioBand={setClueStudioBand}
             onClueStudioSense={(v) => setClueStudio((st) => (st ? { ...st, sense: v } : st))}
+            onDiscoverSenses={discoverStudioSenses}
+            onPickSense={pickStudioSense}
             onGenerateClues={generateStudioClues}
             onClueAccepted={saveUserClue}
             aiGenerateClues={aiGenerateClues}

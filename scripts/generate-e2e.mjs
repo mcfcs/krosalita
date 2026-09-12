@@ -546,6 +546,65 @@ try {
       if (rv) break;
       await sleep(250);
     }
+    // Sense discovery needs Ollama, which only the audit step above turns on — so this
+    // runs here rather than with the other Studio checks, where AI is still off.
+    await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => (x.textContent || '').trim() === 'Clues' && !x.disabled);
+      if (b) b.click();
+    })()`);
+    await sleep(1200);
+// Sense discovery: the answer's distinct meanings, each pickable.
+    const askedSenses = await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => /what can it mean|find meanings/i.test((x.textContent || '').trim()) && !x.disabled);
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    if (askedSenses) {
+      let senseRows = [];
+      for (let i = 0; i < 60; i++) {
+        senseRows = await page.evaluate(`(() => {
+          const h = [...document.querySelectorAll('span.eyebrow')]
+            .find(e => (e.textContent || '').trim() === 'Clues for');
+          if (!h) return [];
+          const panel = h.parentElement.parentElement;
+          return [...panel.querySelectorAll('ul li button')]
+            .map(b => (b.textContent || '').trim())
+            .filter(t => /as published|unverified|unchecked/.test(t));
+        })()`);
+        if (senseRows.length) break;
+        await sleep(1000);
+      }
+      if (senseRows.length) {
+        ok(`sense list offered ${senseRows.length} meanings`);
+        for (const r of senseRows.slice(0, 3)) console.log(`       ${r.replace(/\s+/g, ' ').slice(0, 84)}`);
+        // Every meaning must carry a confidence label — the model invents them, so an
+        // unlabelled one would read as vetted.
+        const unlabelled = senseRows.filter(t => !/as published|unverified|unchecked/.test(t));
+        if (unlabelled.length) bad('every meaning is labelled', `${unlabelled.length} without a label`);
+        else ok('every meaning carries a confidence label');
+        // The Studio sits well below the fold; a viewport capture would show the header.
+        await page.evaluate(`(() => {
+          const h = [...document.querySelectorAll('span.eyebrow')]
+            .find(e => (e.textContent || '').trim() === 'Clues for');
+          if (h) h.parentElement.parentElement.scrollIntoView({ block: 'center' });
+        })()`);
+        await sleep(400);
+        const sshot = await page.send('Page.captureScreenshot', { format: 'png' });
+        if (sshot.result?.data) {
+          const out = join(ROOT, 'scripts', 'senses-e2e.png');
+          writeFileSync(out, Buffer.from(sshot.result.data, 'base64'));
+          console.log(`  screenshot: ${out}`);
+        }
+      } else {
+        bad('sense list offered meanings', 'none appeared within 60s');
+      }
+    } else {
+      console.log('  skip: sense discovery (button not present — AI off?)');
+    }
+
     if (openedReclue && rv) ok('opened the Re-clue panel from Create');
     else bad('opened the Re-clue panel', openedReclue ? 'panel header never rendered' : 'no enabled "Re-clue all" button');
 

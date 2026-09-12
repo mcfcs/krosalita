@@ -45,6 +45,8 @@ const ManualEditor = ({
   onCloseClueStudio = () => {},
   onClueStudioBand = () => {},
   onClueStudioSense = () => {},
+  onDiscoverSenses = () => {},
+  onPickSense = () => {},
   onGenerateClues = () => {},
   onClueAccepted = () => {},
   onOpenReclue = () => {},
@@ -264,6 +266,10 @@ const ManualEditor = ({
                 sense={clueStudio.sense}
                 reading={clueStudio.reading}
                 onSenseChange={onClueStudioSense}
+                senses={clueStudio.senses}
+                findingSenses={clueStudio.findingSenses}
+                onDiscoverSenses={onDiscoverSenses}
+                onPickSense={onPickSense}
                 onGenerate={onGenerateClues}
                 onAccept={(clue) => {
                   updateClue(clue);

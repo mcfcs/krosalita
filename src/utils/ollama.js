@@ -454,20 +454,34 @@ export const generateCluesBatch = async ({
  */
 export const embedTexts = async ({ baseUrl, model = 'qwen3-embedding:0.6b', texts, signal }) => {
   if (!texts?.length) return [];
-  const t = linkedTimeout(60000, signal);
-  try {
-    const res = await fetch(`${trimBase(baseUrl)}/api/embed`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input: texts }),
-      signal: t.signal,
-    });
-    if (!res.ok) throw new Error(`Embedding model responded ${res.status}.`);
-    const data = await res.json();
-    return data.embeddings || [];
-  } finally {
-    t.done();
+  // The embedding model is small and the generation model is not, so they are commonly on
+  // different machines: this setup runs a 27B over the tailnet and a 0.6B embedder
+  // locally. Pointing both at the configured server meant every embedding call 404'd, so
+  // the accuracy check and sense corroboration silently never ran. Try the configured
+  // server, then localhost.
+  const hosts = [...new Set([trimBase(baseUrl), 'http://localhost:11434'].filter(Boolean))];
+  let last = null;
+  for (const host of hosts) {
+    const t = linkedTimeout(60000, signal);
+    try {
+      const res = await fetch(`${host}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, input: texts }),
+        signal: t.signal,
+      });
+      if (!res.ok) { last = new Error(`Embedding model responded ${res.status}.`); continue; }
+      const data = await res.json();
+      if (data.embeddings?.length) return data.embeddings;
+      last = new Error('Embedding model returned nothing.');
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      last = err;
+    } finally {
+      t.done();
+    }
   }
+  throw last || new Error('No embedding model reachable.');
 };
 
 // ---------------------------------------------------------------------------
