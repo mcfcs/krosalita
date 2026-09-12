@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Trophy, Maximize } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import CrosswordGrid from './CrosswordGrid';
 import { renderRich } from '../utils/richText';
+import { difficultyColorClass } from '../utils/difficulty';
 
 const PlayView = ({
   playGrid,
@@ -45,15 +46,6 @@ const PlayView = ({
   const cluesContainerRef = useRef(null);
   const clueRefs = useRef({});
 
-  const difficultyColorClass = (label = '') => {
-    const d = label.toUpperCase();
-    if (d === 'EASY') return 'text-inkblue';
-    if (d === 'FAIR') return 'text-grass';
-    if (d === 'MODERATE') return 'text-gold';
-    if (d === 'HARD') return 'text-accent';
-    if (d === 'DIFFICULT') return 'text-accent-deep';
-    return 'text-ink-soft';
-  };
 
   // Compute the active slot/clue once per render (getPlayCurrentSlot rebuilds
   // the layout + re-derives slots, so calling it per cell was O(cells × findSlots)).

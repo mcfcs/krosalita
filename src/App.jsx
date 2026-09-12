@@ -10,6 +10,7 @@ import DictionaryModal from './components/DictionaryModal';
 import LayoutEditorModal from './components/LayoutEditorModal';
 import LayoutSelector from './components/LayoutSelector';
 import ManualEditor from './components/ManualEditor';
+import ReclueReview from './components/ReclueReview';
 import PlayView from './components/PlayView';
 import GameView from './components/GameView';
 import RequiredWordsModal from './components/RequiredWordsModal';
@@ -17,8 +18,19 @@ import SettingsModal from './components/SettingsModal';
 import { DEFAULT_LAYOUTS } from './data/layouts';
 import { parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, getCellNumber } from './utils/crosswordUtils';
 import { loadJSON, saveJSON } from './utils/storage';
-import { todayKey, seedFromString, makeRng, seededShuffle, getStreak, recordDailySolve, isDailySolved } from './utils/daily';
-import { getOllamaConfig, saveOllamaConfig, generateClues } from './utils/ollama';
+
+// Clues the user writes or accepts. Kept separate from the corpus so they survive the CSV
+// being re-fetched on every load, and so they can be exported and fed back into the
+// pipeline later.
+const USER_CLUES_KEY = 'userClues';
+import { todayKey, seedFromString, getStreak, recordDailySolve, isDailySolved } from './utils/daily';
+import { difficultyLabelFromScore, difficultyColorClass, difficultyTargetOf } from './utils/difficulty';
+import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } from './utils/ollama';
+import { loadClueModel, cluePercentile } from './utils/clueScore';
+import {
+  BANDS, scoreCandidates, flagImplausible, makeGenerator, recluePuzzle,
+} from './utils/clueSource';
+import { memoryClueStore } from './utils/clueIndex';
 import { useAuth } from './hooks/useAuth';
 import { savePuzzle } from './lib/puzzles';
 import { sfx, isSoundOn, setSoundOn } from './utils/sound';
@@ -34,6 +46,10 @@ const CrosswordGenerator = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState('');
   const [tagalogMode, setTagalogMode] = useState(false);
+  // True when the words come from an uploaded CSV or the Tagalog list rather than
+  // the packed corpus artifact, so the worker is told which source to index.
+  const [usingCustomWords, setUsingCustomWords] = useState(false);
+  const [userClues, setUserClues] = useState(() => loadJSON(USER_CLUES_KEY, []));
   const [debugMode, setDebugMode] = useState(false);
   const [debugLog, setDebugLog] = useState([]);
   const [layouts, setLayouts] = useState(DEFAULT_LAYOUTS);
@@ -210,56 +226,6 @@ const CrosswordGenerator = () => {
     return 0.5;
   };
 
-  const difficultyLabelFromScore = (score) => {
-    const pct = score * 100;
-    if (pct < 20) return 'Easy';
-    if (pct < 40) return 'Fair';
-    if (pct < 60) return 'Moderate';
-    if (pct < 80) return 'Hard';
-    return 'Difficult';
-  };
-
-  const difficultyRanges = {
-    easy: { min: 0, max: 20, label: 'Easy' },
-    fair: { min: 20, max: 40, label: 'Fair' },
-    moderate: { min: 40, max: 60, label: 'Moderate' },
-    hard: { min: 60, max: 80, label: 'Hard' },
-    difficult: { min: 80, max: 100, label: 'Difficult' }
-  };
-
-  const allowedDifficulties = (choice) => {
-    if (!choice || choice === 'random') return null;
-    const map = {
-      easy: ['EASY', 'FAIR'],
-      fair: ['EASY', 'FAIR', 'MODERATE'],
-      moderate: ['FAIR', 'MODERATE', 'HARD'],
-      hard: ['MODERATE', 'HARD', 'DIFFICULT'],
-      difficult: ['HARD', 'DIFFICULT']
-    };
-    return new Set(map[choice] || []);
-  };
-
-  const filterWordsByDifficulty = (list, choice) => {
-    if (!choice || choice === 'random') return list;
-    const allowedSet = allowedDifficulties(choice);
-    const filtered = list.filter(item => {
-      const diff = (item.difficulty || 'MODERATE').toUpperCase();
-      if (allowedSet && !allowedSet.has(diff)) return false;
-      return true;
-    });
-    return filtered;
-  };
-
-  const difficultyColorClass = (label = '') => {
-    const d = label.toUpperCase();
-    if (d === 'EASY') return 'text-inkblue';
-    if (d === 'FAIR') return 'text-grass';
-    if (d === 'MODERATE') return 'text-gold';
-    if (d === 'HARD') return 'text-accent';
-    if (d === 'DIFFICULT') return 'text-accent-deep';
-    return 'text-ink-soft';
-  };
-
   const computePuzzleDifficulty = useCallback((gridData, clueSet) => {
     if (!gridData || !clueSet) return { score: null, label: '' };
     const allClues = [...(clueSet.across || []), ...(clueSet.down || [])];
@@ -340,82 +306,47 @@ const CrosswordGenerator = () => {
       presetClues[`down-${c.row}-${c.col}`] = c.clue || '';
     });
     const requiredMerged = requiredWordsList.map(w => w.toUpperCase());
-    const allowedSet = allowedDifficulties(difficultyChoice);
-    const workingWords = filterWordsByDifficulty(wordList, difficultyChoice);
-    if (workingWords.length === 0) {
-      setError('No words match the selected difficulty/filter.');
-      setIsGenerating(false);
-      return;
-    }
-    requiredMerged.forEach(w => {
-      if (!workingWords.some(item => item.word === w)) {
-        workingWords.push({ word: w, clue: '', difficulty: 'MODERATE' });
-      }
-    });
-    
-    // Add fully filled manual words (even if not in dictionary) as valid options with empty clue
-    const slots = findSlots(layout);
-    for (const slot of slots) {
-      let word = '';
-      let complete = true;
-      for (let i = 0; i < slot.length; i++) {
-        const r = slot.direction === 'across' ? slot.row : slot.row + i;
-        const c = slot.direction === 'across' ? slot.col + i : slot.col;
-        const ch = presetGrid[r][c];
-        if (!ch || ch === '#') { complete = false; break; }
-        word += ch;
-      }
-      if (complete) {
-        const existing = workingWords.find(w => w.word === word);
-        const diff = 'MODERATE';
-        if (!allowedSet || allowedSet.has(diff)) {
-          if (!existing) {
-            const clueEntry = presetClues[`${slot.direction}-${slot.row}-${slot.col}`] || '';
-            workingWords.push({ word, clue: clueEntry, difficulty: diff });
-          }
-        }
-      }
-    }
-    
-    const timeoutMs = 120000;
-    const startTime = Date.now();
-    const maxDifficultyRuns = difficultyChoice !== 'random' ? 3 : 1;
-    const range = difficultyChoice !== 'random' ? difficultyRanges[difficultyChoice] : null;
-    let bestRun = null;
-    let bestGap = Infinity;
-    let lastResult = null;
 
-    for (let attemptRun = 1; attemptRun <= maxDifficultyRuns; attemptRun++) {
-      const result = await generateCrossword(
-        workingWords,
-        layout,
-        setProgress,
-        Math.max(0, timeoutMs - (Date.now() - startTime)),
-        presetGrid,
-        requiredMerged,
-        requiredModeInput,
-        presetClues
-      );
-      lastResult = result;
-      if (!result?.grid) continue;
+    // Fully-filled squares are passed through as presetGrid; the solver injects any
+    // off-dictionary entries itself and constrains around them, so there is no longer a
+    // hand-built word list to assemble here.
+    const result = await generateCrossword(
+      layout,
+      setProgress,
+      15000,
+      presetGrid,
+      requiredMerged,
+      requiredModeInput,
+      presetClues,
+      difficultyTargetOf(difficultyChoice),
+      null,
+    );
+
+    let picked = result;
+    if (result?.grid) {
       const numberedTmp = assignNumbers(result.placements || []);
       const tmpClues = {
         across: numberedTmp.filter(n => n.direction === 'across').sort((a, b) => a.number - b.number),
         down: numberedTmp.filter(n => n.direction === 'down').sort((a, b) => a.number - b.number)
       };
-      const diffInfo = computePuzzleDifficulty(result.grid, tmpClues);
-      const gap = range && diffInfo.score !== null ? Math.max(range.min - diffInfo.score, diffInfo.score - range.max, 0) : 0;
-      if (range && gap <= 0) {
-        bestRun = { ...result, cluesObj: tmpClues, difficultyMeta: diffInfo };
-        break;
-      }
-      if (gap < bestGap) {
-        bestGap = gap;
-        bestRun = { ...result, cluesObj: tmpClues, difficultyMeta: diffInfo };
-      }
+      picked = {
+        ...result,
+        cluesObj: tmpClues,
+        // difficultyPercentile places the puzzle within what THIS word list can
+        // actually produce; the raw score is on an absolute scale the corpus only
+        // sparsely populates, so a grid at the easy end of the achievable range would
+        // otherwise still be labelled "Moderate".
+        difficultyMeta: result.difficultyPercentile != null
+          ? {
+            score: result.difficultyPercentile,
+            label: difficultyLabelFromScore(result.difficultyPercentile / 100),
+          }
+          : result.difficultyScore != null
+            ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
+            : computePuzzleDifficulty(result.grid, tmpClues),
+      };
     }
 
-    const picked = bestRun || lastResult;
     const newGrid = picked?.grid || presetGrid;
     const placements = picked?.placements || [];
     const complete = picked?.complete || false;
@@ -553,47 +484,102 @@ const CrosswordGenerator = () => {
   // the solver can run flat-out (no setTimeout yields). Same return shape as
   // before; the 4th argument is now the time budget in ms. Cancellation is
   // driven by cancelRef plus terminating the worker.
-  const generateCrossword = (wordList, layout, onProgress, timeoutMs = 120000, presetGrid = null, requiredWordsList = [], requiredModeArg = 'anchor', presetClues = {}) =>
+  // One persistent worker for the whole session. It owns the corpus and its bitset
+  // index, so a generation sends only the layout and constraints. The previous version
+  // spawned a fresh Worker per call and structured-cloned all 552k word rows into it —
+  // three times per click when a difficulty band was selected.
+  const pendingRef = useRef(null);
+  const clueDataPendingRef = useRef(null);
+  const corpusFpRef = useRef(null);
+
+  const ensureWorker = () => {
+    if (workerRef.current) return workerRef.current;
+    const w = new Worker(new URL('./worker/crosswordWorker.js', import.meta.url), { type: 'module' });
+    w.onmessage = (e) => {
+      // Clue data has its own channel so it can't be mistaken for solver progress.
+      if (e.data?.type === 'clueDataResult') { clueDataPendingRef.current?.(e.data.data); return; }
+      pendingRef.current?.(e.data);
+    };
+    w.onerror = () => { pendingRef.current?.({ type: 'error', message: 'The solver failed to start.' }); };
+    workerRef.current = w;
+    return w;
+  };
+
+  const killWorker = () => {
+    try { workerRef.current?.terminate(); } catch { /* ignore */ }
+    workerRef.current = null;
+    corpusFpRef.current = null;
+    pendingRef.current = null;
+  };
+
+  // Describes where the worker should get its words: the packed artifact by default,
+  // or the in-memory rows when the user uploaded a CSV / switched to Tagalog.
+  const corpusRequest = useCallback(() => (
+    usingCustomWords
+      ? { rows: words, sourceTag: tagalogMode ? 'tagalog' : 'custom' }
+      : { url: `${import.meta.env.BASE_URL || '/'}corpus/corpus.bin` }
+  ), [usingCustomWords, words, tagalogMode]);
+
+  const generateCrossword = (layout, onProgress, timeoutMs = 10000, presetGrid = null, requiredWordsList = [], requiredModeArg = 'anchor', presetClues = {}, difficultyTarget = null, seed = null) =>
     new Promise((resolve) => {
-      const emptyResult = { grid: null, placements: [], requiredPlaced: 0, attempts: 0, failedWord: null, complete: false };
+      const emptyResult = {
+        grid: null, placements: [], requiredPlaced: 0, attempts: 0,
+        failedWord: null, complete: false, error: null,
+      };
       let worker;
       try {
-        worker = new Worker(new URL('./worker/crosswordWorker.js', import.meta.url), { type: 'module' });
+        worker = ensureWorker();
       } catch {
-        resolve(emptyResult);
+        resolve({ ...emptyResult, error: { code: 'NO_WORKER', message: 'Your browser blocked the solver worker.' } });
         return;
       }
-      workerRef.current = worker;
 
       let best = null;
       let settled = false;
+      let askedForCorpus = false;
 
       const finish = (result) => {
         if (settled) return;
         settled = true;
         clearInterval(poll);
-        try { worker.terminate(); } catch { /* ignore */ }
-        if (workerRef.current === worker) workerRef.current = null;
+        pendingRef.current = null;
         resolve(result || best || emptyResult);
       };
 
-      worker.onmessage = (e) => {
-        const msg = e.data;
+      const sendStart = () => worker.postMessage({
+        type: 'start',
+        payload: {
+          layout, timeoutMs, presetGrid, requiredWordsList, requiredModeArg, presetClues,
+          difficultyTarget, seed, corpusFingerprint: corpusFpRef.current,
+        },
+      });
+
+      pendingRef.current = (msg) => {
         if (msg.type === 'progress') onProgress(msg.text);
         else if (msg.type === 'best') best = msg.result;
         else if (msg.type === 'done') finish(msg.result);
-        else if (msg.type === 'error') finish(best);
+        else if (msg.type === 'corpusReady') { corpusFpRef.current = msg.fingerprint; sendStart(); }
+        else if (msg.type === 'needCorpus') {
+          if (askedForCorpus) { finish({ ...emptyResult, error: { code: 'NO_CORPUS', message: 'Could not load the word list.' } }); return; }
+          askedForCorpus = true;
+          worker.postMessage({ type: 'loadCorpus', payload: corpusRequest() });
+        } else if (msg.type === 'error') {
+          finish(best || { ...emptyResult, error: { code: 'SOLVER_ERROR', message: msg.message } });
+        }
       };
-      worker.onerror = () => finish(best);
 
       const poll = setInterval(() => {
-        if (cancelRef.current) finish(best);
+        if (cancelRef.current) {
+          worker.postMessage({ type: 'cancel' });
+          finish(best);
+        }
       }, 60);
 
-      worker.postMessage({
-        type: 'start',
-        payload: { wordList, layout, timeoutMs, presetGrid, requiredWordsList, requiredModeArg, presetClues },
-      });
+      if (corpusFpRef.current) sendStart();
+      else {
+        askedForCorpus = true;
+        worker.postMessage({ type: 'loadCorpus', payload: corpusRequest() });
+      }
     });
 
   const handleFileUpload = (e) => {
@@ -607,8 +593,10 @@ const CrosswordGenerator = () => {
         const parsed = parseCSV(event.target.result);
         if (parsed.length === 0) { setError('No valid words found in CSV'); return; }
         setWords(parsed);
+        setUsingCustomWords(true);
+        corpusFpRef.current = null;
         setError('');
-        if (activeTab === 'auto') generatePuzzle(parsed);
+        if (activeTab === 'auto') generatePuzzle();
       } catch (err) { setError('Error parsing CSV: ' + err.message); }
       setCsvLoading(false);
       setProgress('');
@@ -621,10 +609,7 @@ const CrosswordGenerator = () => {
     reader.readAsText(file);
   };
 
-  const generatePuzzle = async (wordList = words, layoutIdx = selectedLayoutIndex, autoStartPlay = false, requiredWordsList = requiredWords, requiredModeInput = requiredMode, targetDifficulty = difficultyChoice) => {
-    if (wordList.length === 0) { setError('Please upload a CSV file first'); return; }
-    const filteredWords = filterWordsByDifficulty(wordList, targetDifficulty);
-    if (filteredWords.length === 0) { setError('No words match the selected difficulty/filter.'); return; }
+  const generatePuzzle = async (layoutIdx = selectedLayoutIndex, autoStartPlay = false, requiredWordsList = requiredWords, requiredModeInput = requiredMode, targetDifficulty = difficultyChoice, seed = null) => {
     
     // Reset cancellation state
     cancelRef.current = false;
@@ -645,62 +630,53 @@ const CrosswordGenerator = () => {
     const layout = layouts[layoutIdx].grid;
     const slots = findSlots(layout);
     
-    // Merge required words into working list (ensure presence)
     const requiredMerged = requiredWordsList.map(w => w.toUpperCase());
-    const workingWords = filterWordsByDifficulty(wordList, targetDifficulty);
-    requiredMerged.forEach(w => {
-      if (!workingWords.some(item => item.word === w)) {
-        workingWords.push({ word: w, clue: '', difficulty: 'MODERATE' });
-      }
-    });
-    
-    log(`Starting generation with ${wordList.length} words for ${slots.length} slots`);
+
+    log(`Starting generation for ${slots.length} slots`);
     setProgress(`Searching for complete ${layout.length}x${layout[0].length} puzzle...`);
     
     await new Promise(resolve => setTimeout(resolve, 100));
     
-    const timeoutMs = 120000;
-    const startTime = Date.now();
-    const maxDifficultyRuns = targetDifficulty && targetDifficulty !== 'random' ? 3 : 1;
-    const range = targetDifficulty !== 'random' ? difficultyRanges[targetDifficulty] : null;
-    let bestRun = null;
-    let bestGap = Infinity;
-    let lastResult = null;
+    // One solve, not three. Difficulty is steered inside the search by biasing value
+    // ordering toward a running residual target, so a single run lands in the band;
+    // re-rolling whole puzzles and picking the closest was both slower and less accurate.
+    const timeoutMs = 15000;
+    const result = await generateCrossword(
+      layout,
+      setProgress,
+      timeoutMs,
+      null,
+      requiredMerged,
+      requiredModeInput,
+      {},
+      difficultyTargetOf(targetDifficulty),
+      seed,
+    );
 
-    for (let attemptRun = 1; attemptRun <= maxDifficultyRuns; attemptRun++) {
-      const result = await generateCrossword(
-        workingWords, 
-        layout, 
-        setProgress,
-        Math.max(0, timeoutMs - (Date.now() - startTime)),
-        null,
-        requiredMerged,
-        requiredModeInput,
-        {}
-      );
-      lastResult = result;
-      if (!result?.grid) continue;
-      
+    let picked = result;
+    if (result?.grid) {
       const numberedTmp = assignNumbers(result.placements);
-      const tmpClues = { 
-        across: numberedTmp.filter(n => n.direction === 'across').sort((a, b) => a.number - b.number), 
-        down: numberedTmp.filter(n => n.direction === 'down').sort((a, b) => a.number - b.number) 
+      const tmpClues = {
+        across: numberedTmp.filter(n => n.direction === 'across').sort((a, b) => a.number - b.number),
+        down: numberedTmp.filter(n => n.direction === 'down').sort((a, b) => a.number - b.number)
       };
-      const diffInfo = computePuzzleDifficulty(result.grid, tmpClues);
-      const gap = range && diffInfo.score !== null ? Math.max(range.min - diffInfo.score, diffInfo.score - range.max, 0) : 0;
-      
-      if (range && gap <= 0) {
-        bestRun = { ...result, cluesObj: tmpClues, difficultyMeta: diffInfo };
-        break;
-      }
-      
-      if (gap < bestGap) {
-        bestGap = gap;
-        bestRun = { ...result, cluesObj: tmpClues, difficultyMeta: diffInfo };
-      }
+      picked = {
+        ...result,
+        cluesObj: tmpClues,
+        // difficultyPercentile places the puzzle within what THIS word list can
+        // actually produce; the raw score is on an absolute scale the corpus only
+        // sparsely populates, so a grid at the easy end of the achievable range would
+        // otherwise still be labelled "Moderate".
+        difficultyMeta: result.difficultyPercentile != null
+          ? {
+            score: result.difficultyPercentile,
+            label: difficultyLabelFromScore(result.difficultyPercentile / 100),
+          }
+          : result.difficultyScore != null
+            ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
+            : computePuzzleDifficulty(result.grid, tmpClues),
+      };
     }
-
-    const picked = bestRun || lastResult;
     const newGrid = picked?.grid;
     const placements = picked?.placements || [];
     const complete = picked?.complete || false;
@@ -756,22 +732,26 @@ const CrosswordGenerator = () => {
       setHighlightMissingRequired(true);
       syncManualFromAuto(newGrid, generatedClues, layoutIdx);
       setActiveTab('create');
-      setError(`Stopped: Best result was ${placements.length}/${slots.length} slots filled. You can edit it in Create.`);
-      const lastPlaced = placements?.length ? placements[placements.length - 1]?.word : null;
-      setFailedWord(lastPlaced || solveFailedWord || null);
+      setError(picked?.error?.message
+        || `Stopped: best result was ${placements.length}/${slots.length} slots filled. You can edit it in Create.`);
+      setFailedWord(solveFailedWord || null);
     } else {
-      setError('Could not place any words. Check that your CSV has words of the right lengths.');
+      // Preflight refusals land here: they name the actual blocker (a 2-letter slot,
+      // a required word with nowhere to go, an impossible preset) instead of leaving
+      // the user staring at a spinner for two minutes.
+      setError(picked?.error?.message
+        || 'Could not place any words. Check that your word list has words of the right lengths.');
     }
     
     setIsGenerating(false);
   };
 
   const handleAutoGenerateInternal = (reqWords, mode) => {
-    generatePuzzle(words, selectedLayoutIndex, false, reqWords, mode, difficultyChoice);
+    generatePuzzle(selectedLayoutIndex, false, reqWords, mode, difficultyChoice);
   };
   
   const handleAutoGeneratePlayInternal = (reqWords, mode) => {
-    generatePuzzle(words, selectedLayoutIndex, true, reqWords, mode, difficultyChoice);
+    generatePuzzle(selectedLayoutIndex, true, reqWords, mode, difficultyChoice);
   };
 
   const syncManualFromAuto = (newGrid, generatedClues, layoutIdx) => {
@@ -802,9 +782,7 @@ const CrosswordGenerator = () => {
   const cancelGeneration = () => {
     cancelRef.current = true;
     if (workerRef.current) {
-      try { workerRef.current.postMessage({ type: 'cancel' }); } catch { /* ignore */ }
-      try { workerRef.current.terminate(); } catch { /* ignore */ }
-      workerRef.current = null;
+      try { workerRef.current.postMessage({ type: 'cancel' }); } catch { killWorker(); }
     }
   };
 
@@ -1703,6 +1681,22 @@ const CrosswordGenerator = () => {
   
   // ============ DICTIONARY FUNCTIONS ============
   
+  const saveUserClue = useCallback((word, clue) => {
+    const w = String(word || '').toUpperCase().replace(/[^A-Z]/g, '');
+    const c = String(clue || '').trim();
+    if (!w || !c) return false;
+    const date = new Date().toISOString().split('T')[0];
+    if (userClues.some((e) => e.word === w && e.clue === c)) return false;
+    const next = [...userClues, { date, word: w, clue: c }];
+    saveJSON(USER_CLUES_KEY, next);
+    setUserClues(next);
+    setWords((prev) => (prev.some((e) => e.word === w && e.clue === c)
+      ? prev : [...prev, { date, word: w, clue: c, difficulty: '' }]));
+    setUsingCustomWords(true);
+    corpusFpRef.current = null;
+    return true;
+  }, [userClues]);
+
   const addWordToDictionary = () => {
     if (!newWord.trim() || !newClue.trim()) return;
     
@@ -1711,23 +1705,26 @@ const CrosswordGenerator = () => {
     
     if (!word) return;
     
-    // Check if word already exists
-    const exists = words.some(w => w.word === word);
-    if (exists) {
-      setError('Word already exists in dictionary');
+    // An answer legitimately has many clues -- picking one at a difficulty is the whole
+    // point -- so only the exact (word, clue) pair counts as a duplicate. This used to
+    // reject any word already present, which made saving a second clue impossible.
+    if (words.some(w => w.word === word && w.clue === clue)) {
+      setError('That clue is already in your dictionary');
       setTimeout(() => setError(''), 3000);
       return;
     }
-    
-    setWords(prev => [...prev, { date: new Date().toISOString().split('T')[0], word, clue }]);
+
+    saveUserClue(word, clue);
     setNewWord('');
     setNewClue('');
-    setProgress('Word added to dictionary!');
+    setProgress('Saved to your dictionary.');
     setTimeout(() => setProgress(''), 3000);
   };
   
   const deleteWordFromDictionary = (index) => {
     setWords(prev => prev.filter((_, i) => i !== index));
+    setUsingCustomWords(true);
+    corpusFpRef.current = null;
   };
   
   const startEditWord = (index) => {
@@ -1744,6 +1741,8 @@ const CrosswordGenerator = () => {
     
     if (!word || !clue) return;
     
+    setUsingCustomWords(true);
+    corpusFpRef.current = null;
     setWords(prev => prev.map((w, i) => 
       i === editingWordIndex ? { ...w, word, clue } : w
     ));
@@ -1754,10 +1753,16 @@ const CrosswordGenerator = () => {
   };
   
   const exportDictionary = () => {
+    // Proper RFC-4180 quoting. The old version only quoted on a comma and never escaped an
+    // embedded quote, so any clue containing one corrupted the file — and clues contain
+    // them constantly ("___ it", quoted titles, dialogue).
+    const cell = (v) => {
+      const t = String(v ?? '');
+      return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
     let csv = 'Date,Word,Clue\n';
     words.forEach(w => {
-      const clue = w.clue.includes(',') ? `"${w.clue}"` : w.clue;
-      csv += `${w.date || ''},${w.word},${clue}\n`;
+      csv += `${cell(w.date || '')},${cell(w.word)},${cell(w.clue)}\n`;
     });
     
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -1800,7 +1805,12 @@ const CrosswordGenerator = () => {
         if (response.ok) {
           const text = await response.text();
           const parsed = parseCSV(text);
-          if (!cancelled && !tagalogMode && parsed.length > 0) setWords(parsed);
+          if (!cancelled && !tagalogMode && parsed.length > 0) {
+            // Merge the user's own clues over the corpus; they are additive, never a
+            // replacement, so a fresh CSV never silently drops them.
+            const mine = loadJSON(USER_CLUES_KEY, []);
+            setWords(mine.length ? [...parsed, ...mine.map((e) => ({ ...e, difficulty: '' }))] : parsed);
+          }
         }
       } catch { console.log('No default crosswords.csv found'); }
       if (!cancelled) {
@@ -1847,10 +1857,14 @@ const CrosswordGenerator = () => {
 
     if (tagalogMode) {
       previousWordsRef.current = words;
+      setUsingCustomWords(true);
+      corpusFpRef.current = null;
       loadTagalogList();
     } else if (previousWordsRef.current) {
       setWords(previousWordsRef.current);
       previousWordsRef.current = null;
+      setUsingCustomWords(false);
+      corpusFpRef.current = null;
     }
 
     return () => { cancelled = true; };
@@ -1900,6 +1914,235 @@ const CrosswordGenerator = () => {
     saveOllamaConfig(next);
   };
 
+  // ---- whole-puzzle re-clue ----
+  const [reclue, setReclue] = useState(null);
+  const reclueAbortRef = useRef(null);
+
+  // clueSource works against a corpus-shaped object; build one from what the worker sent
+  // rather than shipping a second copy of the 6 MB artifact to the main thread.
+  const shimCorpus = (data) => {
+    const byWord = new Map();
+    const entries = [];
+    for (const [word, v] of Object.entries(data || {})) {
+      byWord.set(word, v.clues || []);
+      entries.push({ word, ...(v.answerFeatures || {}) });
+    }
+    return { entries, clueStore: memoryClueStore(byWord) };
+  };
+
+  const activeClueSet = () => (activeTab === 'create' ? manualClues : clues);
+
+  const runReclue = async (band) => {
+    const set = activeClueSet();
+    const entries = [...(set?.across || []), ...(set?.down || [])]
+      .filter((c) => c.word && !c.word.includes('_'))
+      .map((c) => ({ key: `${c.direction}-${c.row}-${c.col}`, ...c }));
+    if (!entries.length) {
+      setReclue((r) => ({ ...(r || {}), band, error: 'Fill the grid first.' }));
+      return;
+    }
+    reclueAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    reclueAbortRef.current = ctrl;
+    setReclue({ band, running: true, progress: null, result: null, error: '', selected: new Set() });
+    try {
+      const [model, data] = await Promise.all([
+        loadScorer(),
+        requestClueData([...new Set(entries.map((e) => e.word))]),
+      ]);
+      const corpus = shimCorpus(data);
+      const generate = ollamaConfig.enabled
+        ? makeGenerator({ baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 4, signal: ctrl.signal })
+        : null;
+      const out = await recluePuzzle(corpus, model, entries, {
+        band,
+        generate,
+        onProgress: (p) => setReclue((r) => (r ? { ...r, progress: p } : r)),
+      });
+      // Pre-tick only the proposals that actually landed in the requested band. A
+      // near-miss is still shown and can be ticked deliberately, but it must not be
+      // applied by default: ticking those would quietly swap p57 and p62 clues into an
+      // EASY pass, which is precisely the silent near-miss this feature exists to avoid.
+      const selected = new Set(out.results
+        .filter((r) => r.chosen && (r.status === 'corpus' || r.status === 'generated'))
+        .map((r) => r.key));
+      setReclue({ band, running: false, progress: null, result: out, error: '', selected });
+    } catch (err) {
+      setReclue((r) => ({ ...(r || { band }), running: false, error: String(err?.message || err) }));
+    }
+  };
+
+  const applyReclue = () => {
+    const st = reclue;
+    if (!st?.result) return;
+    const picks = new Map(st.result.results
+      .filter((r) => r.chosen && st.selected.has(r.key))
+      .map((r) => [r.key, r.chosen.clue]));
+    if (!picks.size) return;
+    const apply = (set) => ({
+      across: (set?.across || []).map((c) => {
+        const k = `across-${c.row}-${c.col}`;
+        return picks.has(k) ? { ...c, clue: picks.get(k) } : c;
+      }),
+      down: (set?.down || []).map((c) => {
+        const k = `down-${c.row}-${c.col}`;
+        return picks.has(k) ? { ...c, clue: picks.get(k) } : c;
+      }),
+    });
+    if (activeTab === 'create') setManualClues((prev) => apply(prev));
+    else { setClues((prev) => apply(prev)); setLatestClues((prev) => apply(prev)); }
+    for (const r of st.result.results) {
+      if (r.chosen && st.selected.has(r.key)) saveUserClue(r.word, r.chosen.clue);
+    }
+    setReclue(null);
+    setProgress(`Re-clued ${picks.size} ${picks.size === 1 ? 'entry' : 'entries'}.`);
+    setTimeout(() => setProgress(''), 4000);
+  };
+
+  // ============ CLUE STUDIO ============
+  // The scorer runs on the MAIN thread, not in the worker: it has to rate a clue on every
+  // keystroke, and a postMessage round trip per character would be absurd for something
+  // that takes microseconds. The corpus stays in the worker, which hands over just the
+  // per-answer material the scorer needs.
+  const clueModelRef = useRef(null);
+  const [clueStudio, setClueStudio] = useState(null);
+
+  const loadScorer = useCallback(async () => {
+    if (clueModelRef.current) return clueModelRef.current;
+    const res = await fetch(`${import.meta.env.BASE_URL || '/'}corpus/clue-model.json`);
+    if (!res.ok) throw new Error(`Couldn't load the clue scorer (${res.status}).`);
+    clueModelRef.current = loadClueModel(await res.json());
+    return clueModelRef.current;
+  }, []);
+
+  const requestClueData = useCallback((words) => new Promise((resolve) => {
+    const w = ensureWorker();
+    const timer = setTimeout(() => { clueDataPendingRef.current = null; resolve({}); }, 15000);
+    clueDataPendingRef.current = (data) => { clearTimeout(timer); clueDataPendingRef.current = null; resolve(data || {}); };
+    const send = () => w.postMessage({ type: 'clueData', payload: { words } });
+    if (corpusFpRef.current) send();
+    else {
+      // The worker needs its corpus before it can answer.
+      const prev = pendingRef.current;
+      pendingRef.current = (msg) => {
+        if (msg.type === 'corpusReady') { corpusFpRef.current = msg.fingerprint; pendingRef.current = prev; send(); }
+        else prev?.(msg);
+      };
+      w.postMessage({ type: 'loadCorpus', payload: corpusRequest() });
+    }
+  }), [corpusRequest]);
+
+  const openClueStudio = async (word, currentClue, band = 'medium') => {
+    if (!word || /_/.test(word)) return;
+    setClueStudio({ word, currentClue, band, candidates: [], loading: true, generating: false,
+      error: '', range: null, sense: '', reading: '' });
+    try {
+      const [model, data] = await Promise.all([loadScorer(), requestClueData([word])]);
+      const entry = data[word];
+      const clues = entry?.clues || [];
+      const af = entry?.answerFeatures || {};
+      const cands = clues.map((c) => {
+        const percentile = cluePercentile(model, word, c.clue, af);
+        const win = BANDS[band];
+        return {
+          clue: c.clue, percentile, source: 'corpus',
+          band: percentile < BANDS.easy.max ? 'easy' : percentile < BANDS.medium.max ? 'medium' : 'hard',
+          inBand: percentile >= win.min && percentile < win.max,
+        };
+      }).sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile);
+      const ps = cands.map((c) => c.percentile);
+      setClueStudio((st) => (st?.word !== word ? st : {
+        ...st,
+        candidates: cands,
+        range: ps.length ? { min: Math.min(...ps), max: Math.max(...ps), count: ps.length } : null,
+        answerFeatures: af,
+        loading: false,
+      }));
+    } catch (err) {
+      setClueStudio((st) => (st ? { ...st, loading: false, error: String(err?.message || err) } : st));
+    }
+  };
+
+  const setClueStudioBand = (band) => setClueStudio((st) => {
+    if (!st) return st;
+    const win = BANDS[band];
+    const candidates = st.candidates
+      .map((c) => ({ ...c, inBand: c.percentile >= win.min && c.percentile < win.max }))
+      .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile);
+    return { ...st, band, candidates };
+  });
+
+  const generateStudioClues = async () => {
+    const st = clueStudio;
+    if (!st) return;
+    setClueStudio((s0) => (s0 ? { ...s0, generating: true, error: '' } : s0));
+    try {
+      const model = await loadScorer();
+      const generate = makeGenerator({
+        baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 6,
+      });
+      // Hand the model how this answer has actually been clued, so it writes in the same
+      // sense — and the same READING, which is what stops a concatenated phrase like
+      // ISITME being clued as though it were about the time.
+      const known = st.candidates.filter((c) => c.source === 'corpus').map((c) => c.clue);
+      const fresh = await generate([{ word: st.word, sense: st.sense, known }], st.band);
+      const got = fresh.get(st.word) || { clues: [], reading: '' };
+      const shim = { entries: [{ word: st.word, ...(st.answerFeatures || {}) }],
+        clueStore: { wordIndexOf: new Map([[st.word, 0]]), counts: [0], offsets: [0] } };
+      const exclude = new Set(st.candidates.map((c) => c.clue.toLowerCase()));
+      let scored = scoreCandidates(shim, model, st.word, got.clues, { band: st.band, exclude });
+      // Flag anything that reads unlike this answer's real clues — the model does write
+      // confidently wrong ones, and nothing in the difficulty score can see that.
+      if (known.length >= 3) {
+        scored = await flagImplausible(
+          { clueStore: { __mem: new Map([[st.word, known.map((c) => ({ clue: c }))]]) } },
+          st.word, scored, { baseUrl: ollamaConfig.baseUrl },
+        );
+      }
+      setClueStudio((s0) => (s0?.word !== st.word ? s0 : {
+        ...s0,
+        generating: false,
+        reading: got.reading || '',
+        candidates: [...s0.candidates, ...scored]
+          .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile),
+      }));
+    } catch (err) {
+      setClueStudio((s0) => (s0 ? { ...s0, generating: false, error: String(err?.message || err) } : s0));
+    }
+  };
+
+  // Rate every clue in the finished puzzle with the local model. The precomputed
+  // difficulty is instant but blind to how a specific clue reads, so this is what
+  // actually surfaces a Saturday-hard entry sitting in a Monday grid.
+  const [auditState, setAuditState] = useState({ running: false, done: 0, total: 0, summary: null, error: '' });
+  const auditAbortRef = useRef(null);
+
+  const runDifficultyAudit = async () => {
+    const entries = [...(clues?.across || []), ...(clues?.down || [])]
+      .filter((c) => c.word && c.clue)
+      .map((c) => ({ number: c.number, direction: c.direction, word: c.word, clue: c.clue }));
+    if (!entries.length) {
+      setAuditState({ running: false, done: 0, total: 0, summary: null, error: 'Nothing to audit yet.' });
+      return;
+    }
+    auditAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    auditAbortRef.current = ctrl;
+    setAuditState({ running: true, done: 0, total: entries.length, summary: null, error: '' });
+    try {
+      const { summary } = await auditDifficulty({
+        baseUrl: ollamaConfig.baseUrl,
+        model: ollamaConfig.model,
+        entries,
+        signal: ctrl.signal,
+        onProgress: ({ done, total }) => setAuditState((s) => ({ ...s, done, total })),
+      });
+      setAuditState({ running: false, done: entries.length, total: entries.length, summary, error: '' });
+    } catch (err) {
+      setAuditState({ running: false, done: 0, total: 0, summary: null, error: String(err?.message || err) });
+    }
+  };
+
   const aiGenerateClues = (word, difficulty = 'MODERATE') =>
     generateClues({
       baseUrl: ollamaConfig.baseUrl,
@@ -1913,13 +2156,14 @@ const CrosswordGenerator = () => {
   // ============ DAILY PUZZLE ============
   const handleDaily = () => {
     if (words.length === 0) { setError('Load a word list first to build today’s puzzle.'); return; }
+    // The solver is seeded, so the daily is genuinely reproducible. It used to
+    // seededShuffle all 552k rows to imitate determinism, which the solver then threw
+    // away by calling Math.random() internally.
     const seed = seedFromString(todayKey());
-    const rng = makeRng(seed);
-    const dayWords = seededShuffle(words, rng);
     const layoutIdx = layouts.length ? seed % layouts.length : 0;
     setSelectedLayoutIndex(layoutIdx);
     setIsDailyMode(true);
-    generatePuzzle(dayWords, layoutIdx, true, [], 'anchor', 'random');
+    generatePuzzle(layoutIdx, true, [], 'anchor', 'random', seed);
   };
 
   // Record a streak when the daily puzzle is completed (once per day).
@@ -2014,9 +2258,8 @@ const CrosswordGenerator = () => {
     if (!words.length) throw new Error('Load a word list first.');
     const layout = layouts[selectedLayoutIndex]?.grid;
     if (!layout) throw new Error('No layout selected.');
-    const workingWords = filterWordsByDifficulty(words, difficultyChoice);
-    if (!workingWords.length) throw new Error('No words match the difficulty.');
-    const result = await generateCrossword(workingWords, layout, () => {}, 60000, null, [], 'anchor', {});
+    const result = await generateCrossword(
+      layout, () => {}, 15000, null, [], 'anchor', {}, difficultyTargetOf(difficultyChoice), null);
     if (!result?.grid || !result.complete) throw new Error('Could not generate a full puzzle — try Crosswithfriends.');
     const numbered = assignNumbers(result.placements || []);
     const clueSet = {
@@ -2304,7 +2547,7 @@ const CrosswordGenerator = () => {
               <button
                 onClick={() => {
                   if (activeTab === 'play') {
-                    generatePuzzle(words, selectedLayoutIndex, true, requiredWords, requiredMode);
+                    generatePuzzle(selectedLayoutIndex, true, requiredWords, requiredMode);
                   } else {
                     setRequiredAction('play');
                     setShowRequiredModal(true);
@@ -2401,14 +2644,91 @@ const CrosswordGenerator = () => {
                   <div className="eyebrow">The Puzzle</div>
                   <h2 className="font-display text-2xl font-semibold text-ink leading-tight">Proof Grid</h2>
                 </div>
-                {difficultyInfo?.label && (
-                  <span className="inline-flex items-center gap-2 border border-ink/20 bg-paper-sunken px-3 py-1.5 rounded-sm">
-                    <span className="eyebrow">Difficulty</span>
-                    <span className={`font-display font-semibold ${difficultyColorClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
-                    {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
-                  </span>
-                )}
+                <div className="flex items-center gap-2 flex-wrap">
+                  {difficultyInfo?.label && (
+                    <span className="inline-flex items-center gap-2 border border-ink/20 bg-paper-sunken px-3 py-1.5 rounded-sm">
+                      <span className="eyebrow">Difficulty</span>
+                      <span className={`font-display font-semibold ${difficultyColorClass(difficultyInfo.label)}`}>{difficultyInfo.label}</span>
+                      {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
+                    </span>
+                  )}
+                  {clues && (clues.across?.length || 0) > 0 && (
+                    <button
+                      onClick={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
+                      className="btn btn-sm btn-ghost"
+                      title="Swap in clues at a chosen difficulty"
+                    >
+                      <RefreshCw size={14} />Re-clue
+                    </button>
+                  )}
+                  {ollamaConfig.enabled && clues && (clues.across?.length || 0) > 0 && (
+                    <button
+                      onClick={runDifficultyAudit}
+                      disabled={auditState.running}
+                      className="btn btn-sm btn-ghost"
+                      title="Rate every clue with your local model"
+                    >
+                      <Zap size={14} />
+                      {auditState.running
+                        ? `Auditing ${auditState.done}/${auditState.total}…`
+                        : 'AI Audit'}
+                    </button>
+                  )}
+                </div>
               </div>
+
+              {reclue && activeTab === 'auto' && (
+                <ReclueReview
+                  band={reclue.band}
+                  onBandChange={(b) => setReclue((r) => ({ ...r, band: b }))}
+                  running={!!reclue.running}
+                  progress={reclue.progress}
+                  result={reclue.result}
+                  error={reclue.error}
+                  selected={reclue.selected || new Set()}
+                  aiEnabled={ollamaConfig.enabled}
+                  onToggle={(k) => setReclue((r) => {
+                    const next = new Set(r.selected);
+                    if (next.has(k)) next.delete(k); else next.add(k);
+                    return { ...r, selected: next };
+                  })}
+                  onRun={() => runReclue(reclue.band)}
+                  onApply={applyReclue}
+                  onClose={() => setReclue(null)}
+                />
+              )}
+
+              {(auditState.summary || auditState.error) && (
+                <div className="mb-4 border border-ink/15 bg-paper-sunken rounded-sm p-3">
+                  {auditState.error ? (
+                    <p className="text-xs text-accent">{auditState.error}</p>
+                  ) : (
+                    <>
+                      <div className="flex items-baseline gap-3 flex-wrap mb-2">
+                        <span className="eyebrow">AI difficulty</span>
+                        <span className="font-display font-semibold text-ink">
+                          {Math.round(auditState.summary.mean)}
+                        </span>
+                        <span className="text-xs text-ink-faint font-mono">
+                          hardest fifth {Math.round(auditState.summary.p80)}
+                          {auditState.summary.unrated > 0 && ` · ${auditState.summary.unrated} unrated`}
+                        </span>
+                      </div>
+                      {/* The average hides the entries that actually stall a solver, so
+                          call out the worst few explicitly. */}
+                      <ul className="text-xs text-ink-soft space-y-0.5">
+                        {auditState.summary.hardest.map((h) => (
+                          <li key={`${h.number}-${h.direction}`}>
+                            <span className="font-mono text-ink-faint mr-1.5">{Math.round(h.difficulty)}</span>
+                            <span className="font-semibold">{h.number} {h.direction === 'across' ? 'A' : 'D'}</span>
+                            {' '}{h.word} — {h.clue}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              )}
               <div className="rule-hair my-4" />
               <div className="overflow-x-auto pb-2"><div className="xw-grid" style={{ '--cols': grid[0]?.length || 15 }}>
                 {grid.map((row, r) => <div key={r} className="flex">{row.map((cell, c) => <div key={c} className={`xw-cell ${cell === '#' ? 'xw-cell--block' : ''}`}>{cell !== '#' && getNumberForCell(r, c) && <span className="xw-num">{getNumberForCell(r, c)}</span>}{cell !== '#' && cell !== null && <span className="xw-letter">{cell}</span>}</div>)}</div>)}
@@ -2466,9 +2786,37 @@ const CrosswordGenerator = () => {
             setHighlightMissingRequired={setHighlightMissingRequired}
             difficultyInfo={difficultyInfo}
             aiEnabled={ollamaConfig.enabled}
+            clueStudio={clueStudio}
+            onOpenClueStudio={openClueStudio}
+            onCloseClueStudio={() => setClueStudio(null)}
+            onClueStudioBand={setClueStudioBand}
+            onClueStudioSense={(v) => setClueStudio((st) => (st ? { ...st, sense: v } : st))}
+            onGenerateClues={generateStudioClues}
+            onClueAccepted={saveUserClue}
             aiGenerateClues={aiGenerateClues}
             onOpenSettings={() => setShowSettings(true)}
             onVirtualKey={applyManualKey}
+            onOpenReclue={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
+          />
+        )}
+        {reclue && activeTab === 'create' && (
+          <ReclueReview
+            band={reclue.band}
+            onBandChange={(b) => setReclue((r) => ({ ...r, band: b }))}
+            running={!!reclue.running}
+            progress={reclue.progress}
+            result={reclue.result}
+            error={reclue.error}
+            selected={reclue.selected || new Set()}
+            aiEnabled={ollamaConfig.enabled}
+            onToggle={(k) => setReclue((r) => {
+              const next = new Set(r.selected);
+              if (next.has(k)) next.delete(k); else next.add(k);
+              return { ...r, selected: next };
+            })}
+            onRun={() => runReclue(reclue.band)}
+            onApply={applyReclue}
+            onClose={() => setReclue(null)}
           />
         )}
         
@@ -2579,7 +2927,7 @@ const CrosswordGenerator = () => {
             <h3 className="font-display text-2xl font-semibold text-ink mb-2">Nothing on the Stand</h3>
             <p className="text-ink-faint mb-6 max-w-md mx-auto">Generate a puzzle in Play mode, or import a saved crossword to start solving immediately.</p>
             <div className="flex flex-wrap justify-center gap-3">
-              <button onClick={() => generatePuzzle(words, selectedLayoutIndex, true)} disabled={words.length === 0 || isGenerating} className="btn btn-accent">
+              <button onClick={() => generatePuzzle(selectedLayoutIndex, true)} disabled={words.length === 0 || isGenerating} className="btn btn-accent">
                 <RefreshCw size={16} />Generate &amp; Play
               </button>
               <button onClick={() => puzzleFileInputRef.current?.click()} className="btn">
@@ -2652,7 +3000,7 @@ const CrosswordGenerator = () => {
         difficulty={difficultyInfo?.label}
         onClose={() => setShowResult(false)}
         onShare={sharePuzzle}
-        onPlayAgain={words.length ? () => { setShowResult(false); generatePuzzle(words, selectedLayoutIndex, true); } : null}
+        onPlayAgain={words.length ? () => { setShowResult(false); generatePuzzle(selectedLayoutIndex, true); } : null}
       />
 
       <DictionaryModal
