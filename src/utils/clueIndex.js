@@ -21,6 +21,10 @@ import { isClueUsableFor } from './clueFilters.js';
  */
 export function cluesForWord(store, word) {
   if (!store || !word) return [];
+  // An in-memory store, built from data the worker handed over. The packed store reads
+  // bytes out of corpus.bin, which only the worker holds, so the main thread needs a
+  // shape it can populate itself rather than a second copy of the 6 MB artifact.
+  if (store.__mem) return store.__mem.get(word) || [];
   const wordIndex = store.wordIndexOf.get(word);
   if (wordIndex === undefined) return [];
   const n = store.counts[wordIndex];
@@ -38,6 +42,17 @@ export function cluesForWord(store, word) {
     p += len;
   }
   return out;
+}
+
+/**
+ * A clue store backed by a plain Map, for data fetched from the worker.
+ * Same read API as the packed store, so everything in clueSource.js works against either.
+ */
+export function memoryClueStore(byWord) {
+  return {
+    __mem: byWord,
+    wordIndexOf: new Map([...byWord.keys()].map((w, i) => [w, i])),
+  };
 }
 
 /** Clue store backed by parsed CSV rows, for user uploads and Tagalog mode. */

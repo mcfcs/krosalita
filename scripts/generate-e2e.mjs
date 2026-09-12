@@ -213,6 +213,143 @@ try {
     for (const l of page.console_.slice(-8)) console.log(`    ${l.slice(0, 160)}`);
   }
 
+  // ---- Clue Studio, in Create. Works with Ollama off: the corpus supplies candidates
+  // and the scorer is local, so only "Write more" needs a model.
+  await page.evaluate(`(() => {
+    const t = [...document.querySelectorAll('button')]
+      .find(x => (x.textContent||'').trim().toLowerCase() === 'create'
+                 && x.classList.contains('tab'));
+    if (t) t.click();
+  })()`);
+  await sleep(900);
+
+  // A completed auto-fill is copied into the Create tab (syncManualFromAuto), but the
+  // copy lands a render tick after the tab switch — poll rather than guess a delay.
+  // Letters live in <span class="xw-letter"> INSIDE the clickable <div class="xw-cell">,
+  // so the leaf-node scan used for the proof grid above finds nothing here.
+  let createLetters = 0;
+  for (let i = 0; i < 40; i++) {
+    createLetters = await page.evaluate(`document.querySelectorAll('.xw-cell .xw-letter').length`);
+    if (createLetters > 40) break;
+    await sleep(250);
+  }
+  if (createLetters > 40) ok(`Create grid carries the fill (${createLetters} letters)`);
+  else bad('Create grid carries the fill', `${createLetters} lettered cells in .xw-cell`);
+
+  // Reads the open ClueStudio panel: header is `<span class="eyebrow">Clues for</span>`
+  // then the answer; each candidate row is `<span>percentile</span><button>clue</button>`
+  // where the button may also carry "published" / "check accuracy" badge spans.
+  const READ_STUDIO = `(() => {
+    const h = [...document.querySelectorAll('span')]
+      .find(e => e.classList.contains('eyebrow') && (e.textContent||'').trim() === 'Clues for');
+    if (!h) return null;
+    const panel = h.parentElement.parentElement;
+    const rows = [...panel.querySelectorAll('li')].map(li => {
+      const b = li.querySelector('button');
+      if (!b) return null;
+      const c = b.cloneNode(true);
+      for (const s of c.querySelectorAll('span')) s.remove();   // drop the badges
+      const clue = (c.textContent||'').trim();
+      const pct = ((li.querySelector('span')||{}).textContent||'').trim();
+      return clue ? { clue, pct } : null;
+    }).filter(Boolean);
+    return { word: ((h.nextElementSibling||{}).textContent||'').trim(), rows,
+             loading: /Loading clues/i.test(panel.innerText||''),
+             text: (panel.innerText||'').slice(0, 400) };
+  })()`;
+
+  // Select a filled square so there is a complete word to clue. Not every answer has
+  // corpus clues, so probe a few squares spread across the grid until one yields
+  // candidates instead of failing on whichever letter happened to be in the middle.
+  let picked = null;
+  let openedStudio = false;
+  let studio = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const cell = await page.evaluate(`(() => {
+      const cells = [...document.querySelectorAll('.xw-cell')].filter(e => e.querySelector('.xw-letter'));
+      if (!cells.length) return null;
+      const el = cells[(${attempt} * 13 + 7) % cells.length];
+      el.click();
+      return (el.querySelector('.xw-letter').textContent||'').trim();
+    })()`);
+    if (!cell) break;
+    picked = picked || cell;
+    await sleep(250);
+
+    const opened = await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')]
+        .find(x => (x.textContent||'').trim() === 'Clues' && !x.disabled);
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    openedStudio = openedStudio || opened;
+    if (!opened) continue;
+
+    // The studio fetches the scorer + asks the worker for the corpus clues.
+    for (let i = 0; i < 40; i++) {
+      studio = await page.evaluate(READ_STUDIO);
+      if (studio && (studio.rows.length || !studio.loading)) break;
+      await sleep(250);
+    }
+    if (studio?.rows?.length) break;
+  }
+  if (picked) ok(`selected a filled square in Create (${picked})`);
+  else {
+    const diag = await page.evaluate(`JSON.stringify({
+      tabs: [...document.querySelectorAll('button.tab')].map(b => (b.textContent||'').trim() + (b.classList.contains('tab-active') ? '*' : '')),
+      cells: document.querySelectorAll('.xw-cell').length,
+      letters: document.querySelectorAll('.xw-cell .xw-letter').length,
+      body: (document.body.innerText||'').slice(0, 300)
+    })`);
+    bad('selected a filled square in Create', diag);
+  }
+  if (openedStudio) ok('opened the Clue Studio');
+  else bad('opened the Clue Studio', 'no enabled "Clues" button');
+
+  if (studio?.rows?.length) {
+    ok(`Studio listed ${studio.rows.length} candidates for ${studio.word}`);
+    for (const r of studio.rows.slice(0, 3)) {
+      console.log(`     ${String(r.pct).padStart(3)}  ${r.clue.slice(0, 110)}`);
+    }
+  } else {
+    bad('Studio listed candidates', `panel text: ${String(studio?.text || 'not found').slice(0, 120)}`);
+  }
+
+  // Accepting must actually change the slot's clue.
+  if (studio?.rows?.length) {
+    const applied = await page.evaluate(`(() => {
+      const h = [...document.querySelectorAll('span')]
+        .find(e => e.classList.contains('eyebrow') && (e.textContent||'').trim() === 'Clues for');
+      if (!h) return '';
+      const b = h.parentElement.parentElement.querySelector('li button');
+      if (!b) return '';
+      const c = b.cloneNode(true);
+      for (const s of c.querySelectorAll('span')) s.remove();
+      b.click();
+      return (c.textContent||'').trim();
+    })()`);
+    const stripped = String(applied)
+      .replace(/^\d+\s*/, '').replace(/published|check accuracy/g, '').trim();
+    // Read the "Current Clue" block rather than the whole page: the studio itself shows
+    // the candidate, so a body-wide match would pass before the clue was ever applied.
+    let clueNow = '';
+    for (let i = 0; i < 24; i++) {
+      clueNow = await page.evaluate(`(() => {
+        const h = [...document.querySelectorAll('div')]
+          .find(e => (e.textContent||'').trim() === 'Current Clue');
+        return h && h.nextElementSibling ? (h.nextElementSibling.textContent||'').trim() : '';
+      })()`);
+      if (stripped && clueNow.includes(stripped.slice(0, 24))) break;
+      await sleep(250);
+    }
+    if (stripped && clueNow.includes(stripped.slice(0, 24))) {
+      ok(`accepted clue became the slot clue ("${stripped.slice(0, 60)}")`);
+    } else {
+      bad('accepted clue applied', `looked for "${stripped.slice(0, 40)}", slot shows "${clueNow.slice(0, 40)}"`);
+    }
+  }
+
   // Optional: the AI difficulty audit, only when the configured Ollama is actually up.
   // Skipped rather than failed so this harness stays useful offline.
   const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
@@ -237,7 +374,7 @@ try {
     await page.evaluate(`(() => {
       const b = [...document.querySelectorAll('button')]
         .filter(x => (x.textContent||'').trim().toLowerCase() === 'generate' && !x.disabled)
-        .find(x => /\bbtn\b/.test(x.className || ''));
+        .find(x => x.classList.contains('btn'));   // \\b in a template literal is BACKSPACE
       if (b) b.click();
     })()`);
     await sleep(700);
@@ -264,7 +401,7 @@ try {
       let summary = null;
       for (let i = 0; i < 90; i++) {          // 84 clues ~ 5 batches ~ 2-3 min
         summary = await page.evaluate(
-          `(document.body.innerText.match(/AI difficulty[\s\S]{0,220}/i) || [''])[0]`);
+          `(document.body.innerText.match(/AI difficulty[\\s\\S]{0,220}/i) || [''])[0]`);
         if (summary && !/Auditing/i.test(summary)) break;
         await sleep(3000);
       }

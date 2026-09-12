@@ -10,6 +10,7 @@ import DictionaryModal from './components/DictionaryModal';
 import LayoutEditorModal from './components/LayoutEditorModal';
 import LayoutSelector from './components/LayoutSelector';
 import ManualEditor from './components/ManualEditor';
+import ReclueReview from './components/ReclueReview';
 import PlayView from './components/PlayView';
 import GameView from './components/GameView';
 import RequiredWordsModal from './components/RequiredWordsModal';
@@ -26,7 +27,10 @@ import { todayKey, seedFromString, getStreak, recordDailySolve, isDailySolved } 
 import { difficultyLabelFromScore, difficultyColorClass, difficultyTargetOf } from './utils/difficulty';
 import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } from './utils/ollama';
 import { loadClueModel, cluePercentile } from './utils/clueScore';
-import { BANDS, scoreCandidates, flagImplausible, makeGenerator } from './utils/clueSource';
+import {
+  BANDS, scoreCandidates, flagImplausible, makeGenerator, recluePuzzle,
+} from './utils/clueSource';
+import { memoryClueStore } from './utils/clueIndex';
 import { useAuth } from './hooks/useAuth';
 import { savePuzzle } from './lib/puzzles';
 import { sfx, isSoundOn, setSoundOn } from './utils/sound';
@@ -1910,6 +1914,86 @@ const CrosswordGenerator = () => {
     saveOllamaConfig(next);
   };
 
+  // ---- whole-puzzle re-clue ----
+  const [reclue, setReclue] = useState(null);
+  const reclueAbortRef = useRef(null);
+
+  // clueSource works against a corpus-shaped object; build one from what the worker sent
+  // rather than shipping a second copy of the 6 MB artifact to the main thread.
+  const shimCorpus = (data) => {
+    const byWord = new Map();
+    const entries = [];
+    for (const [word, v] of Object.entries(data || {})) {
+      byWord.set(word, v.clues || []);
+      entries.push({ word, ...(v.answerFeatures || {}) });
+    }
+    return { entries, clueStore: memoryClueStore(byWord) };
+  };
+
+  const activeClueSet = () => (activeTab === 'create' ? manualClues : clues);
+
+  const runReclue = async (band) => {
+    const set = activeClueSet();
+    const entries = [...(set?.across || []), ...(set?.down || [])]
+      .filter((c) => c.word && !c.word.includes('_'))
+      .map((c) => ({ key: `${c.direction}-${c.row}-${c.col}`, ...c }));
+    if (!entries.length) {
+      setReclue((r) => ({ ...(r || {}), band, error: 'Fill the grid first.' }));
+      return;
+    }
+    reclueAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    reclueAbortRef.current = ctrl;
+    setReclue({ band, running: true, progress: null, result: null, error: '', selected: new Set() });
+    try {
+      const [model, data] = await Promise.all([
+        loadScorer(),
+        requestClueData([...new Set(entries.map((e) => e.word))]),
+      ]);
+      const corpus = shimCorpus(data);
+      const generate = ollamaConfig.enabled
+        ? makeGenerator({ baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 4, signal: ctrl.signal })
+        : null;
+      const out = await recluePuzzle(corpus, model, entries, {
+        band,
+        generate,
+        onProgress: (p) => setReclue((r) => (r ? { ...r, progress: p } : r)),
+      });
+      // Everything is pre-selected; the author unticks rather than hunts.
+      const selected = new Set(out.results.filter((r) => r.chosen).map((r) => r.key));
+      setReclue({ band, running: false, progress: null, result: out, error: '', selected });
+    } catch (err) {
+      setReclue((r) => ({ ...(r || { band }), running: false, error: String(err?.message || err) }));
+    }
+  };
+
+  const applyReclue = () => {
+    const st = reclue;
+    if (!st?.result) return;
+    const picks = new Map(st.result.results
+      .filter((r) => r.chosen && st.selected.has(r.key))
+      .map((r) => [r.key, r.chosen.clue]));
+    if (!picks.size) return;
+    const apply = (set) => ({
+      across: (set?.across || []).map((c) => {
+        const k = `across-${c.row}-${c.col}`;
+        return picks.has(k) ? { ...c, clue: picks.get(k) } : c;
+      }),
+      down: (set?.down || []).map((c) => {
+        const k = `down-${c.row}-${c.col}`;
+        return picks.has(k) ? { ...c, clue: picks.get(k) } : c;
+      }),
+    });
+    if (activeTab === 'create') setManualClues((prev) => apply(prev));
+    else { setClues((prev) => apply(prev)); setLatestClues((prev) => apply(prev)); }
+    for (const r of st.result.results) {
+      if (r.chosen && st.selected.has(r.key)) saveUserClue(r.word, r.chosen.clue);
+    }
+    setReclue(null);
+    setProgress(`Re-clued ${picks.size} ${picks.size === 1 ? 'entry' : 'entries'}.`);
+    setTimeout(() => setProgress(''), 4000);
+  };
+
   // ============ CLUE STUDIO ============
   // The scorer runs on the MAIN thread, not in the worker: it has to rate a clue on every
   // keystroke, and a postMessage round trip per character would be absurd for something
@@ -2557,6 +2641,15 @@ const CrosswordGenerator = () => {
                       {difficultyInfo.score !== null && <span className="font-mono text-xs text-ink-faint">({Math.round(difficultyInfo.score)})</span>}
                     </span>
                   )}
+                  {clues && (clues.across?.length || 0) > 0 && (
+                    <button
+                      onClick={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
+                      className="btn btn-sm btn-ghost"
+                      title="Swap in clues at a chosen difficulty"
+                    >
+                      <RefreshCw size={14} />Re-clue
+                    </button>
+                  )}
                   {ollamaConfig.enabled && clues && (clues.across?.length || 0) > 0 && (
                     <button
                       onClick={runDifficultyAudit}
@@ -2572,6 +2665,27 @@ const CrosswordGenerator = () => {
                   )}
                 </div>
               </div>
+
+              {reclue && activeTab === 'auto' && (
+                <ReclueReview
+                  band={reclue.band}
+                  onBandChange={(b) => setReclue((r) => ({ ...r, band: b }))}
+                  running={!!reclue.running}
+                  progress={reclue.progress}
+                  result={reclue.result}
+                  error={reclue.error}
+                  selected={reclue.selected || new Set()}
+                  aiEnabled={ollamaConfig.enabled}
+                  onToggle={(k) => setReclue((r) => {
+                    const next = new Set(r.selected);
+                    if (next.has(k)) next.delete(k); else next.add(k);
+                    return { ...r, selected: next };
+                  })}
+                  onRun={() => runReclue(reclue.band)}
+                  onApply={applyReclue}
+                  onClose={() => setReclue(null)}
+                />
+              )}
 
               {(auditState.summary || auditState.error) && (
                 <div className="mb-4 border border-ink/15 bg-paper-sunken rounded-sm p-3">
@@ -2670,6 +2784,27 @@ const CrosswordGenerator = () => {
             aiGenerateClues={aiGenerateClues}
             onOpenSettings={() => setShowSettings(true)}
             onVirtualKey={applyManualKey}
+            onOpenReclue={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
+          />
+        )}
+        {reclue && activeTab === 'create' && (
+          <ReclueReview
+            band={reclue.band}
+            onBandChange={(b) => setReclue((r) => ({ ...r, band: b }))}
+            running={!!reclue.running}
+            progress={reclue.progress}
+            result={reclue.result}
+            error={reclue.error}
+            selected={reclue.selected || new Set()}
+            aiEnabled={ollamaConfig.enabled}
+            onToggle={(k) => setReclue((r) => {
+              const next = new Set(r.selected);
+              if (next.has(k)) next.delete(k); else next.add(k);
+              return { ...r, selected: next };
+            })}
+            onRun={() => runReclue(reclue.band)}
+            onApply={applyReclue}
+            onClose={() => setReclue(null)}
           />
         )}
         

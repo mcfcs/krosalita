@@ -46,6 +46,7 @@ const ManualEditor = ({
   onClueStudioBand = () => {},
   onGenerateClues = () => {},
   onClueAccepted = () => {},
+  onOpenReclue = () => {},
   onVirtualKey = () => {}
 }) => {
 
@@ -197,6 +198,7 @@ const ManualEditor = ({
                 <button onClick={() => { setClueInput(getClueForCurrentSlot()?.clue || ''); setEditingClue(true); }} className="btn btn-sm"><PenTool size={15} />Edit Clue</button>
                 {words.length > 0 && <button onClick={() => { setShowSuggestions(!showSuggestions); setSuggestions(findSuggestionsForSlot()); }} className="btn btn-sm btn-accent"><Sparkles size={15} />Auto-fill</button>}
                 <button onClick={openStudio} disabled={!wordComplete} title={wordComplete ? 'Browse and write clues at a chosen difficulty' : 'Fill the word first'} className="btn btn-sm btn-gold"><Zap size={15} />Clues</button>
+                <button onClick={onOpenReclue} title="Re-clue the whole puzzle at a chosen difficulty" className="btn btn-sm"><Sparkles size={15} />Re-clue all</button>
               </div>
             </div>
 
