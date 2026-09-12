@@ -176,9 +176,14 @@ try {
   };
   const heard = async () => [...identify(await drain())];
 
-  // The app's keydown handler sits on a tabIndex=0 wrapper div. A synthetic .click() does
-  // not move focus the way a real mousedown does, so without this the key events land on
-  // <body> and never reach React.
+  // The app's keydown handler sits on a tabIndex=0 wrapper div, and a synthetic .click()
+  // does not move focus the way a real mousedown does, so without this the key events land
+  // on <body> and never reach React.
+  //
+  // This also papers over a real bug, so don't read it as a pure harness quirk: isFormElement
+  // (App.jsx:1195) counts 'button' as a form element and both keydown handlers bail on it, so
+  // after a REAL click on any button — a clue in the clue list, Check, Reveal, Pause — typing
+  // and the arrow keys stop working until you click a grid square again.
   const focusApp = () => page.evaluate(`(() => {
     const w = document.querySelector('div[tabindex="0"]');
     if (w) { w.focus(); return document.activeElement === w; }
