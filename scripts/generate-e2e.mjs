@@ -696,6 +696,50 @@ try {
     }
   }
 
+  // ---- Create-mode auto-fill against the new solver. The suggestion and
+  // "Generate Remaining" paths predate the rewrite, so exercise them for real: clear the
+  // grid, refill it from scratch, and check the solver's own message reaches the UI.
+  await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')]
+      .find(x => (x.textContent || '').trim() === 'Clear Grid' && !x.disabled);
+    if (b) b.click();
+  })()`);
+  await sleep(600);
+  const cleared = await page.evaluate(`document.querySelectorAll('.xw-cell .xw-letter').length`);
+  if (cleared === 0) ok('cleared the Create grid');
+  else bad('cleared the Create grid', `${cleared} letters remain`);
+
+  const ranFill = await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')]
+      .find(x => (x.textContent || '').trim() === 'Generate Remaining' && !x.disabled);
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+  if (!ranFill) {
+    bad('ran Generate Remaining', 'button missing or disabled');
+  } else {
+    let filled = 0;
+    let open = 0;
+    for (let i = 0; i < 80; i++) {
+      const m = await page.evaluate(`JSON.stringify({
+        letters: document.querySelectorAll('.xw-cell .xw-letter').length,
+        open: [...document.querySelectorAll('.xw-cell')].filter(c => !c.classList.contains('xw-cell--block')).length
+      })`);
+      ({ letters: filled, open } = JSON.parse(m));
+      if (open > 0 && filled >= open) break;
+      await sleep(500);
+    }
+    if (open > 0 && filled >= open) ok(`Generate Remaining refilled the grid (${filled}/${open})`);
+    else bad('Generate Remaining refilled the grid', `${filled} of ${open} squares`);
+
+    // Every refilled entry must get a clue — an unclued answer is unsolvable, and this is
+    // the path where preset clues used to be re-pinned to the wrong word.
+    const unclued = await page.evaluate(`document.querySelectorAll('.xw-cell--needs-clue, .xw-cell--needs-clue-strong').length`);
+    if (unclued === 0) ok('every refilled entry has a clue');
+    else bad('every refilled entry has a clue', `${unclued} squares still flagged as needing one`);
+  }
+
   const shot = await page.send('Page.captureScreenshot', { format: 'png' });
   if (shot.result?.data) {
     const out = join(ROOT, 'scripts', 'generate-e2e.png');
