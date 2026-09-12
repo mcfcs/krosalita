@@ -35,7 +35,7 @@ import {
 import { memoryClueStore } from './utils/clueIndex';
 import { useAuth } from './hooks/useAuth';
 import { savePuzzle } from './lib/puzzles';
-import { sfx, isSoundOn, setSoundOn } from './utils/sound';
+import { sfx, isSoundOn, setSoundOn, getVolume, setVolume } from './utils/sound';
 import { burstConfetti } from './utils/confetti';
 import { renderRich } from './utils/richText';
 
@@ -133,13 +133,21 @@ const CrosswordGenerator = () => {
   });
   const [showAuth, setShowAuth] = useState(false);
   const [soundOn, setSoundOnState] = useState(() => isSoundOn());
+  const [soundVolume, setSoundVolumeState] = useState(() => getVolume());
   const auth = useAuth();
 
   const toggleSound = () => {
     const next = !soundOn;
     setSoundOn(next);
     setSoundOnState(next);
-    if (next) sfx.reveal(); // audible confirmation
+    if (next) sfx.toggle(); // audible confirmation that it is on
+  };
+
+  // Dragging the slider previews at the new level, which is the only way to judge it.
+  const changeVolume = (v) => {
+    setVolume(v);
+    setSoundVolumeState(v);
+    sfx.type();
   };
 
   const puzzleFileInputRef = useRef(null);
@@ -1201,14 +1209,17 @@ const CrosswordGenerator = () => {
       if (newGrid[row][col]) {
         newGrid[row][col] = '';
         setManualGrid(newGrid);
+        sfx.erase();
       } else if (selectedDirection === 'across' && col > 0 && manualGrid[row][col - 1] !== '#') {
         newGrid[row][col - 1] = '';
         setManualGrid(newGrid);
         setSelectedCell({ row, col: col - 1 });
+        sfx.erase();
       } else if (selectedDirection === 'down' && row > 0 && manualGrid[row - 1][col] !== '#') {
         newGrid[row - 1][col] = '';
         setManualGrid(newGrid);
         setSelectedCell({ row: row - 1, col });
+        sfx.erase();
       }
       return;
     }
@@ -1216,14 +1227,15 @@ const CrosswordGenerator = () => {
       const newGrid = manualGrid.map(r => [...r]);
       newGrid[row][col] = key.toUpperCase();
       setManualGrid(newGrid);
+      sfx.type();
       if (selectedDirection === 'across' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') setSelectedCell({ row, col: col + 1 });
       else if (selectedDirection === 'down' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') setSelectedCell({ row: row + 1, col });
       return;
     }
-    if (key === 'ArrowRight' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') { setSelectedCell({ row, col: col + 1 }); setSelectedDirection('across'); }
-    else if (key === 'ArrowLeft' && col > 0 && manualGrid[row][col - 1] !== '#') { setSelectedCell({ row, col: col - 1 }); setSelectedDirection('across'); }
-    else if (key === 'ArrowDown' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') { setSelectedCell({ row: row + 1, col }); setSelectedDirection('down'); }
-    else if (key === 'ArrowUp' && row > 0 && manualGrid[row - 1][col] !== '#') { setSelectedCell({ row: row - 1, col }); setSelectedDirection('down'); }
+    if (key === 'ArrowRight' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') { setSelectedCell({ row, col: col + 1 }); setSelectedDirection('across'); sfx.move(); }
+    else if (key === 'ArrowLeft' && col > 0 && manualGrid[row][col - 1] !== '#') { setSelectedCell({ row, col: col - 1 }); setSelectedDirection('across'); sfx.move(); }
+    else if (key === 'ArrowDown' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') { setSelectedCell({ row: row + 1, col }); setSelectedDirection('down'); sfx.move(); }
+    else if (key === 'ArrowUp' && row > 0 && manualGrid[row - 1][col] !== '#') { setSelectedCell({ row: row - 1, col }); setSelectedDirection('down'); sfx.move(); }
   };
 
   const handleKeyDown = (e) => {
@@ -1424,6 +1436,7 @@ const CrosswordGenerator = () => {
   
   const handlePlayCellClick = (r, c) => {
     if (!playGrid || playGrid[r][c] === '#') return;
+    sfx.move();
     
     if (playSelectedCell?.row === r && playSelectedCell?.col === c) {
       setPlayDirection(prev => prev === 'across' ? 'down' : 'across');
@@ -1485,13 +1498,14 @@ const CrosswordGenerator = () => {
         const newGrid = playGrid.map(r => [...r]);
         newGrid[row][col] = cur.slice(0, -1);
         setPlayGrid(newGrid);
+        if (cur) sfx.erase();
         return;
       }
       if (key.length === 1 && /[a-zA-Z]/.test(key)) {
         const newGrid = playGrid.map(r => [...r]);
         newGrid[row][col] = (cur + key.toUpperCase()).slice(0, 8);
         setPlayGrid(newGrid);
-        sfx.key();
+        sfx.type();
         if (checkedCells.has(`${row},${col}`)) setCheckedCells(prev => { const n = new Set(prev); n.delete(`${row},${col}`); return n; });
         checkPlayComplete(newGrid);
         return;
@@ -1505,24 +1519,28 @@ const CrosswordGenerator = () => {
         // clear the current cell, stay put
         newGrid[row][col] = '';
         setPlayGrid(newGrid);
+        sfx.erase();
       } else if (playDirection === 'across' && col > 0 && playGrid[row][col - 1] !== '#') {
         // empty already → step back and clear
         newGrid[row][col - 1] = '';
         setPlayGrid(newGrid);
         setPlaySelectedCell({ row, col: col - 1 });
+        sfx.erase();
       } else if (playDirection === 'down' && row > 0 && playGrid[row - 1][col] !== '#') {
         newGrid[row - 1][col] = '';
         setPlayGrid(newGrid);
         setPlaySelectedCell({ row: row - 1, col });
+        sfx.erase();
       }
       return;
     }
 
     if (key.length === 1 && /[a-zA-Z]/.test(key)) {
+      const wasEmpty = !playGrid[row][col];
       const newGrid = playGrid.map(r => [...r]);
       newGrid[row][col] = key.toUpperCase();
       setPlayGrid(newGrid);
-      sfx.key();
+      sfx.type();
       // a re-typed cell needs re-checking → drop its "checked" mark
       if (checkedCells.has(`${row},${col}`)) {
         setCheckedCells(prev => { const n = new Set(prev); n.delete(`${row},${col}`); return n; });
@@ -1556,6 +1574,19 @@ const CrosswordGenerator = () => {
       if (target) setPlaySelectedCell(target);
       else if (playDirection === 'across' && col < newGrid[0].length - 1 && newGrid[row][col + 1] !== '#') setPlaySelectedCell({ row, col: col + 1 });
       else if (playDirection === 'down' && row < newGrid.length - 1 && newGrid[row + 1][col] !== '#') setPlaySelectedCell({ row: row + 1, col });
+      // That keypress just completed the entry → a small chime. Gated on `wasEmpty`, so
+      // re-typing a letter into an already-full word stays silent. The sound is the same
+      // whether the answer is right or wrong: a "that's wrong" noise here would be a free
+      // Check, which is exactly the help the player chose not to ask for.
+      if (wasEmpty && slot) {
+        let filled = 0;
+        for (let i = 0; i < slot.length; i++) {
+          const rr = slot.direction === 'across' ? slot.row : slot.row + i;
+          const cc = slot.direction === 'across' ? slot.col + i : slot.col;
+          if (newGrid[rr][cc]) filled++;
+        }
+        if (filled === slot.length) sfx.wordDone();
+      }
       // Check completion (even if auto-check is off, so the timer stops)
       checkPlayComplete(newGrid);
       return;
@@ -1565,15 +1596,19 @@ const CrosswordGenerator = () => {
     if (key === 'ArrowRight' && col < playGrid[0].length - 1 && playGrid[row][col + 1] !== '#') {
       setPlaySelectedCell({ row, col: col + 1 });
       setPlayDirection('across');
+      sfx.move();
     } else if (key === 'ArrowLeft' && col > 0 && playGrid[row][col - 1] !== '#') {
       setPlaySelectedCell({ row, col: col - 1 });
       setPlayDirection('across');
+      sfx.move();
     } else if (key === 'ArrowDown' && row < playGrid.length - 1 && playGrid[row + 1][col] !== '#') {
       setPlaySelectedCell({ row: row + 1, col });
       setPlayDirection('down');
+      sfx.move();
     } else if (key === 'ArrowUp' && row > 0 && playGrid[row - 1][col] !== '#') {
       setPlaySelectedCell({ row: row - 1, col });
       setPlayDirection('down');
+      sfx.move();
     }
   };
 
@@ -1631,6 +1666,7 @@ const CrosswordGenerator = () => {
 
     setRevealedCells(prev => new Set([...prev, `${row},${col}`]));
     setUsedAssist(true);
+    sfx.reveal();
     checkPlayComplete(newGrid);
   };
 
@@ -1651,6 +1687,7 @@ const CrosswordGenerator = () => {
     setPlayGrid(newGrid);
     setRevealedCells(newRevealed);
     setUsedAssist(true);
+    sfx.reveal();
     checkPlayComplete(newGrid);
   };
 
@@ -1658,6 +1695,7 @@ const CrosswordGenerator = () => {
     if (!playAnswers) return;
     setPlayGrid(playAnswers.map(r => [...r]));
     setUsedAssist(true);
+    sfx.reveal();
     setPlayComplete(true);
     setPlayTimerActive(false);
   };
@@ -1674,6 +1712,20 @@ const CrosswordGenerator = () => {
     if (!cells.length) return;
     setCheckedCells(prev => { const n = new Set(prev); cells.forEach(k => n.add(k)); return n; });
     setUsedAssist(true);
+    // One sound for the whole action. Any wrong square makes it a "wrong" — that is the
+    // part the player needs to hear, and staying silent would read as "all correct".
+    // A blank square is not wrong, it is simply unanswered, so it does not count.
+    if (playAnswers && playGrid) {
+      const answered = cells
+        .map((k) => k.split(',').map(Number))
+        .filter(([r, c]) => playGrid[r]?.[c] && playGrid[r][c] !== '#');
+      // Nothing typed yet → nothing to be right about. Playing the correct sound over an
+      // empty entry reads as "yes, that's it", which is the opposite of the truth.
+      if (answered.length) {
+        const wrong = answered.some(([r, c]) => playGrid[r][c] !== playAnswers[r]?.[c]);
+        if (wrong) sfx.wrong(); else sfx.correct();
+      }
+    }
   };
   const checkSquare = () => {
     if (!playSelectedCell || playGrid?.[playSelectedCell.row]?.[playSelectedCell.col] === '#') return;
@@ -2419,6 +2471,20 @@ const CrosswordGenerator = () => {
           <button onClick={toggleSound} className={`btn btn-sm ${soundOn ? 'btn-ink' : 'btn-ghost'}`} title="Sound effects">
             {soundOn ? <Volume2 size={14} /> : <VolumeX size={14} />}Sound
           </button>
+          {soundOn && (
+            <label className="flex items-center gap-1.5 text-[11px] text-ink-faint" title="Effect volume">
+              <span className="sr-only">Sound effect volume</span>
+              <input
+                type="range"
+                min="0" max="1" step="0.05"
+                value={soundVolume}
+                onChange={(e) => changeVolume(Number(e.target.value))}
+                className="w-20 accent-ink cursor-pointer"
+                aria-label="Sound effect volume"
+              />
+              <span className="font-mono tabular-nums w-7">{Math.round(soundVolume * 100)}</span>
+            </label>
+          )}
           {installPromptEvent && (
             <button onClick={handleInstall} className="btn btn-sm btn-accent">
               <DownloadCloud size={14} />Install App
