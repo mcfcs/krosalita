@@ -469,3 +469,103 @@ export const embedTexts = async ({ baseUrl, model = 'qwen3-embedding:0.6b', text
     t.done();
   }
 };
+
+// ---------------------------------------------------------------------------
+// Sense discovery
+// ---------------------------------------------------------------------------
+
+const SENSE_TIMEOUT_MS = 120000;
+
+/**
+ * Ask what an answer could mean, before asking for clues.
+ *
+ * Deliberately a separate call from clue writing. Asking for meanings AND clues in one
+ * request is cheaper and measurably worse: GHAST came back with only a D&D specter and
+ * lost the Minecraft mob entirely, RAZER lost the raze sense the corpus actually uses,
+ * and DISCORD overran the token budget and failed to parse. Two small calls beat one big
+ * one here.
+ *
+ * The model WILL invent senses for obscure answers — asked about RAZER it offered a
+ * "Vampire character in D&D" — so nothing here is presented as fact. clueSource
+ * corroborates each sense against the answer's published clues before the UI labels it.
+ *
+ * @returns {Promise<Array<{label:string, gloss:string, domain:string}>>}
+ */
+export const discoverSenses = async ({ baseUrl, model, word, known = [], signal, max = 4 }) => {
+  const answer = (word || '').toUpperCase();
+  if (!answer) return [];
+  const mc = mixedContentWarning(baseUrl);
+  if (mc) throw new Error(mc);
+
+  const prompt = `You are a crossword editor deciding how an answer could be clued.
+
+ANSWER: ${answer}
+${known.length
+    ? `It has been clued before as: ${known.slice(0, 6).map((c) => `"${c}"`).join(', ')}.`
+    : 'It has never been clued before.'}
+
+List the genuinely DISTINCT things this answer can REFER TO. Include proper nouns —
+brands, video game characters or creatures, bands, films, places, people — not only
+dictionary senses. A solver is as likely to meet the brand as the dictionary word.
+
+Do NOT list facts ABOUT the string itself. "A valid Scrabble word", "a five-letter word",
+"an anagram of X" are not meanings and must never appear.
+Only list meanings you are confident really exist. One correct meaning is far better than
+three with an invented one among them. At most ${max}.
+
+For each give:
+  "label"  2-4 words naming the sense, e.g. "Minecraft mob"
+  "gloss"  one short sentence saying what it is
+  "domain" the vocabulary a clue in that sense would draw on, comma separated
+
+Reply with ONLY a JSON array. No prose, no code fences.`;
+
+  const t = linkedTimeout(SENSE_TIMEOUT_MS, signal);
+  try {
+    const res = await fetch(`${trimBase(baseUrl)}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, prompt, stream: false, think: false,
+        options: { temperature: 0.7, num_predict: 900 },
+      }),
+      signal: t.signal,
+    });
+    if (!res.ok) throw new Error(`Ollama responded ${res.status}. Check the model name.`);
+    const data = await res.json();
+    return parseSenses(data.response || '', max);
+  } catch (err) {
+    if (signal?.aborted) throw new Error('Sense lookup cancelled.');
+    if (t.timedOut()) throw new Error('Sense lookup timed out.');
+    throw new Error(err.message || 'Sense lookup failed.');
+  } finally {
+    t.done();
+  }
+};
+
+/** Exported so the parsing can be tested without a server. */
+export const parseSenses = (text, max = 4) => {
+  if (!text) return [];
+  const cleaned = String(text).replace(/^```(?:json)?|```$/gm, '').trim();
+  const m = cleaned.match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  let arr;
+  try { arr = JSON.parse(m[0]); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const label = typeof it.label === 'string' ? it.label.trim() : '';
+    const gloss = typeof it.gloss === 'string' ? it.gloss.trim() : '';
+    if (!label || seen.has(label.toLowerCase())) continue;
+    seen.add(label.toLowerCase());
+    out.push({
+      label,
+      gloss,
+      domain: typeof it.domain === 'string' ? it.domain.trim() : '',
+    });
+    if (out.length >= max) break;
+  }
+  return out;
+};

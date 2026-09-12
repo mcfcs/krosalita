@@ -4,6 +4,7 @@
 //   node scripts/clue.mjs GHAST --band hard --count 8
 //   node scripts/clue.mjs ORBIT --band easy --no-generate     # published clues only
 //   node scripts/clue.mjs GHAST --sense "the Minecraft mob"   # disambiguate the answer
+//   node scripts/clue.mjs DISCORD --senses                    # clue every meaning it has
 //
 // The same pipeline the Clue Studio uses, without the browser: published clues first,
 // then generation to fill the gap, everything scored by the local model. Handy for trying
@@ -20,8 +21,10 @@ const { decodeCorpus } = await import(url('src/utils/wordIndex.js'));
 const { loadClueModel, answerFeaturesFrom } = await import(url('src/utils/clueScore.js'));
 const {
   BANDS, corpusCandidates, scoreCandidates, flagImplausible, makeGenerator, answerRange,
+  sensesForAnswer, senseText,
 } = await import(url('src/utils/clueSource.js'));
 
+const NL = String.fromCharCode(10);
 const argv = process.argv.slice(2);
 const flag = (k, d) => { const i = argv.indexOf(k); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
 const word = (argv.find((a) => !a.startsWith('--') && !/^\d+$/.test(a)) || '').toUpperCase().replace(/[^A-Z]/g, '');
@@ -29,6 +32,7 @@ const band = flag('--band', 'medium');
 const count = Number(flag('--count', 6));
 const sense = flag('--sense', '');
 const doGen = !argv.includes('--no-generate');
+const bySense = argv.includes('--senses');
 const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
 const GEN_MODEL = flag('--model', 'qwen3.5:27b');
 
@@ -82,6 +86,47 @@ const show = (list, title) => {
 let candidates = corpusCandidates(corpus, model, word, { band });
 show(candidates.filter((c) => c.inBand), `published, in band`);
 show(candidates.filter((c) => !c.inBand), `published, outside the band`);
+
+// --senses: find every meaning the answer could carry, then clue each one separately.
+if (bySense) {
+  let up = false;
+  try {
+    const c = new AbortController();
+    const to = setTimeout(() => c.abort(), 4000);
+    up = (await fetch(`${OLLAMA}/api/tags`, { signal: c.signal })).ok;
+    clearTimeout(to);
+  } catch { up = false; }
+  if (!up) {
+    console.log(`${NL}  (${OLLAMA} unreachable — cannot look up meanings)`);
+    process.exit(0);
+  }
+  process.stdout.write(`${NL}  finding meanings…`);
+  const senses = await sensesForAnswer(corpus, word, {
+    baseUrl: OLLAMA, model: GEN_MODEL, embedUrl: 'http://localhost:11434',
+  });
+  console.log(` ${senses.length} found`);
+  const generate = makeGenerator({ baseUrl: OLLAMA, model: GEN_MODEL, perWord: count });
+  const knownClues = corpusCandidates(corpus, model, word, { band }).map((c) => c.clue);
+  for (const sn of senses) {
+    // The corpus can only corroborate a sense, never rule one out — it simply may never
+    // have been clued that way. So an unverified sense is flagged, not hidden.
+    // Silence would read as approval. An answer with no published clues cannot have any
+    // of its meanings corroborated, and the model does invent them -- it placed GHAST in
+    // Super Mario -- so say that outright rather than leaving the line blank.
+    const tag = sn.corroborated === null ? '  [unchecked — nothing published to compare against]'
+      : sn.corroborated ? '  [matches published clues]'
+        : `  [unverified — check this meaning exists, ${sn.similarity.toFixed(2)}]`;
+    console.log(`${NL}  ${sn.label}${tag}`);
+    if (sn.gloss) console.log(`    ${sn.gloss}`);
+    const fresh = await generate([{ word, sense: senseText(sn), known: knownClues }], band);
+    const got = fresh.get(word) || { clues: [] };
+    for (const c of scoreCandidates(corpus, model, word, got.clues, { band })) {
+      console.log(`      ${c.inBand ? ' ' : '·'} ${String(Math.round(c.percentile)).padStart(3)}  ${c.clue}`);
+    }
+  }
+  console.log('');
+  process.exit(0);
+}
 
 if (doGen) {
   let up = false;

@@ -17,7 +17,7 @@
 import { isClueUsableFor } from './clueFilters.js';
 import { cluesForWord } from './clueIndex.js';
 import { cluePercentile, scoreClue, scorePercentile, answerFeaturesFrom } from './clueScore.js';
-import { generateCluesBatch, embedTexts } from './ollama.js';
+import { generateCluesBatch, embedTexts, discoverSenses } from './ollama.js';
 
 /** The three bands offered for generation, as percentile windows. */
 export const BANDS = {
@@ -92,6 +92,10 @@ export function scoreCandidates(corpus, model, word, clues, { band = 'medium', e
 }
 
 const PLAUSIBLE_MIN = 0.70;
+// A sense whose gloss sits this close to the answer's published clues is the sense the
+// corpus already uses. Lower than PLAUSIBLE_MIN because a one-line gloss is a looser
+// match to a set of terse clues than another clue would be.
+const SENSE_MATCH_MIN = 0.60;
 
 function cosine(a, b) {
   let dot = 0;
@@ -133,6 +137,53 @@ export async function flagImplausible(corpus, word, candidates, { baseUrl, model
     });
   } catch {
     return candidates; // the check is a bonus; never let it fail the whole request
+  }
+}
+
+/** A sense, phrased the way generateCluesBatch wants it. */
+export const senseText = (sense) => (
+  !sense ? '' : [sense.label, sense.gloss].filter(Boolean).join(' — ')
+    + (sense.domain ? ` (vocabulary: ${sense.domain})` : '')
+);
+
+/**
+ * The distinct meanings an answer could be clued as, each marked with whether the corpus
+ * corroborates it.
+ *
+ * The model invents senses for obscure answers — asked about RAZER it produced a "Vampire
+ * character in D&D", and labelled a made-up "fictional weapon" sense as the one the corpus
+ * uses. So its own claim about which sense is established is ignored; instead each sense's
+ * gloss is compared against the centroid of the answer's published clues, the same check
+ * that catches wrong clues. A sense that matches is marked published; everything else is
+ * explicitly unverified, and the UI must not present the two alike.
+ *
+ * @returns {Promise<Array<{label,gloss,domain,similarity,corroborated}>>}
+ */
+export async function sensesForAnswer(corpus, word, { baseUrl, model, embedUrl, signal } = {}) {
+  const known = cluesForWord(corpus?.clueStore, word).map((c) => c.clue);
+  const senses = await discoverSenses({ baseUrl, model, word, known, signal });
+  if (!senses.length) return [];
+  if (!embedUrl || known.length < 3) {
+    return senses.map((s) => ({ ...s, similarity: null, corroborated: null }));
+  }
+  try {
+    const vecs = await embedTexts({
+      baseUrl: embedUrl, signal,
+      texts: [...senses.map((s) => `${s.label}. ${s.gloss}`), ...known],
+    });
+    if (vecs.length !== senses.length + known.length) {
+      return senses.map((s) => ({ ...s, similarity: null, corroborated: null }));
+    }
+    const kn = vecs.slice(senses.length);
+    const dim = kn[0].length;
+    const centroid = new Array(dim).fill(0);
+    for (const v of kn) for (let i = 0; i < dim; i++) centroid[i] += v[i] / kn.length;
+    return senses.map((s, i) => {
+      const similarity = cosine(vecs[i], centroid);
+      return { ...s, similarity, corroborated: similarity >= SENSE_MATCH_MIN };
+    });
+  } catch {
+    return senses.map((s) => ({ ...s, similarity: null, corroborated: null }));
   }
 }
 
