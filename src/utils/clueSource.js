@@ -140,7 +140,7 @@ export async function flagImplausible(corpus, word, candidates, { baseUrl, model
  * @returns {Promise<{word, band, candidates, range, reachable, usedLLM}>}
  */
 export async function cluesForAnswer(corpus, model, word, {
-  band = 'medium', exclude, generate = null, want = 6,
+  band = 'medium', exclude, generate = null, want = 6, sense = '',
 } = {}) {
   const range = answerRange(corpus, model, word);
   const win = BANDS[band] || BANDS.medium;
@@ -151,7 +151,7 @@ export async function cluesForAnswer(corpus, model, word, {
   // Generate whenever the corpus cannot fill the band, regardless of the published range.
   if (generate && haveInBand < want) {
     usedLLM = true;
-    const fresh = await generate([{ word }], band);
+    const fresh = await generate([{ word, sense }], band);
     candidates.push(...scoreCandidates(corpus, model, word, fresh.get(word) || [], { band, exclude }));
     candidates.sort((a, b) => (b.inBand - a.inBand)
       || Math.abs(a.percentile - win.target * 100) - Math.abs(b.percentile - win.target * 100));

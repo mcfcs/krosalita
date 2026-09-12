@@ -332,7 +332,12 @@ export const parseGenerateResponse = (text, batchSize) => {
 
 const generatePrompt = (batch, band, perWord) => {
   const hint = GEN_RUBRIC[band] || GEN_RUBRIC.medium;
-  const lines = batch.map((e, i) => `${i + 1}. ${e.word}`).join('\n');
+  // An answer's sense is often ambiguous and the model silently picks one: asked to clue
+  // GHAST it writes about specters and never the Minecraft mob. `sense` lets the caller
+  // say which meaning is wanted, per answer.
+  const lines = batch
+    .map((e, i) => `${i + 1}. ${e.word}${e.sense ? `  (meaning: ${e.sense})` : ''}`)
+    .join('\n');
   return `You are a New York Times crossword editor writing clues.
 
 For each numbered ANSWER below, write ${perWord} crossword ${perWord === 1 ? 'clue' : 'clues'}.
@@ -343,6 +348,7 @@ Rules:
 - Never refer to another entry ("see 14-Across", "with 3-Down") — these puzzles are generated, so the numbers would be meaningless.
 - Never refer to the grid, its theme, circled or shaded squares.
 - Keep each clue short, the way a printed crossword clue is short.
+- Where a meaning is given in brackets, clue THAT meaning and no other.
 
 Reply with ONLY a JSON array of {"i":<answer number>,"c":"<clue>"}, ${perWord} entries per answer. No prose, no code fences.
 
