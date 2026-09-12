@@ -84,7 +84,7 @@ export function extractFeatures(word, clueText, answer = {}) {
     len ? roundPy(vowels / len, 4) : 0,
     vowels === 0 ? 1 : 0,
     num(answer.distinctClues),
-    clue.length,
+    [...clue].length,
     nTok,
     nTok ? roundPy(tokens.reduce((a, t) => a + t.length, 0) / nTok, 3) : 0,
     nTok <= 1 ? 1 : 0,
@@ -140,6 +140,18 @@ export function scoreFeatures(model, features) {
 
 export function scoreClue(model, word, clueText, answer) {
   return scoreFeatures(model, extractFeatures(word, clueText, answer));
+}
+
+/**
+ * Difficulty as a percentile, 0..100 — the scale the rest of the app displays.
+ *
+ * Uses the model's OWN output distribution (`rawQuantiles`), not the corpus difficulty
+ * quantiles. The cold model's raw range is narrower than the full model's, so ranking its
+ * output against the corpus scale would read almost every freshly written clue as
+ * mid-range regardless of what it actually says.
+ */
+export function cluePercentile(model, word, clueText, answer) {
+  return scorePercentile(model.rawQuantiles, scoreClue(model, word, clueText, answer));
 }
 
 /**

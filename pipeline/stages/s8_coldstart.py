@@ -49,8 +49,14 @@ ANSWER_FEATURES = {
     "VowelRatio", "IsAllCons", "DistinctCluesForWord",
 }
 
-PARITY_ROWS = 400
+PARITY_ROWS = 600
 SKIP = {"Word", "Clue"}
+
+# Markers fire rarely (some in well under 1% of clues). An evenly-strided fixture sample
+# would contain zero rows for several of them, and a JS regex that silently never matches
+# would then pass the parity check trivially -- the exact failure the check exists to
+# catch. So the fixture is stratified to guarantee coverage of every marker.
+MIN_PER_MARKER = 12
 
 
 def _load():
@@ -139,33 +145,89 @@ def run():
     te = np.array([g in test_words for g in groups])
     tr = ~te
 
+    # Missingness augmentation: train on each row twice, once with the answer features
+    # blanked. Without it the NaN branch direction is whatever sklearn's grower happened to
+    # pick from child sizes -- an untrained, unvalidated path, and unknown answers are a
+    # routine case here (a user's own word), not an edge case. Measured: this lifts the
+    # unknown-answer correlation from 0.366 to ~0.398 AND nudges the known-answer one up
+    # too, for ~1% more nodes.
+    ans_idx = [i for i, c in enumerate(cols) if c in ANSWER_FEATURES]
+    X_blank = X[tr].copy()
+    X_blank[:, ans_idx] = np.nan
+    X_fit = np.vstack([X[tr], X_blank])
+    y_fit = np.concatenate([y[tr], y[tr]])
+
     model = HistGradientBoostingRegressor(
         max_iter=60, max_depth=4, learning_rate=0.06,
         min_samples_leaf=20, l2_regularization=1.0, random_state=11,
     )
-    model.fit(X[tr], y[tr])
+    model.fit(X_fit, y_fit)
 
     pred = model.predict(X[te])
     rho = _spearman(pred.tolist(), y[te].tolist())
     mae = float(np.mean(np.abs(pred - y[te])) * 100)
 
     # Same model, answer features blanked: this is what a user's own word gets.
-    ans_idx = [i for i, c in enumerate(cols) if c in ANSWER_FEATURES]
     X_cold = X[te].copy()
     X_cold[:, ans_idx] = np.nan
     pred_cold = model.predict(X_cold)
     rho_cold = _spearman(pred_cold.tolist(), y[te].tolist())
     mae_cold = float(np.mean(np.abs(pred_cold - y[te])) * 100)
 
+    # Calibration. The cold model's raw output occupies a narrower range than the corpus
+    # difficulty byte (which comes from the full 32-feature model), so ranking a freshly
+    # written clue against the corpus quantiles would read every one of them as mid-range.
+    # Shipping the cold model's OWN quantiles makes its percentile directly comparable to
+    # everything else the app displays.
+    state.stage_progress(NAME, len(y), message="calibrating against the full corpus")
+    raw_all = []
+    with open(FEATURES, encoding="utf-8", newline="") as f:
+        rdr = csv.DictReader(f)
+        chunk = []
+        for row in rdr:
+            vec = []
+            for c in cols:
+                v = row.get(c)
+                try:
+                    vec.append(float(v) if v not in (None, "") else np.nan)
+                except ValueError:
+                    vec.append(np.nan)
+            chunk.append(vec)
+            if len(chunk) >= 50000:
+                raw_all.append(model.predict(np.array(chunk)))
+                chunk = []
+        if chunk:
+            raw_all.append(model.predict(np.array(chunk)))
+    raw_all = np.sort(np.concatenate(raw_all))
+
     bundle = _export(model, cols)
+    bundle["rawQuantiles"] = [
+        round(float(raw_all[min(len(raw_all) - 1, int(len(raw_all) * q / 100))]), 6)
+        for q in range(101)
+    ]
     os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
     with open(MODEL_OUT, "w", encoding="utf-8") as f:
         json.dump(bundle, f, separators=(",", ":"))
 
     # Parity fixture: the JS side recomputes these features from (word, clue) and must
     # land on the same numbers, and the same predictions.
-    step = max(1, len(keys) // PARITY_ROWS)
-    sample = list(range(0, len(keys), step))[:PARITY_ROWS]
+    marker_start = cols.index("q_wordplay")
+    chosen = set()
+    # every marker, then edge shapes, then an even sweep of the rest
+    for mi in range(marker_start, len(cols)):
+        hits = [i for i in range(len(keys)) if X[i][mi] == 1]
+        chosen.update(hits[:MIN_PER_MARKER])
+    def pick(test, n=10):
+        chosen.update([i for i in range(len(keys)) if test(i)][:n])
+    pick(lambda i: '"' in keys[i][1])                       # straight quotes
+    pick(lambda i: any(ord(c) > 127 for c in keys[i][1]))   # non-ASCII: the  divergence
+    pick(lambda i: X[i][cols.index("ClueTokens")] <= 1)     # single-token clues
+    pick(lambda i: X[i][cols.index("WordLen")] >= 14)
+    pick(lambda i: X[i][cols.index("IsAllCons")] == 1)
+    pick(lambda i: np.isnan(X[i][cols.index("ZipfEn")]))    # unknown to wordfreq
+    step = max(1, len(keys) // max(1, PARITY_ROWS - len(chosen)))
+    chosen.update(range(0, len(keys), step))
+    sample = sorted(chosen)[:PARITY_ROWS]
     parity = {
         "features": cols,
         "rows": [{
@@ -186,6 +248,10 @@ def run():
         "rho_heldout": round(rho, 4), "mae_points": round(mae, 2),
         "rho_unknown_answer": round(rho_cold, 4), "mae_unknown_answer": round(mae_cold, 2),
         "parity_rows": len(parity["rows"]),
+        "markers_covered": sum(
+            1 for mi in range(cols.index("q_wordplay"), len(cols))
+            if any(X[i][mi] == 1 for i in sample)),
+        "markers_total": len(cols) - cols.index("q_wordplay"),
     }
     for k, v in metrics.items():
         state.set_validation(f"s8_{k}", v)

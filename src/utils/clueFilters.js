@@ -28,6 +28,7 @@ export const CLUE_FILTER_RULES = [
   ['theme_of', /\btheme of this\b/i],
   ['this_answer', /\bthis (?:answer|clue|entry)\b/i],
   ['other_answers', /\b(?:other|remaining)\s+(?:\w+\s+)?(?:answers|entries|clues)\b/i],
+  ['literally', /\bas (?:seen|found|shown|spelled) in (?:this|the) (?:puzzle|grid)\b/i],
 ];
 
 /** The rule that rejects `clue`, or null when it is usable. */

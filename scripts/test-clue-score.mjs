@@ -16,7 +16,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const url = (p) => pathToFileURL(path.join(ROOT, p)).href;
 
 const {
-  loadClueModel, extractFeatures, scoreFeatures, scoreClue, scorePercentile,
+  loadClueModel, extractFeatures, scoreFeatures, scoreClue, cluePercentile,
   explainClue, FEATURE_ORDER,
 } = await import(url('src/utils/clueScore.js'));
 
@@ -99,11 +99,46 @@ for (const row of fixture.rows) {
 if (maxErr > 1e-5) fail(`JS tree walker differs from Python by up to ${maxErr.toFixed(7)}`);
 else ok(`prediction parity — max |JS − Python| = ${maxErr.toExponential(1)}`);
 
+// ---------------------------------------------------------------- marker coverage
+// A JS regex that never matches would satisfy every equality check above by agreeing with
+// Python on zero rows. Require each marker to actually fire somewhere in the fixture.
+{
+  const markerStart = FEATURE_ORDER.indexOf('q_wordplay');
+  const dead = [];
+  for (let m = markerStart; m < FEATURE_ORDER.length; m++) {
+    const firedPy = fixture.rows.some((r) => r.values[m] === 1);
+    const firedJs = fixture.rows.some((r) => {
+      const py = r.values.map((v) => (v === null ? NaN : v));
+      return extractFeatures(r.word, r.clue, {
+        corpusFreqLog: py[ANSWER_IDX.CorpusFreqLog], zipf: py[ANSWER_IDX.ZipfEn],
+        crosswordese: py[ANSWER_IDX.Crosswordese], distinctClues: py[ANSWER_IDX.DistinctCluesForWord],
+      })[m] === 1;
+    });
+    if (!firedPy || !firedJs) dead.push(`${FEATURE_ORDER[m]}(py=${firedPy} js=${firedJs})`);
+  }
+  if (dead.length) fail(`markers never firing in the fixture: ${dead.join(', ')}`);
+  else ok(`all ${FEATURE_ORDER.length - markerStart} markers fire in both Python and JS`);
+}
+
+// ---------------------------------------------------------------- filter-rule parity
+// clue_filters.py and clueFilters.js are hand-mirrored, and have drifted before.
+{
+  const py = fs.readFileSync(path.join(ROOT, 'pipeline', 'clue_filters.py'), 'utf8');
+  const pyNames = [...py.matchAll(/^\s*\("([a-z_]+)",/gm)].map((m) => m[1]);
+  const { CLUE_FILTER_RULES } = await import(url('src/utils/clueFilters.js'));
+  const jsNames = CLUE_FILTER_RULES.map((r) => r[0]);
+  const missing = pyNames.filter((n) => !jsNames.includes(n));
+  const extra = jsNames.filter((n) => !pyNames.includes(n));
+  if (missing.length || extra.length) {
+    fail(`clue filter rules drifted — missing in JS: [${missing}] · extra in JS: [${extra}]`);
+  } else {
+    ok(`clue filter rules match Python (${jsNames.length} rules)`);
+  }
+}
+
 // ---------------------------------------------------------------- behaviour
 // Ordering is what the feature is actually used for, so check it directly rather than
 // trusting a correlation number computed elsewhere.
-const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'public', 'corpus', 'manifest.json'), 'utf8'));
-const q = manifest.difficultyQuantiles;
 const corpusBuf = fs.readFileSync(path.join(ROOT, 'public', 'corpus', 'corpus.bin'));
 const { decodeCorpus } = await import(url('src/utils/wordIndex.js'));
 const corpus = decodeCorpus(corpusBuf.buffer.slice(corpusBuf.byteOffset,
@@ -121,7 +156,7 @@ const CASES = [
 console.log('');
 let bandErrors = 0;
 for (const [word, clue, want] of CASES) {
-  const p = scorePercentile(q, scoreClue(model, word, clue, answerFeaturesFrom(corpus, word)));
+  const p = cluePercentile(model, word, clue, answerFeaturesFrom(corpus, word));
   const got = p < 40 ? 'easy' : p >= 60 ? 'hard' : 'middling';
   const mark = got === want ? '   ' : ' ! ';
   console.log(`  ${mark}p${String(Math.round(p)).padStart(3)}  ${word.padEnd(6)}${clue}`);

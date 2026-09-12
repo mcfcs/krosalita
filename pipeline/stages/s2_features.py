@@ -35,25 +35,33 @@ except ImportError:  # degrade rather than fail; the model just loses its best f
     zipf_frequency = None
 
 # Clue-surface markers. Each is a genuine signal a crossword editor uses on purpose.
+#
+# re.ASCII on every one of these is load-bearing, not tidiness: JavaScript's , \w and
+# \d are ASCII-only while Python 3's are Unicode-aware, and the browser scorer
+# (src/utils/clueScore.js) must compute byte-identical features or it feeds the model
+# numbers it never trained on. Measured before the fix: 294 of 551,653 clues where
+# ProperNounCount differed between the two, all around curly quotes and accents.
+A = re.ASCII
 MARKERS = [
-    ("q_wordplay",  re.compile(r"\?\s*$")),                       # "?" = wordplay, harder
-    ("fitb",        re.compile(r"_{2,}|\b___\b")),                # fill-in-the-blank, easier
-    ("abbr",        re.compile(r":\s*Abbr\.?|,\s*for short|,\s*in brief|\bacronym\b", re.I)),
-    ("variant",     re.compile(r":\s*Var\.?|\bvar\.\b", re.I)),
-    ("by_example",  re.compile(r",\s*e\.g\.|\bperhaps\b|\bmaybe\b|\bsay\b\s*$|\bfor one\b", re.I)),
-    ("quoted",      re.compile(r'"[^"]{2,}"')),
+    ("q_wordplay",  re.compile(r"\?\s*$", A)),                       # "?" = wordplay, harder
+    ("fitb",        re.compile(r"_{2,}|\b___\b", A)),                # fill-in-the-blank, easier
+    ("abbr",        re.compile(r":\s*Abbr\.?|,\s*for short|,\s*in brief|\bacronym\b", re.I | A)),
+    ("variant",     re.compile(r":\s*Var\.?|\bvar\.\b", re.I | A)),
+    ("by_example",  re.compile(r",\s*e\.g\.|\bperhaps\b|\bmaybe\b|\bsay\b\s*$|\bfor one\b", re.I | A)),
+    ("quoted",      re.compile(r'"[^"]{2,}"', A)),
     ("foreign",     re.compile(r"\bin (?:Paris|Spain|France|Italy|Germany|Rome|Madrid)\b"
                                r"|\b(?:French|Spanish|German|Italian|Latin|Greek) (?:for|word)\b"
-                               r"|:\s*(?:Fr|Sp|Ger|It|Lat)\.", re.I)),
-    ("year",        re.compile(r"\b(?:1[5-9]\d{2}|20[0-2]\d)\b")),  # trivia anchor
-    ("prefix_sfx",  re.compile(r"\b(?:prefix|suffix|combining form)\b", re.I)),
-    ("brand_name",  re.compile(r"\b(?:brand|maker|company|co\.|inc\.)\b", re.I)),
-    ("roman",       re.compile(r"\bRoman numeral|\bin Roman\b", re.I)),
-    ("crossword_of",re.compile(r"\bpartner\b|\bcompanion\b|\bfollower\b|\bword (?:before|after)\b", re.I)),
+                               r"|:\s*(?:Fr|Sp|Ger|It|Lat)\.", re.I | A)),
+    ("year",        re.compile(r"\b(?:1[5-9]\d{2}|20[0-2]\d)\b", A)),  # trivia anchor
+    ("prefix_sfx",  re.compile(r"\b(?:prefix|suffix|combining form)\b", re.I | A)),
+    ("brand_name",  re.compile(r"\b(?:brand|maker|company|co\.|inc\.)\b", re.I | A)),
+    ("roman",       re.compile(r"\bRoman numeral|\bin Roman\b", re.I | A)),
+    ("crossword_of",re.compile(r"\bpartner\b|\bcompanion\b|\bfollower\b|\bword (?:before|after)\b", re.I | A)),
 ]
 
-CAP_WORD = re.compile(r"\b[A-Z][a-z]{2,}")
-TOKEN = re.compile(r"[A-Za-z']+")
+DIGIT = re.compile(r"[0-9]", A)
+CAP_WORD = re.compile(r"\b[A-Z][a-z]{2,}", A)
+TOKEN = re.compile(r"[A-Za-z']+", A)
 
 
 def _f(row, key, default=None):
@@ -144,7 +152,7 @@ def run(src=IN, out=OUT):
                 1 if ntok <= 1 else 0,
                 proper,
                 round(proper / ntok, 4) if ntok else 0,
-                1 if any(c.isdigit() for c in clue) else 0,
+                1 if DIGIT.search(clue) else 0,
                 row.get("PairCount") or 1,
                 row.get("WeekdayMean") or "",
                 row.get("WeekdayLast") or "",
