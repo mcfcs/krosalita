@@ -184,11 +184,22 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
     # Keep the best few clues per word. Rank by recurrence then recency -- the OPPOSITE
     # of today's behaviour, where parseCSV's stable sort over an oldest-first CSV means
     # every word gets its 1993-era clue.
+    # Rank by recurrence AND recency together. Sorting by (-count, date) broke ties
+    # oldest-first, which quietly kept 46% of 1990s clues against 34% of 2020s ones --
+    # the last remnant of the old "every answer gets its 1993 clue" behaviour. A clue
+    # used forty times is still strong evidence, so recurrence keeps most of the weight;
+    # recency decides between clues that are otherwise equal.
+    def rank(t):
+        _diff, _clue, count, last = t
+        year = 0
+        if last and len(last) >= 4 and last[:4].isdigit():
+            year = int(last[:4])
+        recency = 0.0 if not year else max(0.0, min(1.0, (year - 1993) / 32.0))
+        return math.log1p(count) + 1.2 * recency
+
     kept = {}
     for w, lst in clues.items():
-        lst.sort(key=lambda t: (-t[2], t[3]), reverse=False)
-        lst.sort(key=lambda t: (-t[2], t[3] or "0000-00-00"), reverse=False)
-        best = lst[:max_clues]
+        best = sorted(lst, key=rank, reverse=True)[:max_clues]
         best.sort(key=lambda t: t[0])          # store ascending by difficulty
         kept[w] = best
 

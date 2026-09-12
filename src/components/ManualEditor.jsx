@@ -169,17 +169,17 @@ const ManualEditor = ({
               const cellClass = cell === '#'
                 ? 'xw-cell--block'
                 : inFailedWord
-                  ? 'bg-wrong/15'
+                  ? 'xw-cell--failed'
                   : isSelected
                     ? 'bg-select ring-1 ring-inset ring-ink/30'
                     : isInWord
                       ? 'bg-word'
                       : shouldShowRequiredMissing && cell
-                        ? 'bg-gold/20'
+                        ? 'xw-cell--needs-clue-strong'
                         : inHighlightedWord
-                          ? 'bg-correct/15'
+                          ? 'xw-cell--required'
                           : missingClue && cell
-                            ? 'bg-gold/15'
+                            ? 'xw-cell--needs-clue'
                             : '';
               return <div key={c} onClick={() => handleCellClick(r, c)} className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${cellClass}`}>{cell !== '#' && clueNumber && <span className="xw-num">{clueNumber}</span>}{cell !== '#' && cell && <span className="xw-letter text-ink">{cell}</span>}</div>;
             })}</div>)}

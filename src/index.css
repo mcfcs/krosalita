@@ -260,6 +260,33 @@
     -webkit-tap-highlight-color: transparent;
   }
   .xw-cell--block { background: var(--ink); box-shadow: none; cursor: default; }
+
+  /* ---- Create-grid cell states ----
+     These MUST paint an opaque base. The grid's own backdrop is --ink, and a
+     translucent utility fill (the old `bg-gold/15`) overrides .xw-cell's white
+     background entirely, so the tint composited over near-black and buried the
+     letter at ~1.2:1. Lay the token tint over --paper-raised instead: same hue,
+     same meaning, letter back above WCAG AA (>= 6.3:1 in both themes). */
+  .xw-cell--needs-clue,
+  .xw-cell--needs-clue-strong,
+  .xw-cell--required,
+  .xw-cell--failed { background-color: var(--paper-raised); }
+  /* entry is filled but has no clue yet */
+  .xw-cell--needs-clue {
+    background-image: linear-gradient(rgb(var(--gold-rgb) / 0.45), rgb(var(--gold-rgb) / 0.45));
+  }
+  /* required/suggested word that is also missing its clue — deeper ochre */
+  .xw-cell--needs-clue-strong {
+    background-image: linear-gradient(rgb(var(--gold-rgb) / 0.7), rgb(var(--gold-rgb) / 0.7));
+  }
+  /* part of a required / suggested word */
+  .xw-cell--required {
+    background-image: linear-gradient(rgb(var(--correct-rgb) / 0.34), rgb(var(--correct-rgb) / 0.34));
+  }
+  /* word the filler failed to place */
+  .xw-cell--failed {
+    background-image: linear-gradient(rgb(var(--wrong-rgb) / 0.3), rgb(var(--wrong-rgb) / 0.3));
+  }
   .xw-num {
     position: absolute;
     top: 1px;

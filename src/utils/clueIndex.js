@@ -124,9 +124,10 @@ export function assignClues(placements, {
     let chosen = '';
     if (usable.length) {
       if (difficultyTarget == null) {
-        // No target: the packed store is ordered best-first by recurrence, so take from
-        // the front, with a little seeded jitter for variety across regenerations.
-        chosen = usable[Math.min(usable.length - 1, Math.floor(rng() * Math.min(3, usable.length)))].clue;
+        // No target: pick freely among the answer's kept clues. They are already ranked
+        // for recurrence and recency at pack time, so an even draw here gives real
+        // variety between regenerations instead of always serving the same few.
+        chosen = usable[Math.floor(rng() * usable.length)].clue;
       } else {
         let best = usable[0];
         let bestD = Infinity;

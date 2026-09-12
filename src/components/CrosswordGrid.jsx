@@ -58,7 +58,7 @@ const CrosswordGrid = ({
                 : isInWord
                   ? 'bg-word'
                   : missingClue && cell
-                    ? 'bg-gold/15'
+                    ? 'xw-cell--needs-clue'
                     : '';
             const letterColor = isRevealed
               ? 'text-revealed'
