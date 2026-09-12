@@ -382,16 +382,25 @@ try {
   // Optional: the AI difficulty audit, only when the configured Ollama is actually up.
   // Skipped rather than failed so this harness stays useful offline.
   const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
+// LLM steps are OPT-IN. The model server is shared with other work, so a test run must
+// never reach for it by accident — pass --llm (or KROSALITA_E2E_LLM=1) to include the
+// audit, sense discovery and clue generation. Everything else runs without it: the
+// corpus supplies candidates and the difficulty scorer is local.
+const USE_LLM = process.argv.includes('--llm') || process.env.KROSALITA_E2E_LLM === '1';
   let ollamaUp = false;
-  try {
-    const c = new AbortController();
-    const to = setTimeout(() => c.abort(), 4000);
-    ollamaUp = (await fetch(`${OLLAMA}/api/tags`, { signal: c.signal })).ok;
-    clearTimeout(to);
-  } catch { ollamaUp = false; }
+  if (USE_LLM) {
+    try {
+      const c = new AbortController();
+      const to = setTimeout(() => c.abort(), 4000);
+      ollamaUp = (await fetch(`${OLLAMA}/api/tags`, { signal: c.signal })).ok;
+      clearTimeout(to);
+    } catch { ollamaUp = false; }
+  }
 
   if (!ollamaUp) {
-    console.log(`  skip: AI audit (${OLLAMA} unreachable)`);
+    console.log(USE_LLM
+      ? `  skip: AI audit (${OLLAMA} unreachable)`
+      : '  skip: all LLM steps (pass --llm to include them)');
   } else {
     await page.evaluate(`(() => {
       localStorage.setItem('krosalita:ollama', JSON.stringify(
