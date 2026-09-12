@@ -13,7 +13,7 @@
 //   -> { type:'cancel' }
 
 import { solveCrossword } from '../utils/solver.js';
-import { assignClues, buildClueIndexFromRows } from '../utils/clueIndex.js';
+import { assignClues, buildClueIndexFromRows, cluesForWord } from '../utils/clueIndex.js';
 import {
   decodeCorpus, buildWordIndex, entriesFromRows, fingerprintOf,
 } from '../utils/wordIndex.js';
@@ -64,6 +64,7 @@ async function loadFromUrl(url) {
     fingerprint,
     index: buildWordIndex(corpus.entries, { fingerprint, presorted: true }),
     clueStore: corpus.clueStore,
+    entries: corpus.entries,
     rowIndex: null,
     quantiles: corpus.header.difficultyQuantiles || null,
     stats: { distinct: corpus.entries.length, difficultySource: corpus.header.difficultySource },
@@ -101,6 +102,30 @@ self.onmessage = async (e) => {
     } catch (err) {
       self.postMessage({ type: 'error', message: String((err && err.message) || err) });
     }
+    return;
+  }
+
+  // The corpus lives here, but the clue scorer runs on the main thread (it has to score
+  // every keystroke while someone types a clue). So the worker hands over just the raw
+  // per-answer material — the four model features and the answer's known clues — and the
+  // main thread does the scoring. Cheap: a 15x15 puzzle is ~80 answers.
+  if (msg.type === 'clueData') {
+    const words = [...new Set((msg.payload?.words || []).filter(Boolean))];
+    const data = {};
+    for (const w of words) {
+      const i = cached?.clueStore?.wordIndexOf?.get(w);
+      const e = i === undefined ? null : cached.entries?.[i];
+      data[w] = {
+        answerFeatures: e ? {
+          corpusFreqLog: e.corpusFreqLog,
+          zipf: e.zipf,
+          crosswordese: e.crosswordese,
+          distinctClues: e.distinctClues,
+        } : null,
+        clues: cluesForWord(cached?.clueStore, w),
+      };
+    }
+    self.postMessage({ type: 'clueDataResult', data });
     return;
   }
 

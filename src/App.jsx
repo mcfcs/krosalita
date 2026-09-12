@@ -17,9 +17,16 @@ import SettingsModal from './components/SettingsModal';
 import { DEFAULT_LAYOUTS } from './data/layouts';
 import { parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, getCellNumber } from './utils/crosswordUtils';
 import { loadJSON, saveJSON } from './utils/storage';
+
+// Clues the user writes or accepts. Kept separate from the corpus so they survive the CSV
+// being re-fetched on every load, and so they can be exported and fed back into the
+// pipeline later.
+const USER_CLUES_KEY = 'userClues';
 import { todayKey, seedFromString, getStreak, recordDailySolve, isDailySolved } from './utils/daily';
 import { difficultyLabelFromScore, difficultyColorClass, difficultyTargetOf } from './utils/difficulty';
 import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } from './utils/ollama';
+import { loadClueModel, cluePercentile } from './utils/clueScore';
+import { BANDS, scoreCandidates, flagImplausible, makeGenerator } from './utils/clueSource';
 import { useAuth } from './hooks/useAuth';
 import { savePuzzle } from './lib/puzzles';
 import { sfx, isSoundOn, setSoundOn } from './utils/sound';
@@ -38,6 +45,7 @@ const CrosswordGenerator = () => {
   // True when the words come from an uploaded CSV or the Tagalog list rather than
   // the packed corpus artifact, so the worker is told which source to index.
   const [usingCustomWords, setUsingCustomWords] = useState(false);
+  const [userClues, setUserClues] = useState(() => loadJSON(USER_CLUES_KEY, []));
   const [debugMode, setDebugMode] = useState(false);
   const [debugLog, setDebugLog] = useState([]);
   const [layouts, setLayouts] = useState(DEFAULT_LAYOUTS);
@@ -477,12 +485,17 @@ const CrosswordGenerator = () => {
   // spawned a fresh Worker per call and structured-cloned all 552k word rows into it —
   // three times per click when a difficulty band was selected.
   const pendingRef = useRef(null);
+  const clueDataPendingRef = useRef(null);
   const corpusFpRef = useRef(null);
 
   const ensureWorker = () => {
     if (workerRef.current) return workerRef.current;
     const w = new Worker(new URL('./worker/crosswordWorker.js', import.meta.url), { type: 'module' });
-    w.onmessage = (e) => { pendingRef.current?.(e.data); };
+    w.onmessage = (e) => {
+      // Clue data has its own channel so it can't be mistaken for solver progress.
+      if (e.data?.type === 'clueDataResult') { clueDataPendingRef.current?.(e.data.data); return; }
+      pendingRef.current?.(e.data);
+    };
     w.onerror = () => { pendingRef.current?.({ type: 'error', message: 'The solver failed to start.' }); };
     workerRef.current = w;
     return w;
@@ -1664,6 +1677,22 @@ const CrosswordGenerator = () => {
   
   // ============ DICTIONARY FUNCTIONS ============
   
+  const saveUserClue = useCallback((word, clue) => {
+    const w = String(word || '').toUpperCase().replace(/[^A-Z]/g, '');
+    const c = String(clue || '').trim();
+    if (!w || !c) return false;
+    const date = new Date().toISOString().split('T')[0];
+    if (userClues.some((e) => e.word === w && e.clue === c)) return false;
+    const next = [...userClues, { date, word: w, clue: c }];
+    saveJSON(USER_CLUES_KEY, next);
+    setUserClues(next);
+    setWords((prev) => (prev.some((e) => e.word === w && e.clue === c)
+      ? prev : [...prev, { date, word: w, clue: c, difficulty: '' }]));
+    setUsingCustomWords(true);
+    corpusFpRef.current = null;
+    return true;
+  }, [userClues]);
+
   const addWordToDictionary = () => {
     if (!newWord.trim() || !newClue.trim()) return;
     
@@ -1672,20 +1701,19 @@ const CrosswordGenerator = () => {
     
     if (!word) return;
     
-    // Check if word already exists
-    const exists = words.some(w => w.word === word);
-    if (exists) {
-      setError('Word already exists in dictionary');
+    // An answer legitimately has many clues -- picking one at a difficulty is the whole
+    // point -- so only the exact (word, clue) pair counts as a duplicate. This used to
+    // reject any word already present, which made saving a second clue impossible.
+    if (words.some(w => w.word === word && w.clue === clue)) {
+      setError('That clue is already in your dictionary');
       setTimeout(() => setError(''), 3000);
       return;
     }
-    
-    setWords(prev => [...prev, { date: new Date().toISOString().split('T')[0], word, clue }]);
-    setUsingCustomWords(true);
-    corpusFpRef.current = null;
+
+    saveUserClue(word, clue);
     setNewWord('');
     setNewClue('');
-    setProgress('Word added to dictionary!');
+    setProgress('Saved to your dictionary.');
     setTimeout(() => setProgress(''), 3000);
   };
   
@@ -1721,10 +1749,16 @@ const CrosswordGenerator = () => {
   };
   
   const exportDictionary = () => {
+    // Proper RFC-4180 quoting. The old version only quoted on a comma and never escaped an
+    // embedded quote, so any clue containing one corrupted the file — and clues contain
+    // them constantly ("___ it", quoted titles, dialogue).
+    const cell = (v) => {
+      const t = String(v ?? '');
+      return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
     let csv = 'Date,Word,Clue\n';
     words.forEach(w => {
-      const clue = w.clue.includes(',') ? `"${w.clue}"` : w.clue;
-      csv += `${w.date || ''},${w.word},${clue}\n`;
+      csv += `${cell(w.date || '')},${cell(w.word)},${cell(w.clue)}\n`;
     });
     
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -1767,7 +1801,12 @@ const CrosswordGenerator = () => {
         if (response.ok) {
           const text = await response.text();
           const parsed = parseCSV(text);
-          if (!cancelled && !tagalogMode && parsed.length > 0) setWords(parsed);
+          if (!cancelled && !tagalogMode && parsed.length > 0) {
+            // Merge the user's own clues over the corpus; they are additive, never a
+            // replacement, so a fresh CSV never silently drops them.
+            const mine = loadJSON(USER_CLUES_KEY, []);
+            setWords(mine.length ? [...parsed, ...mine.map((e) => ({ ...e, difficulty: '' }))] : parsed);
+          }
         }
       } catch { console.log('No default crosswords.csv found'); }
       if (!cancelled) {
@@ -1869,6 +1908,112 @@ const CrosswordGenerator = () => {
     const next = { ...ollamaConfig, ...cfg };
     setOllamaConfig(next);
     saveOllamaConfig(next);
+  };
+
+  // ============ CLUE STUDIO ============
+  // The scorer runs on the MAIN thread, not in the worker: it has to rate a clue on every
+  // keystroke, and a postMessage round trip per character would be absurd for something
+  // that takes microseconds. The corpus stays in the worker, which hands over just the
+  // per-answer material the scorer needs.
+  const clueModelRef = useRef(null);
+  const [clueStudio, setClueStudio] = useState(null);
+
+  const loadScorer = useCallback(async () => {
+    if (clueModelRef.current) return clueModelRef.current;
+    const res = await fetch(`${import.meta.env.BASE_URL || '/'}corpus/clue-model.json`);
+    if (!res.ok) throw new Error(`Couldn't load the clue scorer (${res.status}).`);
+    clueModelRef.current = loadClueModel(await res.json());
+    return clueModelRef.current;
+  }, []);
+
+  const requestClueData = useCallback((words) => new Promise((resolve) => {
+    const w = ensureWorker();
+    const timer = setTimeout(() => { clueDataPendingRef.current = null; resolve({}); }, 15000);
+    clueDataPendingRef.current = (data) => { clearTimeout(timer); clueDataPendingRef.current = null; resolve(data || {}); };
+    const send = () => w.postMessage({ type: 'clueData', payload: { words } });
+    if (corpusFpRef.current) send();
+    else {
+      // The worker needs its corpus before it can answer.
+      const prev = pendingRef.current;
+      pendingRef.current = (msg) => {
+        if (msg.type === 'corpusReady') { corpusFpRef.current = msg.fingerprint; pendingRef.current = prev; send(); }
+        else prev?.(msg);
+      };
+      w.postMessage({ type: 'loadCorpus', payload: corpusRequest() });
+    }
+  }), [corpusRequest]);
+
+  const openClueStudio = async (word, currentClue, band = 'medium') => {
+    if (!word || /_/.test(word)) return;
+    setClueStudio({ word, currentClue, band, candidates: [], loading: true, generating: false, error: '', range: null });
+    try {
+      const [model, data] = await Promise.all([loadScorer(), requestClueData([word])]);
+      const entry = data[word];
+      const clues = entry?.clues || [];
+      const af = entry?.answerFeatures || {};
+      const cands = clues.map((c) => {
+        const percentile = cluePercentile(model, word, c.clue, af);
+        const win = BANDS[band];
+        return {
+          clue: c.clue, percentile, source: 'corpus',
+          band: percentile < BANDS.easy.max ? 'easy' : percentile < BANDS.medium.max ? 'medium' : 'hard',
+          inBand: percentile >= win.min && percentile < win.max,
+        };
+      }).sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile);
+      const ps = cands.map((c) => c.percentile);
+      setClueStudio((st) => (st?.word !== word ? st : {
+        ...st,
+        candidates: cands,
+        range: ps.length ? { min: Math.min(...ps), max: Math.max(...ps), count: ps.length } : null,
+        answerFeatures: af,
+        loading: false,
+      }));
+    } catch (err) {
+      setClueStudio((st) => (st ? { ...st, loading: false, error: String(err?.message || err) } : st));
+    }
+  };
+
+  const setClueStudioBand = (band) => setClueStudio((st) => {
+    if (!st) return st;
+    const win = BANDS[band];
+    const candidates = st.candidates
+      .map((c) => ({ ...c, inBand: c.percentile >= win.min && c.percentile < win.max }))
+      .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile);
+    return { ...st, band, candidates };
+  });
+
+  const generateStudioClues = async () => {
+    const st = clueStudio;
+    if (!st) return;
+    setClueStudio((s0) => (s0 ? { ...s0, generating: true, error: '' } : s0));
+    try {
+      const model = await loadScorer();
+      const generate = makeGenerator({
+        baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 6,
+      });
+      const fresh = await generate([{ word: st.word }], st.band);
+      const shim = { entries: [{ word: st.word, ...(st.answerFeatures || {}) }],
+        clueStore: { wordIndexOf: new Map([[st.word, 0]]), counts: [0], offsets: [0] } };
+      const exclude = new Set(st.candidates.map((c) => c.clue.toLowerCase()));
+      let scored = scoreCandidates(shim, model, st.word, fresh.get(st.word) || [], { band: st.band, exclude });
+      // Flag anything that reads unlike this answer's real clues — the model does write
+      // confidently wrong ones, and nothing in the difficulty score can see that.
+      const known = st.candidates.filter((c) => c.source === 'corpus').map((c) => ({ clue: c.clue }));
+      if (known.length >= 2) {
+        scored = await flagImplausible(
+          { clueStore: { wordIndexOf: new Map([[st.word, 0]]), counts: [known.length], __clues: known } },
+          st.word, scored, { baseUrl: ollamaConfig.baseUrl },
+        );
+      }
+      setClueStudio((s0) => (s0?.word !== st.word ? s0 : {
+        ...s0,
+        generating: false,
+        candidates: [...s0.candidates, ...scored]
+          .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile),
+      }));
+    } catch (err) {
+      setClueStudio((s0) => (s0 ? { ...s0, generating: false, error: String(err?.message || err) } : s0));
+    }
   };
 
   // Rate every clue in the finished puzzle with the local model. The precomputed
@@ -2516,6 +2661,12 @@ const CrosswordGenerator = () => {
             setHighlightMissingRequired={setHighlightMissingRequired}
             difficultyInfo={difficultyInfo}
             aiEnabled={ollamaConfig.enabled}
+            clueStudio={clueStudio}
+            onOpenClueStudio={openClueStudio}
+            onCloseClueStudio={() => setClueStudio(null)}
+            onClueStudioBand={setClueStudioBand}
+            onGenerateClues={generateStudioClues}
+            onClueAccepted={saveUserClue}
             aiGenerateClues={aiGenerateClues}
             onOpenSettings={() => setShowSettings(true)}
             onVirtualKey={applyManualKey}

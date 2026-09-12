@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
+import ClueStudio from './ClueStudio';
 import { difficultyColorClass } from '../utils/difficulty';
 
 const ManualEditor = ({
@@ -39,14 +40,14 @@ const ManualEditor = ({
   failedWord = null,
   difficultyInfo = { score: null, label: '' },
   aiEnabled = false,
-  aiGenerateClues = () => Promise.resolve([]),
-  onOpenSettings = () => {},
+  clueStudio = null,
+  onOpenClueStudio = () => {},
+  onCloseClueStudio = () => {},
+  onClueStudioBand = () => {},
+  onGenerateClues = () => {},
+  onClueAccepted = () => {},
   onVirtualKey = () => {}
 }) => {
-  const [aiClues, setAiClues] = useState([]);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState('');
-  const [showAiClues, setShowAiClues] = useState(false);
 
 
   const currentWord = getCurrentWord();
@@ -70,7 +71,7 @@ const ManualEditor = ({
 
   const wordComplete = !!currentWord?.word && !currentWord.word.includes('_');
 
-  const runAI = async () => {
+  const openStudio = () => {
     const slot = currentWord?.slot;
     if (!slot) return;
     let word = '';
@@ -79,22 +80,8 @@ const ManualEditor = ({
       const c = slot.direction === 'across' ? slot.col + i : slot.col;
       word += manualGrid[r]?.[c] || '';
     }
-    setShowAiClues(true);
-    if (!word || word.length !== slot.length) {
-      setAiError('Fill in the whole word first, then ask the AI for clues.');
-      setAiClues([]);
-      return;
-    }
-    setAiLoading(true); setAiError(''); setAiClues([]);
-    try {
-      const difficulty = (difficultyInfo?.label || 'MODERATE').toUpperCase();
-      const clues = await aiGenerateClues(word, difficulty);
-      setAiClues(clues);
-      if (clues.length === 0) setAiError('No clues came back — try again or choose another model in AI settings.');
-    } catch (err) {
-      setAiError(err.message || 'Clue generation failed.');
-    }
-    setAiLoading(false);
+    if (!word || word.length !== slot.length || word.includes('_')) return;
+    onOpenClueStudio(word, getClueForCurrentSlot()?.clue || '');
   };
 
   const activeSlot = currentWord?.slot;
@@ -209,7 +196,7 @@ const ManualEditor = ({
               <div className="flex gap-2 flex-wrap">
                 <button onClick={() => { setClueInput(getClueForCurrentSlot()?.clue || ''); setEditingClue(true); }} className="btn btn-sm"><PenTool size={15} />Edit Clue</button>
                 {words.length > 0 && <button onClick={() => { setShowSuggestions(!showSuggestions); setSuggestions(findSuggestionsForSlot()); }} className="btn btn-sm btn-accent"><Sparkles size={15} />Auto-fill</button>}
-                {aiEnabled && <button onClick={runAI} disabled={aiLoading || !wordComplete} title={wordComplete ? 'Draft clues with your local AI' : 'Fill the word first'} className="btn btn-sm btn-gold"><Zap size={15} />{aiLoading ? 'Thinking…' : 'AI Clue'}</button>}
+                <button onClick={openStudio} disabled={!wordComplete} title={wordComplete ? 'Browse and write clues at a chosen difficulty' : 'Fill the word first'} className="btn btn-sm btn-gold"><Zap size={15} />Clues</button>
               </div>
             </div>
 
@@ -256,22 +243,27 @@ const ManualEditor = ({
               </div>
             )}
 
-            {showAiClues && (
-              <div className="mt-4 border border-line rounded-lg overflow-hidden">
-                <div className="bg-paper-sunken px-4 py-2 flex items-center justify-between border-b border-line">
-                  <span className="eyebrow flex items-center gap-1.5"><Zap size={12} className="text-gold" />AI clue ideas</span>
-                  <button onClick={() => setShowAiClues(false)} className="text-ink-faint hover:text-ink"><X size={15} /></button>
-                </div>
-                <div className="p-2">
-                  {aiLoading && <div className="p-3 text-ink-faint text-sm text-center flex items-center justify-center gap-2"><span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-ink/25 border-t-ink" />Generating clues…</div>}
-                  {!aiLoading && aiError && (
-                    <div className="p-3 text-wrong text-sm">{aiError} <button onClick={onOpenSettings} className="underline font-semibold">Open AI settings</button></div>
-                  )}
-                  {!aiLoading && !aiError && aiClues.map((c, i) => (
-                    <button key={i} onClick={() => { updateClue(c); setShowAiClues(false); }} className="w-full text-left px-3 py-2 rounded-md hover:bg-word/60 transition text-sm text-ink-soft leading-snug">{c}</button>
-                  ))}
-                </div>
-              </div>
+            {clueStudio && (
+              <ClueStudio
+                word={clueStudio.word}
+                currentClue={clueStudio.currentClue}
+                band={clueStudio.band}
+                candidates={clueStudio.candidates}
+                range={clueStudio.range}
+                loading={clueStudio.loading}
+                generating={clueStudio.generating}
+                error={clueStudio.error}
+                aiEnabled={aiEnabled}
+                onBandChange={onClueStudioBand}
+                onGenerate={onGenerateClues}
+                onAccept={(clue) => {
+                  updateClue(clue);
+                  // Keep it: the user's own clues accumulate across puzzles and export.
+                  onClueAccepted(clueStudio.word, clue);
+                  onCloseClueStudio();
+                }}
+                onClose={onCloseClueStudio}
+              />
             )}
 
             {showSuggestions && (
