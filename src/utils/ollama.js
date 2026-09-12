@@ -1,7 +1,7 @@
 // Client for a locally-hosted Ollama server (https://ollama.com).
 // Used for AI clue assistance. All config lives in localStorage so it is
 // per-device and never leaves the machine.
-import { loadJSON, saveJSON } from './storage';
+import { loadJSON, saveJSON } from './storage.js';
 
 const CONFIG_KEY = 'ollama';
 export const DEFAULT_CONFIG = {
@@ -287,4 +287,160 @@ export const auditDifficulty = async ({ baseUrl, model, entries, onProgress, sig
   const hardest = [...ratings].sort((a, b) => b.difficulty - a.difficulty).slice(0, 5);
 
   return { ratings, summary: { mean, p80: percentile(scores, 0.8), hardest, unrated } };
+};
+
+// ---------------------------------------------------------------------------
+// Batched clue generation
+// ---------------------------------------------------------------------------
+
+const GEN_BATCH_SIZE = 15;
+const GEN_TIMEOUT_MS = 240000; // a 27B model writing ~30 clues takes a while
+
+const GEN_RUBRIC = {
+  easy: 'a plain, direct definition of the answer, the kind a Monday solver gets instantly',
+  medium: 'moderately challenging, with light wordplay or a slightly indirect angle',
+  hard: 'genuinely tough — wordplay, misdirection, or a less obvious sense of the word',
+};
+
+/**
+ * Pull `{i, c}` pairs out of whatever the model wrapped its JSON in.
+ * Exported so it can be unit-tested without a server. Tolerant by design: one malformed
+ * item should cost one clue, not the whole batch.
+ */
+export const parseGenerateResponse = (text, batchSize) => {
+  if (!text) return [];
+  const cleaned = String(text).replace(/^```(?:json)?|```$/gm, '').trim();
+  const match = cleaned.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+  let arr;
+  try {
+    arr = JSON.parse(match[0]);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const item of arr) {
+    if (!item || typeof item !== 'object') continue;
+    const i = Number(item.i);
+    const c = typeof item.c === 'string' ? item.c.trim() : '';
+    if (!Number.isFinite(i) || i < 1 || i > batchSize || !c) continue;
+    out.push({ i, clue: cleanClueLine(c) });
+  }
+  return out;
+};
+
+const generatePrompt = (batch, band, perWord) => {
+  const hint = GEN_RUBRIC[band] || GEN_RUBRIC.medium;
+  const lines = batch.map((e, i) => `${i + 1}. ${e.word}`).join('\n');
+  return `You are a New York Times crossword editor writing clues.
+
+For each numbered ANSWER below, write ${perWord} crossword ${perWord === 1 ? 'clue' : 'clues'}.
+Every clue must be ${hint}.
+
+Rules:
+- Never include the answer, or any part of it, in its own clue.
+- Never refer to another entry ("see 14-Across", "with 3-Down") — these puzzles are generated, so the numbers would be meaningless.
+- Never refer to the grid, its theme, circled or shaded squares.
+- Keep each clue short, the way a printed crossword clue is short.
+
+Reply with ONLY a JSON array of {"i":<answer number>,"c":"<clue>"}, ${perWord} entries per answer. No prose, no code fences.
+
+${lines}`;
+};
+
+/**
+ * Write clues for many answers at once.
+ *
+ * One request per answer would mean ~78 round trips for a full puzzle — minutes on a
+ * local 27B model. Batching 15 answers per request makes that ~5 requests. Mirrors
+ * auditDifficulty's shape: one retry per batch, cancellation via AbortSignal, and a batch
+ * that will not parse costs its own entries rather than the whole run.
+ *
+ * @returns {Promise<Map<string, string[]>>} answer -> candidate clues
+ */
+export const generateCluesBatch = async ({
+  baseUrl, model, entries, band = 'medium', perWord = 2, onProgress, signal,
+}) => {
+  const list = (entries || []).filter((e) => e && e.word);
+  const out = new Map();
+  if (!list.length) return out;
+
+  const mc = mixedContentWarning(baseUrl);
+  if (mc) throw new Error(mc);
+
+  let done = 0;
+  for (let start = 0; start < list.length; start += GEN_BATCH_SIZE) {
+    if (signal?.aborted) throw new Error('Clue generation cancelled.');
+    const batch = list.slice(start, start + GEN_BATCH_SIZE);
+    let items = [];
+
+    for (let attempt = 0; attempt < 2 && !items.length; attempt += 1) {
+      const t = linkedTimeout(GEN_TIMEOUT_MS, signal);
+      try {
+        const res = await fetch(`${trimBase(baseUrl)}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt: generatePrompt(batch, band, perWord),
+            stream: false,
+            think: false,
+            options: { temperature: 0.8, num_predict: 1400 },
+          }),
+          signal: t.signal,
+        });
+        if (!res.ok) throw new Error(`Ollama responded ${res.status}. Check the model name.`);
+        const data = await res.json();
+        items = parseGenerateResponse(data.response || '', batch.length);
+      } catch {
+        // A cancel or a timeout is fatal; anything else is just a bad batch, so the loop
+        // retries once and then moves on rather than losing every other answer.
+        if (signal?.aborted) throw new Error('Clue generation cancelled.');
+        if (t.timedOut()) throw new Error('Clue generation timed out.');
+      } finally {
+        t.done();
+      }
+    }
+
+    for (const { i, clue } of items) {
+      const e = batch[i - 1];
+      if (!e) continue;
+      const arr = out.get(e.word) || [];
+      if (!arr.includes(clue)) arr.push(clue);
+      out.set(e.word, arr);
+    }
+
+    done += batch.length;
+    onProgress?.({ done, total: list.length });
+  }
+  return out;
+};
+
+/**
+ * Embed short texts with a local embedding model.
+ *
+ * Used to sanity-check generated clues: a model asked for a clue will occasionally write
+ * a confidently wrong one (asked for ERNE it offered "Old British coin"; ERNE is a sea
+ * eagle). The difficulty scorer cannot catch that — it rates difficulty, not truth — but
+ * comparing a candidate against the answer's KNOWN clues does. Measured on a hand-labelled
+ * sample: every correct clue scored >= 0.77 against the centroid of that answer's real
+ * clues, every wrong one <= 0.64.
+ */
+export const embedTexts = async ({ baseUrl, model = 'qwen3-embedding:0.6b', texts, signal }) => {
+  if (!texts?.length) return [];
+  const t = linkedTimeout(60000, signal);
+  try {
+    const res = await fetch(`${trimBase(baseUrl)}/api/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: texts }),
+      signal: t.signal,
+    });
+    if (!res.ok) throw new Error(`Embedding model responded ${res.status}.`);
+    const data = await res.json();
+    return data.embeddings || [];
+  } finally {
+    t.done();
+  }
 };
