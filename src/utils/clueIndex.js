@@ -99,9 +99,12 @@ export function assignClues(placements, {
     let candidates = cluesForWord(store, p.word);
     if ((!candidates || !candidates.length) && rowIndex) candidates = rowIndex.get(p.word);
 
-    const usable = (candidates || []).filter(
-      (c) => isClueUsableFor(c.clue, p.word) && !usedClues.has(c.clue.toLowerCase()),
-    );
+    const valid = (candidates || []).filter((c) => isClueUsableFor(c.clue, p.word));
+    // Prefer a clue not already used elsewhere in this puzzle, but never at the cost of
+    // leaving an answer unclued — a repeated clue is a blemish, an unclued answer is
+    // unsolvable. (Measured: this fired for 7 answers across ~72,000 assignments.)
+    const fresh = valid.filter((c) => !usedClues.has(c.clue.toLowerCase()));
+    const usable = fresh.length ? fresh : valid;
 
     let chosen = '';
     if (usable.length) {

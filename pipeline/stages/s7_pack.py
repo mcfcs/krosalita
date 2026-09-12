@@ -216,9 +216,19 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
 
     words_buf, meta_buf, cidx_buf, cblob = map(pad, (words_buf, meta_buf, cidx_buf, cblob))
 
+    # Difficulty quantiles over the answers actually shipped. The nominal 0-100 scale is
+    # absolute (and stays that way for display), but it is NOT uniformly populated: only
+    # ~5% of answers score below 21, so a 78-entry grid can never average 10 no matter
+    # how the solver is steered. Asking for "easy" has to mean "the easiest this corpus
+    # can do", and that needs the real distribution, not the nominal range.
+    diffs = sorted(int(meta_buf[i * 5 + 4]) / 255 for i in range(total_words))
+    quantiles = [round(diffs[min(len(diffs) - 1, int(len(diffs) * q / 100))], 5)
+                 for q in range(101)] if diffs else []
+
     header = {
         "version": 1,
         "createdAt": int(time.time()),
+        "difficultyQuantiles": quantiles,
         "difficultySource": diff_source,
         "qualitySource": quality_source,
         "maxCluesPerWord": max_clues,
@@ -257,6 +267,7 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
         "qualitySource": quality_source,
         "maxCluesPerWord": max_clues,
         "byLength": {str(d["len"]): d["count"] for d in lengths},
+        "difficultyQuantiles": quantiles,
         "createdAt": header["createdAt"],
     }
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:

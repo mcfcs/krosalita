@@ -20,7 +20,38 @@ import {
 import { randomSeed } from '../utils/rng.js';
 
 let cancelled = false;
-let cached = null; // { fingerprint, index, clueStore, rowIndex }
+let cached = null; // { fingerprint, index, clueStore, rowIndex, quantiles }
+
+// The 0..1 difficulty scale is absolute, but it is not uniformly populated: in the
+// shipped corpus only ~5% of answers sit below 0.21, so a 78-entry grid cannot average
+// 0.10 however the solver is steered. Asking for "easy" therefore has to mean "the
+// easiest this word list can actually do". These two functions convert between the
+// nominal band the user picked and the difficulty that band corresponds to here.
+const quantilesOf = (entries) => {
+  const d = entries.map((e) => (e.diff || 0) / 255).sort((a, b) => a - b);
+  if (!d.length) return null;
+  return Array.from({ length: 101 },
+    (_, q) => d[Math.min(d.length - 1, Math.floor((d.length * q) / 100))]);
+};
+
+/** Nominal 0..1 band -> the difficulty value at that quantile of this corpus. */
+const targetFor = (band, quantiles) => {
+  if (band == null) return null;
+  if (!quantiles || !quantiles.length) return band;
+  return quantiles[Math.max(0, Math.min(100, Math.round(band * 100)))];
+};
+
+/** An achieved difficulty -> where it sits in this corpus, as 0..100. */
+const percentileOf = (value, quantiles) => {
+  if (value == null) return null;
+  if (!quantiles || !quantiles.length) return value * 100;
+  let lo = 0, hi = 100;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (quantiles[mid] < value) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+};
 
 async function loadFromUrl(url) {
   const res = await fetch(url);
@@ -34,6 +65,7 @@ async function loadFromUrl(url) {
     index: buildWordIndex(corpus.entries, { fingerprint, presorted: true }),
     clueStore: corpus.clueStore,
     rowIndex: null,
+    quantiles: corpus.header.difficultyQuantiles || null,
     stats: { distinct: corpus.entries.length, difficultySource: corpus.header.difficultySource },
   };
 }
@@ -47,6 +79,7 @@ function loadFromRows(rows, sourceTag) {
     index: buildWordIndex(entries, { fingerprint }),
     clueStore: null,
     rowIndex: buildClueIndexFromRows(rows),
+    quantiles: quantilesOf(entries),
     stats: { distinct: entries.length, difficultySource: 'csv-labels' },
   };
 }
@@ -91,7 +124,7 @@ self.onmessage = async (e) => {
       requiredModeArg: p.requiredModeArg,
       timeoutMs: p.timeoutMs,
       seed,
-      difficultyTarget: p.difficultyTarget,
+      difficultyTarget: targetFor(p.difficultyTarget, cached.quantiles),
       onProgress: (text) => self.postMessage({ type: 'progress', text }),
       onBest: (best) => self.postMessage({ type: 'best', result: best }),
       now: () => performance.now(),
@@ -104,10 +137,15 @@ self.onmessage = async (e) => {
       store: cached.clueStore,
       rowIndex: cached.rowIndex,
       presetClues: p.presetClues || {},
-      difficultyTarget: p.difficultyTarget,
+      difficultyTarget: targetFor(p.difficultyTarget, cached.quantiles),
       rng: (() => { let s = (seed ^ 0x9e3779b9) >>> 0;
         return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; })(),
     });
+
+    // Report the puzzle's difficulty as a percentile of this corpus, so the band the
+    // user asked for and the band they are shown mean the same thing.
+    result.difficultyPercentile = percentileOf(
+      result.difficultyMean == null ? null : result.difficultyMean / 100, cached.quantiles);
 
     self.postMessage({ type: 'done', result });
   } catch (err) {

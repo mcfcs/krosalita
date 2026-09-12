@@ -320,9 +320,18 @@ const CrosswordGenerator = () => {
       picked = {
         ...result,
         cluesObj: tmpClues,
-        difficultyMeta: result.difficultyScore != null
-          ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
-          : computePuzzleDifficulty(result.grid, tmpClues),
+        // difficultyPercentile places the puzzle within what THIS word list can
+        // actually produce; the raw score is on an absolute scale the corpus only
+        // sparsely populates, so a grid at the easy end of the achievable range would
+        // otherwise still be labelled "Moderate".
+        difficultyMeta: result.difficultyPercentile != null
+          ? {
+            score: result.difficultyPercentile,
+            label: difficultyLabelFromScore(result.difficultyPercentile / 100),
+          }
+          : result.difficultyScore != null
+            ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
+            : computePuzzleDifficulty(result.grid, tmpClues),
       };
     }
 
@@ -637,9 +646,18 @@ const CrosswordGenerator = () => {
       picked = {
         ...result,
         cluesObj: tmpClues,
-        difficultyMeta: result.difficultyScore != null
-          ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
-          : computePuzzleDifficulty(result.grid, tmpClues),
+        // difficultyPercentile places the puzzle within what THIS word list can
+        // actually produce; the raw score is on an absolute scale the corpus only
+        // sparsely populates, so a grid at the easy end of the achievable range would
+        // otherwise still be labelled "Moderate".
+        difficultyMeta: result.difficultyPercentile != null
+          ? {
+            score: result.difficultyPercentile,
+            label: difficultyLabelFromScore(result.difficultyPercentile / 100),
+          }
+          : result.difficultyScore != null
+            ? { score: result.difficultyScore, label: difficultyLabelFromScore(result.difficultyScore / 100) }
+            : computePuzzleDifficulty(result.grid, tmpClues),
       };
     }
     const newGrid = picked?.grid;

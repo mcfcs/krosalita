@@ -34,6 +34,10 @@ const A_CODE = 65;
 // scripts/bench-solver.mjs for the measurements behind them.
 const K_TOP = 48;              // best-by-quality candidates considered per node
 const K_RAND = 16;             // extra random candidates, for variety across seeds
+// With a difficulty target the pool has to be wider: candidates enter it by quality,
+// so a narrow pool can simply contain nothing near the requested difficulty.
+const K_TOP_TARGETED = 128;
+const K_RAND_TARGETED = 64;
 const LOOKAHEAD_WORDS = 32;    // u32 words scanned when sizing a crossing domain
 const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted work
 // Skip an arc whose allowed-letter set is this wide: it prunes little for its cost.
@@ -43,8 +47,8 @@ const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted
 const REVISE_MAX_LETTERS = 18;
 const LUBY_BASE = 200;         // backtracks per restart unit
 const REQUIRED_RETRY_RESTARTS = 24; // restarts spent chasing every required word
-const ALPHA_QUALITY = 2.5;     // weight of static word quality in value ordering
-const DEFAULT_BETA_DIFF = 3.0; // weight of difficulty-target matching
+const ALPHA_QUALITY = 1.2;     // weight of static word quality in value ordering
+const DEFAULT_BETA_DIFF = 6.0; // weight of difficulty-target matching
 
 const ABORT = Symbol('abort');
 
@@ -335,9 +339,9 @@ export function solveCrossword(opts) {
   // Scratch, reused; never allocated in the hot path.
   const maxW = Math.max(...Array.from(domW));
   const scratch = new Uint32Array(maxW);
-  const candBuf = new Int32Array(K_TOP + K_RAND);
-  const valBuf = new Int32Array(K_TOP + K_RAND);
-  const valQ = new Float64Array(K_TOP + K_RAND);
+  const candBuf = new Int32Array(K_TOP_TARGETED + K_RAND_TARGETED);
+  const valBuf = new Int32Array(K_TOP_TARGETED + K_RAND_TARGETED);
+  const valQ = new Float64Array(K_TOP_TARGETED + K_RAND_TARGETED);
   const queue = new Int32Array(CELLS * 4);
   const inQueue = new Uint8Array(CELLS);
 
@@ -736,8 +740,9 @@ export function solveCrossword(opts) {
 
     // Indices are stored in descending quality order, so the best candidates are simply
     // the first set bits — an O(K) scan instead of ranking the whole domain.
+    const kTop = difficultyTarget == null ? K_TOP : K_TOP_TARGETED;
     let b = nextSetBit(domArena, off, W, 0);
-    while (b >= 0 && nc < K_TOP) {
+    while (b >= 0 && nc < kTop) {
       let dup = false;
       for (let j = 0; j < nc; j++) if (candBuf[j] === b) { dup = true; break; }
       if (!dup) candBuf[nc++] = b;
@@ -745,7 +750,8 @@ export function solveCrossword(opts) {
     }
     const total = domCount[s];
     if (total > nc) {
-      for (let k = 0; k < K_RAND && nc < candBuf.length; k++) {
+      const kRand = difficultyTarget == null ? K_RAND : K_RAND_TARGETED;
+      for (let k = 0; k < kRand && nc < candBuf.length; k++) {
         const target = randInt(rng, total);
         let hit = nextSetBit(domArena, off, W, 0);
         for (let j = 0; j < target && hit >= 0; j++) hit = nextSetBit(domArena, off, W, hit + 1);
@@ -763,6 +769,7 @@ export function solveCrossword(opts) {
       if ((ci & 63) === 63) checkClock();
       const w = candBuf[ci];
       let supp = 0;
+      let nSupp = 0;
       let ok = true;
       for (let i = 0; i < len; i++) {
         const t = crossSlot[s * MAXLEN + i];
@@ -774,9 +781,14 @@ export function solveCrossword(opts) {
                                  domFirst[t], domLast[t], LOOKAHEAD_WORDS, LOOKAHEAD_CAP);
         if (c === 0) { ok = false; break; } // would wipe a crossing slot
         supp += Math.log1p(c);
+        nSupp++;
       }
       if (!ok) { removeValueTrailed(s, w); continue; }
-      let q = supp + ALPHA_QUALITY * (li.score[w] / 65535);
+      // Average, not sum. Summing over up to 15 crossings reaches ~60, which dwarfed
+      // both the quality and difficulty terms -- difficulty was effectively ignored, and
+      // asking for "easy" moved the finished puzzle's rating by about two points.
+      const suppAvg = nSupp ? supp / nSupp : Math.log1p(LOOKAHEAD_CAP);
+      let q = suppAvg + ALPHA_QUALITY * (li.score[w] / 65535);
       if (reqSet && reqSet.has(w) && !usedRequired.has(reqKey(len, w))) q += 1000;
       if (target != null) q -= difficultyWeight * Math.abs(li.diff[w] / 255 - target);
       // insertion sort, descending
@@ -1214,6 +1226,7 @@ export function solveCrossword(opts) {
   // (what this used to be) rates a grid with four brutal crossings the same as one with
   // four brutal entries scattered safely apart.
   let difficultyScore = null;
+  let difficultyMean = null;
   if (placements.length) {
     const diffOf = new Map();
     const vals = [];
@@ -1240,6 +1253,11 @@ export function solveCrossword(opts) {
       }
     }
     difficultyScore = (0.5 * mean + 0.3 * p80 + 0.2 * worstCross) * 100;
+    // Also report the plain mean. The composite above is the better description of how a
+    // puzzle FEELS, but it is not comparable to a per-answer difficulty distribution --
+    // being a blend of mean, p80 and worst crossing it always sits above the mean, so
+    // ranking it against per-answer quantiles reads every puzzle as harder than it is.
+    difficultyMean = mean * 100;
   }
 
   let failedSlot = null;
@@ -1261,6 +1279,7 @@ export function solveCrossword(opts) {
     failedWord: null,
     failedSlot: failedSlot != null ? slots[failedSlot]?.id ?? null : null,
     difficultyScore,
+    difficultyMean,
     error: complete ? null : (outcome === 'ABORTED'
       ? err('TIMEOUT', `Couldn't fill this grid in ${(timeoutMs / 1000).toFixed(0)}s — got ${placements.length} of ${S} answers. Try another layout, or widen the difficulty.`)
       : err('NO_SOLUTION', `No complete fill exists for this layout with the current word list — got ${placements.length} of ${S} answers.`)),

@@ -15,8 +15,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const PREVIEW_PORT = 4178;
-const CDP_PORT = 9339;
+// Fixed ports make each run hostage to the previous run's cleanup: a leaked vite
+// preview keeps serving a STALE file list, so new asset hashes 404 into the SPA
+// fallback and every module script fails to load. Pick free ports per run.
+const basePort = 4200 + Math.floor(Math.random() * 300);
+const PREVIEW_PORT = basePort;
+const CDP_PORT = basePort + 5000;
 const BASE = `http://localhost:${PREVIEW_PORT}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -125,24 +129,24 @@ try {
   const page = await connect(CDP_PORT);
   console.log('browser attached');
 
-  // Wait for React to mount.
-  for (let i = 0; i < 60; i++) {
-    if (await page.evaluate(`!!document.querySelector('button')`)) break;
-    await sleep(250);
+  // Poll until the Generate ACTION button is clickable, then click it. The app parses
+  // crosswords.csv on startup and the button stays disabled until that finishes, so an
+  // early click would land on the "Generate" nav tab instead (both match the text).
+  let clicked = null;
+  for (let i = 0; i < 120; i++) {
+    clicked = await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')].find(
+        (x) => (x.textContent || '').trim().toLowerCase() === 'generate'
+               && !x.disabled && x.classList.contains('btn'));
+      if (!b) return null;
+      b.click();
+      return b.className;
+    })()`);
+    if (clicked) break;
+    await sleep(500);
   }
-
-  // "Generate" matches BOTH the nav tab and the toolbar action button; the action
-  // button is the one carrying a .btn class, so disambiguate on that.
-  const clicked = await page.evaluate(`(() => {
-    const btns = [...document.querySelectorAll('button')]
-      .filter(x => (x.textContent || '').trim().toLowerCase() === 'generate' && !x.disabled);
-    const b = btns.find(x => /\bbtn\b/.test(x.className || '')) || btns[btns.length - 1];
-    if (!b) return null;
-    b.click();
-    return b.className || 'unclassed';
-  })()`);
   if (clicked) ok(`clicked Generate (${String(clicked).slice(0, 40)})`);
-  else bad('clicked Generate', 'no enabled Generate button');
+  else bad('clicked Generate', 'the Generate button never became enabled');
 
   // Generate opens the "Specific Words" dialog; Confirm actually starts the solve.
   await sleep(600);

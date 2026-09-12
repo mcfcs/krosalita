@@ -39,12 +39,21 @@ export function clueRejectReason(clue) {
 
 export const isClueUsable = (clue) => clueRejectReason(clue) === null;
 
-/** A clue must not give the answer away, and must not be the answer. */
+/**
+ * A clue must not give the answer away, and must not be the answer.
+ *
+ * Matched on word boundaries, not as a bare substring: KEL is spelled out inside
+ * "Kenan's NICKELodeon pal" and OINGO inside "Rock's ___ BOINGO", and rejecting those
+ * left both answers with no usable clue at all — which is worse than the leak it was
+ * guarding against, since an unclued answer is unsolvable.
+ */
 export function clueRevealsAnswer(clue, word) {
   if (!clue || !word) return false;
   const c = clue.toUpperCase();
   const w = word.toUpperCase();
-  return c === w || (w.length >= 3 && c.includes(w));
+  if (c.trim() === w) return true;
+  if (w.length < 3) return false;
+  return new RegExp(`(^|[^A-Z])${w}([^A-Z]|$)`).test(c);
 }
 
 /** Usable for THIS puzzle: passes the filters and doesn't leak the answer. */
