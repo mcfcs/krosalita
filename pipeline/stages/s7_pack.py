@@ -16,7 +16,13 @@ File layout (all little-endian):
     header  utf-8 JSON, hlen bytes
     --- sections, in header-declared order, each 4-byte aligned ---
     words   per length group: count * len bytes of A-Z ASCII, no separators
-    meta    per word, in the same order: u16 score, u16 freq, u8 diff   (5 B)
+    meta    per word, in the same order (13 B):
+                u16 score, u16 freq, u8 diff,
+                u16 zipf*1000, u16 crosswordese*10000, u16 corpusFreqLog*10000,
+                u16 distinctClues
+            The last four are the answer-side inputs the browser clue scorer needs
+            (src/utils/clueScore.js). Quantised so they round-trip EXACTLY to the values
+            the model was trained on -- see s2_features' 3/4-dp rounding.
     cidx    per word: u32 clueOffset, u8 clueCount                      (5 B)
     cblob   per clue: u8 diff, u16 byteLen, utf-8 bytes
 
@@ -45,6 +51,7 @@ OUT_DIR = os.path.join(ROOT, "public", "corpus")
 OUT = os.path.join(OUT_DIR, "corpus.bin")
 
 MAX_CLUES_PER_WORD = 5
+META_STRIDE = 13   # bytes per word in the meta section; see the layout note above
 MIN_LEN, MAX_LEN = 3, 15
 
 
@@ -70,6 +77,33 @@ def _provisional_difficulty(weekday_mean, pair_count, word_count, pre2000):
     # Confidence shrink toward neutral for thin evidence.
     conf = min(1.0, math.log1p(pair_count) / math.log1p(40))
     return max(0.0, min(1.0, conf * raw + (1 - conf) * 0.5))
+
+
+def _load_answer_features():
+    """Per-answer features the browser scorer needs, keyed by answer.
+
+    Scoring a freshly written clue needs the same answer-side numbers the model saw in
+    training. They live in features.csv; this lifts them into the artifact so the browser
+    has them without shipping the whole feature table.
+    """
+    feats = os.path.join(PIPE, "out", "features.csv")
+    if not os.path.exists(feats):
+        return {}
+    out = {}
+    with open(feats, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            w = row["Word"]
+            if w in out:
+                continue
+            def num(k, d=0.0):
+                v = (row.get(k) or "").strip()
+                try:
+                    return float(v) if v else d
+                except ValueError:
+                    return d
+            out[w] = (num("ZipfEn"), num("Crosswordese", 0.5),
+                      num("CorpusFreqLog"), num("DistinctCluesForWord", 1))
+    return out
 
 
 def _load_word_quality():
@@ -167,6 +201,7 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
     max_freq = max(word_freq.values()) if word_freq else 1
     lf_max = math.log1p(max_freq)
     wq = _load_word_quality()
+    afeat = _load_answer_features()
     quality_source = "corpus+english" if wq else "corpus-frequency"
 
     def quality(w):
@@ -202,7 +237,13 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
             fr = min(65535, word_freq.get(w, 1))
             cl = kept[w]
             wd = int(round(sum(c[0] for c in cl) / len(cl) * 255)) if cl else 128
-            meta_buf += struct.pack("<HHB", q, fr, max(0, min(255, wd)))
+            z, cw, cfl, dc = afeat.get(w, (0.0, 0.5, 0.0, 1.0))
+            meta_buf += struct.pack(
+                "<HHBHHHH", q, fr, max(0, min(255, wd)),
+                max(0, min(65535, int(round(z * 1000)))),
+                max(0, min(65535, int(round(cw * 10000)))),
+                max(0, min(65535, int(round(cfl * 10000)))),
+                max(0, min(65535, int(round(dc)))))
             cidx_buf += struct.pack("<IB", len(cblob), len(cl))
             for d, c, _pc, _dt in cl:
                 b = c.encode("utf-8")
@@ -221,12 +262,13 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
     # ~5% of answers score below 21, so a 78-entry grid can never average 10 no matter
     # how the solver is steered. Asking for "easy" has to mean "the easiest this corpus
     # can do", and that needs the real distribution, not the nominal range.
-    diffs = sorted(int(meta_buf[i * 5 + 4]) / 255 for i in range(total_words))
+    diffs = sorted(int(meta_buf[i * META_STRIDE + 4]) / 255 for i in range(total_words))
     quantiles = [round(diffs[min(len(diffs) - 1, int(len(diffs) * q / 100))], 5)
                  for q in range(101)] if diffs else []
 
     header = {
-        "version": 1,
+        "version": 2,
+        "metaStride": META_STRIDE,
         "createdAt": int(time.time()),
         "difficultyQuantiles": quantiles,
         "difficultySource": diff_source,
@@ -251,7 +293,7 @@ def run(pairs_path=PAIRS, out=OUT, max_clues=MAX_CLUES_PER_WORD):
 
     with open(out, "wb") as f:
         f.write(b"KRSC")
-        f.write(struct.pack("<II", 1, len(hjson)))
+        f.write(struct.pack("<II", 2, len(hjson)))
         f.write(hjson)
         for buf in (words_buf, meta_buf, cidx_buf, cblob):
             f.write(buf)

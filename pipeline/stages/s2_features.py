@@ -133,9 +133,9 @@ def run(src=IN, out=OUT):
 
             rec = [
                 word, clue,
-                L, round(cf_log, 5),
+                L, round(cf_log, 4),
                 "" if z is None else round(z, 3),
-                round(crosswordese, 5),
+                round(crosswordese, 4),
                 round(vowels / L, 4) if L else 0,
                 1 if vowels == 0 else 0,
                 row.get("DistinctCluesForWord") or 1,

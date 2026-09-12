@@ -16,6 +16,7 @@ Stages
     s5_fit       distil those labels into a model over the cheap features
     s6_score     score all 551k pairs with it
     s7_pack      emit public/corpus/corpus.bin for the app
+    s8_coldstart train + export the browser clue scorer (public/corpus/clue-model.json)
 
 s1+s2+s7 alone produce a working corpus (difficulty falls back to the old weekday
 signal), so the app is never blocked on the long stages. Re-run s7 after s6 to swap in
@@ -28,7 +29,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "stages"))
 import state  # noqa: E402
 
-ORDER = ["s1_clean", "s2_features", "s3_embed", "s4_label", "s5_fit", "s6_score", "s7_pack"]
+ORDER = ["s1_clean", "s2_features", "s3_embed", "s4_label", "s5_fit", "s6_score",
+         "s7_pack", "s8_coldstart"]
 ALIAS = {s.split("_")[0]: s for s in ORDER}
 
 

@@ -27,6 +27,7 @@ STAGES = [
     ("s5_fit",      "Fit"),
     ("s6_score",    "Score"),
     ("s7_pack",     "Pack"),
+    ("s8_coldstart","Clue scorer"),
 ]
 
 

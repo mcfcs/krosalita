@@ -175,7 +175,7 @@ export function decodeCorpus(buffer) {
   const dv = new DataView(buffer);
   if (dv.getUint32(0, true) !== MAGIC) throw new Error('corpus.bin: bad magic');
   const version = dv.getUint32(4, true);
-  if (version !== 1) throw new Error(`corpus.bin: unsupported version ${version}`);
+  if (version !== 1 && version !== 2) throw new Error(`corpus.bin: unsupported version ${version}`);
   const hlen = dv.getUint32(8, true);
   const headerBytes = new Uint8Array(buffer, 12, hlen);
   const header = JSON.parse(new TextDecoder().decode(headerBytes));
@@ -194,6 +194,9 @@ export function decodeCorpus(buffer) {
   const metaDv = new DataView(buffer, metaSec.off, metaSec.len);
   const cidxDv = new DataView(buffer, cidxSec.off, cidxSec.len);
 
+  // v2 widened the per-word meta from 5 to 13 bytes to carry the answer-side features
+  // the browser clue scorer needs (see src/utils/clueScore.js).
+  const stride = header.metaStride || 5;
   const entries = new Array(header.totalWords);
   const clueOffsets = new Uint32Array(header.totalWords);
   const clueCounts = new Uint8Array(header.totalWords);
@@ -206,11 +209,18 @@ export function decodeCorpus(buffer) {
       let s = '';
       for (let p = 0; p < len; p++) s += String.fromCharCode(wordBytes[byteCursor + p]);
       byteCursor += len;
+      const mo = gi * stride;
       entries[gi] = {
         word: s,
-        score: metaDv.getUint16(gi * 5, true),
-        freq: metaDv.getUint16(gi * 5 + 2, true),
-        diff: metaDv.getUint8(gi * 5 + 4),
+        score: metaDv.getUint16(mo, true),
+        freq: metaDv.getUint16(mo + 2, true),
+        diff: metaDv.getUint8(mo + 4),
+        // Quantised so they recover EXACTLY the values the difficulty model was trained
+        // on -- s2_features rounds zipf to 3dp and the other two to 4dp.
+        zipf: stride >= 13 ? metaDv.getUint16(mo + 5, true) / 1000 : undefined,
+        crosswordese: stride >= 13 ? metaDv.getUint16(mo + 7, true) / 10000 : undefined,
+        corpusFreqLog: stride >= 13 ? metaDv.getUint16(mo + 9, true) / 10000 : undefined,
+        distinctClues: stride >= 13 ? metaDv.getUint16(mo + 11, true) : undefined,
       };
       clueOffsets[gi] = cidxDv.getUint32(gi * 5, true);
       clueCounts[gi] = cidxDv.getUint8(gi * 5 + 4);

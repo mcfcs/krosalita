@@ -1,7 +1,7 @@
 {
   "version": 1,
   "file": "corpus.bin",
-  "bytes": 5591892,
+  "bytes": 6094836,
   "totalWords": 62866,
   "totalClues": 209427,
   "difficultySource": "model",
@@ -125,5 +125,5 @@
     0.70196,
     0.84706
   ],
-  "createdAt": 1789170613
+  "createdAt": 1789176423
 }
