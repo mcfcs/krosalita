@@ -414,6 +414,200 @@ try {
     }
   }
 
+  // ---- Whole-puzzle re-clue, in Create. Runs with or without a model: the corpus alone
+  // already supplies a swap for every answer that has a published clue in the band, and
+  // only the rest go to Ollama. So this is guarded, not skipped, on the offline path —
+  // `ollamaUp` (probed above) only decides how long the run is allowed to take.
+  //
+  // The AI audit above reloads the page into Auto, so re-enter Create either way.
+  await page.evaluate(`(() => {
+    const t = [...document.querySelectorAll('button')]
+      .find(x => (x.textContent||'').trim().toLowerCase() === 'create'
+                 && x.classList.contains('tab'));
+    if (t) t.click();
+  })()`);
+  let reclueCells = 0;
+  for (let i = 0; i < 60; i++) {
+    reclueCells = await page.evaluate(`document.querySelectorAll('.xw-cell .xw-letter').length`);
+    if (reclueCells > 40) break;
+    await sleep(250);
+  }
+
+  // `<span class="eyebrow">Re-clue this puzzle</span>` sits in the panel's header row, so
+  // the panel itself is two levels up — same shape as the Clue Studio reader above.
+  const RECLUE_PANEL = `[...document.querySelectorAll('span')]
+      .find(e => e.classList.contains('eyebrow') && (e.textContent||'').trim() === 'Re-clue this puzzle')
+      ?.parentElement?.parentElement`;
+
+  // Clicks a button inside the panel. `pred` is JS source tested against `t`, the trimmed
+  // label: the band buttons match exactly while Apply carries a live count.
+  const clickInReclue = (pred) => `(() => {
+    const panel = ${RECLUE_PANEL};
+    if (!panel) return false;
+    const b = [...panel.querySelectorAll('button')]
+      .find(x => { const t = (x.textContent||'').trim(); return (${pred}) && !x.disabled; });
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`;
+
+  // Each proposal is an <li>: checkbox, percentile <span>, the numbered clue, status label.
+  // The selected band button is the one carrying the bare `bg-ink` class — the unselected
+  // ones carry `hover:bg-ink/5`, so this must be classList.contains, not a substring test.
+  const READ_RECLUE = `(() => {
+    const panel = ${RECLUE_PANEL};
+    if (!panel) return null;
+    const runBtn = [...panel.querySelectorAll('button')]
+      .find(b => /Working|Find clues/.test((b.textContent||'').trim()));
+    const applyBtn = [...panel.querySelectorAll('button')]
+      .find(b => (b.textContent||'').trim().startsWith('Apply'));
+    const rows = [...panel.querySelectorAll('li')].map(li => {
+      const spans = [...li.querySelectorAll('span')];
+      const box = li.querySelector('input[type="checkbox"]');
+      const line = li.querySelector('div > div');
+      const c = line ? line.cloneNode(true) : null;
+      if (c) for (const s of c.querySelectorAll('span')) s.remove();   // drop number + badges
+      return {
+        box: !!box,
+        checked: !!(box && box.checked),
+        pct: ((li.querySelector('span')||{}).textContent||'').trim(),
+        num: spans.length > 1 ? (spans[1].textContent||'').trim() : '',
+        clue: c ? (c.textContent||'').trim() : '',
+        status: spans.length ? (spans[spans.length - 1].textContent||'').trim() : '',
+      };
+    });
+    const text = panel.innerText || '';
+    return {
+      band: ([...panel.querySelectorAll('button')].find(b => b.classList.contains('bg-ink'))
+             || { textContent: '' }).textContent.trim(),
+      running: /Working/.test(runBtn ? (runBtn.textContent||'') : ''),
+      summary: ((text.match(/^.*from published clues.*$/m) || [''])[0]).trim(),
+      error: ((text.match(/^.*(couldn't|could not|failed|timed out|cancelled).*$/im) || [''])[0]).trim(),
+      applyText: applyBtn ? (applyBtn.textContent||'').trim() : '',
+      rows,
+      text: text.slice(0, 400),
+    };
+  })()`;
+
+  if (reclueCells <= 40) {
+    console.log('  skip: re-clue (no filled grid in Create)');
+  } else {
+    // "Re-clue all" lives in the selection panel, which ManualEditor only renders once a
+    // square is selected — and the reload above cleared whatever was selected before.
+    await page.evaluate(`(() => {
+      const c = [...document.querySelectorAll('.xw-cell')].find(e => e.querySelector('.xw-letter'));
+      if (c) c.click();
+      return !!c;
+    })()`);
+    let openedReclue = false;
+    for (let i = 0; i < 20; i++) {
+      openedReclue = await page.evaluate(`(() => {
+        const b = [...document.querySelectorAll('button')]
+          .find(x => (x.textContent||'').trim() === 'Re-clue all' && !x.disabled);
+        if (!b) return false;
+        b.click();
+        return true;
+      })()`);
+      if (openedReclue) break;
+      await sleep(250);
+    }
+    let rv = null;
+    for (let i = 0; i < 24; i++) {
+      rv = await page.evaluate(READ_RECLUE);
+      if (rv) break;
+      await sleep(250);
+    }
+    if (openedReclue && rv) ok('opened the Re-clue panel from Create');
+    else bad('opened the Re-clue panel', openedReclue ? 'panel header never rendered' : 'no enabled "Re-clue all" button');
+
+    if (rv) {
+      const bandClicked = await page.evaluate(clickInReclue(`t === 'Easy'`));
+      let band = '';
+      for (let i = 0; i < 20; i++) {
+        band = ((await page.evaluate(READ_RECLUE)) || {}).band || '';
+        if (band === 'Easy') break;
+        await sleep(200);
+      }
+      if (bandClicked && band === 'Easy') ok('selected the Easy band');
+      else bad('selected the Easy band', `the highlighted band reads "${band}"`);
+
+      const started = await page.evaluate(clickInReclue(`t === 'Find clues'`));
+      if (!started) {
+        bad('started the re-clue run', 'no enabled "Find clues" button');
+      } else {
+        // Corpus-only lands in seconds; with a model the leftovers go out 15 answers per
+        // request, so allow minutes rather than guessing. The button reads "Working…" for
+        // the whole run, which is the only reliable done signal.
+        await sleep(600);
+        const rounds = ollamaUp ? 90 : 20;          // 90 x 3s ~ 4.5 min
+        const tR0 = Date.now();
+        for (let i = 0; i < rounds; i++) {
+          rv = await page.evaluate(READ_RECLUE);
+          if (rv && !rv.running && (rv.summary || rv.error)) break;
+          await sleep(3000);
+        }
+        const reclueMs = Date.now() - tR0;
+        if (rv?.summary) {
+          ok(`re-clue run finished (~${Math.round(reclueMs / 1000)}s${ollamaUp ? '' : ', corpus only'})`);
+          console.log(`  summary: ${rv.summary.slice(0, 220)}`);
+        } else {
+          bad('re-clue run finished', `after ${reclueMs}ms: ${String(rv?.error || rv?.text || 'panel gone').slice(0, 160)}`);
+        }
+
+        const proposed = rv?.rows || [];
+        if (proposed.length) {
+          ok(`re-clue proposed ${proposed.length} clues`);
+          for (const r of proposed.slice(0, 4)) {
+            console.log(`     ${String(r.pct).padStart(3)}  ${r.num.padEnd(4)} ${r.clue.slice(0, 76)}  [${r.status}]`);
+          }
+        } else {
+          bad('re-clue proposed clues', `panel text: ${String(rv?.text || 'not found').slice(0, 160)}`);
+        }
+
+        // Every row must be actionable: a tickbox, a numeric percentile, and one of the
+        // six outcomes ReclueReview knows how to describe.
+        const STATUSES = ['published clue', 'written', 'already right',
+          'closest available', "answer can't go there", 'nothing found'];
+        const malformed = proposed.filter(
+          (r) => !r.box || !/^[0-9]+$/.test(r.pct) || !r.clue || !STATUSES.includes(r.status));
+        if (proposed.length && !malformed.length) ok('every proposal has a tickbox, a percentile and a known status');
+        else if (proposed.length) bad('proposal rows well formed', JSON.stringify(malformed.slice(0, 2)).slice(0, 200));
+
+        // Screenshot the panel BEFORE applying — the review state is the thing worth seeing.
+        await page.evaluate(`(() => { const p = ${RECLUE_PANEL}; if (p) p.scrollIntoView({ block: 'center' }); return true; })()`);
+        await sleep(400);
+        const reclueShot = await page.send('Page.captureScreenshot', { format: 'png' });
+        if (reclueShot.result?.data) {
+          const out = join(ROOT, 'scripts', 'reclue-e2e.png');
+          writeFileSync(out, Buffer.from(reclueShot.result.data, 'base64'));
+          console.log(`  screenshot: ${out}`);
+        }
+
+        if (proposed.length) {
+          const applyText = rv.applyText;
+          const applied = await page.evaluate(clickInReclue(`t.startsWith('Apply')`));
+          let closed = false;
+          let note = '';
+          for (let i = 0; i < 24; i++) {
+            const st = JSON.parse(await page.evaluate(`JSON.stringify({
+              open: !!(${RECLUE_PANEL}),
+              note: ((document.body.innerText||'').match(/Re-clued[^\\n]*/) || [''])[0]
+            })`));
+            closed = !st.open;
+            note = st.note;
+            if (closed && note) break;
+            await sleep(250);
+          }
+          if (applied && closed && /Re-clued/.test(note)) {
+            ok(`applied the re-clue ("${applyText}" -> "${note.trim()}")`);
+          } else {
+            bad('applied the re-clue', `clicked=${applied} panelClosed=${closed} note="${note}"`);
+          }
+        }
+      }
+    }
+  }
+
   const shot = await page.send('Page.captureScreenshot', { format: 'png' });
   if (shot.result?.data) {
     const out = join(ROOT, 'scripts', 'generate-e2e.png');

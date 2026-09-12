@@ -47,3 +47,4 @@ pipeline/out/
 pipeline/__pycache__/
 **/__pycache__/
 scripts/generate-e2e.png
+scripts/reclue-e2e.png

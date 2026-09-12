@@ -124,7 +124,11 @@ export default function ReclueReview({
           <button onClick={onApply} disabled={!nSelected} className="btn btn-sm btn-accent">
             <Check size={13} />Apply {nSelected} {nSelected === 1 ? 'clue' : 'clues'}
           </button>
-          <span className="text-[11px] text-ink-faint">Nothing changes until you apply.</span>
+          <span className="text-[11px] text-ink-faint">
+            {changed.length > nSelected
+              ? `${changed.length - nSelected} left unticked because they miss the band — tick to use anyway.`
+              : 'Nothing changes until you apply.'}
+          </span>
         </div>
       )}
 

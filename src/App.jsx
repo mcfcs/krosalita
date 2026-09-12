@@ -1959,8 +1959,13 @@ const CrosswordGenerator = () => {
         generate,
         onProgress: (p) => setReclue((r) => (r ? { ...r, progress: p } : r)),
       });
-      // Everything is pre-selected; the author unticks rather than hunts.
-      const selected = new Set(out.results.filter((r) => r.chosen).map((r) => r.key));
+      // Pre-tick only the proposals that actually landed in the requested band. A
+      // near-miss is still shown and can be ticked deliberately, but it must not be
+      // applied by default: ticking those would quietly swap p57 and p62 clues into an
+      // EASY pass, which is precisely the silent near-miss this feature exists to avoid.
+      const selected = new Set(out.results
+        .filter((r) => r.chosen && (r.status === 'corpus' || r.status === 'generated'))
+        .map((r) => r.key));
       setReclue({ band, running: false, progress: null, result: out, error: '', selected });
     } catch (err) {
       setReclue((r) => ({ ...(r || { band }), running: false, error: String(err?.message || err) }));
