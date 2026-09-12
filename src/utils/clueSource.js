@@ -114,8 +114,10 @@ function cosine(a, b) {
  */
 export async function flagImplausible(corpus, word, candidates, { baseUrl, model, signal } = {}) {
   if (!baseUrl || !candidates.length) return candidates;
+  // Fewer than three published clues makes a noisy centroid -- RAZER has only "Leveler"
+  // and "Home wrecker", and correct generated clues were being flagged against them.
   const known = cluesForWord(corpus?.clueStore, word).map((c) => c.clue);
-  if (known.length < 2) return candidates;
+  if (known.length < 3) return candidates;
   try {
     const vecs = await embedTexts({
       baseUrl, model, signal, texts: [...candidates.map((c) => c.clue), ...known],
@@ -148,11 +150,19 @@ export async function cluesForAnswer(corpus, model, word, {
   const haveInBand = candidates.filter((c) => c.inBand).length;
 
   let usedLLM = false;
+  let reading = '';
   // Generate whenever the corpus cannot fill the band, regardless of the published range.
   if (generate && haveInBand < want) {
     usedLLM = true;
-    const fresh = await generate([{ word, sense }], band);
-    candidates.push(...scoreCandidates(corpus, model, word, fresh.get(word) || [], { band, exclude }));
+    // Hand over how this answer has actually been clued. Without it the model picks a
+    // meaning at random -- ISITME became "Time to check one's watch?" rather than
+    // "Am I the issue?" -- and for a concatenated phrase it often misreads the answer
+    // entirely.
+    const known = cluesForWord(corpus?.clueStore, word).map((c) => c.clue);
+    const fresh = await generate([{ word, sense, known }], band);
+    const got = fresh.get(word) || { clues: [], reading: '' };
+    reading = got.reading || '';
+    candidates.push(...scoreCandidates(corpus, model, word, got.clues, { band, exclude }));
     candidates.sort((a, b) => (b.inBand - a.inBand)
       || Math.abs(a.percentile - win.target * 100) - Math.abs(b.percentile - win.target * 100));
   }
@@ -166,6 +176,9 @@ export async function cluesForAnswer(corpus, model, word, {
     // answer. When it hasn't, the UI should say so rather than present a near miss as a hit.
     reachable: !range || (range.min < win.max && range.max >= win.min),
     usedLLM,
+    // What the model thought the answer says. Shown so a wrong reading is visible rather
+    // than silently producing clues for a different word.
+    reading,
   };
 }
 
@@ -213,10 +226,16 @@ export async function recluePuzzle(corpus, model, entries, {
   onProgress?.({ phase: 'corpus', done: entries.length, total: entries.length, needsLLM: needsLLM.length });
 
   if (generate && needsLLM.length) {
-    const fresh = await generate(needsLLM, band, (p) => onProgress?.({ phase: 'generate', ...p }));
+    const withContext = needsLLM.map((e) => ({
+      ...e,
+      known: cluesForWord(corpus?.clueStore, e.word).map((c) => c.clue),
+    }));
+    const fresh = await generate(withContext, band, (p) => onProgress?.({ phase: 'generate', ...p }));
     for (const r of results) {
       if (r.status !== 'pending') continue;
-      const scored = scoreCandidates(corpus, model, r.word, fresh.get(r.word) || [], { band, exclude: used });
+      const got = fresh.get(r.word) || { clues: [], reading: '' };
+      r.reading = got.reading || '';
+      const scored = scoreCandidates(corpus, model, r.word, got.clues, { band, exclude: used });
       const best = scored.find((c) => c.inBand) || scored[0];
       if (best) {
         used.add(best.clue.toLowerCase());

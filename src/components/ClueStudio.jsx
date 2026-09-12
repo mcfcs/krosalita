@@ -28,6 +28,9 @@ export default function ClueStudio({
   generating,
   error,
   aiEnabled,
+  sense = '',
+  reading = '',
+  onSenseChange = () => {},
   onGenerate,
   onAccept,
   onClose,
@@ -128,6 +131,32 @@ export default function ClueStudio({
           </button>
         )}
       </div>
+
+      {aiEnabled && (
+        <div className="px-3 py-2 border-b border-line">
+          <input
+            className="field w-full text-sm"
+            value={sense}
+            placeholder={`What does ${word} mean here? (optional)`}
+            onChange={(e) => onSenseChange(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') onGenerate(); }}
+          />
+          {/* An answer often has more than one reading and the model silently picks one:
+              RAZER gets clued as "Leveler" because that is how the corpus uses it, never
+              as the gaming brand. Saying which meaning you want overrides that. */}
+          <p className="text-[11px] text-ink-faint mt-1">
+            Leave blank to match how {word} has been clued before.
+          </p>
+        </div>
+      )}
+
+      {/* Compared as written, not normalised: "AM IN OT" collapses back to AMINOT,
+          and that mis-split is exactly what needs to be visible. */}
+      {reading && reading.toUpperCase().trim() !== word && (
+        <p className="px-3 py-2 text-xs border-b border-line text-gold">
+          The model read this as <b>{reading}</b> — if that&apos;s wrong, say what you mean above.
+        </p>
+      )}
 
       {currentClue && (
         <div className="px-3 py-2 text-xs text-ink-faint border-b border-line">

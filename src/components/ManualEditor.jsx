@@ -44,6 +44,7 @@ const ManualEditor = ({
   onOpenClueStudio = () => {},
   onCloseClueStudio = () => {},
   onClueStudioBand = () => {},
+  onClueStudioSense = () => {},
   onGenerateClues = () => {},
   onClueAccepted = () => {},
   onOpenReclue = () => {},
@@ -257,6 +258,9 @@ const ManualEditor = ({
                 error={clueStudio.error}
                 aiEnabled={aiEnabled}
                 onBandChange={onClueStudioBand}
+                sense={clueStudio.sense}
+                reading={clueStudio.reading}
+                onSenseChange={onClueStudioSense}
                 onGenerate={onGenerateClues}
                 onAccept={(clue) => {
                   updateClue(clue);

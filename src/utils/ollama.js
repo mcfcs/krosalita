@@ -325,19 +325,37 @@ export const parseGenerateResponse = (text, batchSize) => {
     const i = Number(item.i);
     const c = typeof item.c === 'string' ? item.c.trim() : '';
     if (!Number.isFinite(i) || i < 1 || i > batchSize || !c) continue;
-    out.push({ i, clue: cleanClueLine(c) });
+    // The reading is what the model THOUGHT the answer says. Surfacing it is the only way
+    // a wrong interpretation becomes visible rather than silently producing clues for the
+    // wrong word -- asked for AMINOT it reads "AMINOT" and clues a French painter.
+    out.push({ i, clue: cleanClueLine(c), reading: typeof item.r === 'string' ? item.r.trim() : '' });
   }
   return out;
 };
 
+const NL = String.fromCharCode(10);
+
 const generatePrompt = (batch, band, perWord) => {
   const hint = GEN_RUBRIC[band] || GEN_RUBRIC.medium;
-  // An answer's sense is often ambiguous and the model silently picks one: asked to clue
-  // GHAST it writes about specters and never the Minecraft mob. `sense` lets the caller
-  // say which meaning is wanted, per answer.
-  const lines = batch
-    .map((e, i) => `${i + 1}. ${e.word}${e.sense ? `  (meaning: ${e.sense})` : ''}`)
-    .join('\n');
+  // Three things pin down what an answer actually MEANS, in decreasing order of
+  // reliability. Without them the model guesses and guesses badly: asked to clue ISITME
+  // it wrote "Time to check one's watch?", and RAZER got clued as a gaming brand when the
+  // corpus has only ever used the raze sense.
+  //   1. `sense`   - the caller said outright which meaning is wanted. Wins.
+  //   2. `known`   - how the answer has actually been clued in print. Ground truth.
+  //   3. neither   - say so, and warn that answers are written without spaces, because
+  //                  the model otherwise reads WHATSUPDOC as a Peanuts reference.
+  const lines = batch.map((e, i) => {
+    const bits = [`${i + 1}. ${e.word}`];
+    if (e.sense) bits.push(`   meaning: ${e.sense}`);
+    else if (e.known?.length) {
+      bits.push(`   clued before as: ${e.known.slice(0, 4).map((c) => `"${c}"`).join(', ')} — use the SAME meaning`);
+    } else {
+      bits.push('   never clued before — it may be a multi-word phrase, name or brand written without spaces');
+    }
+    return bits.join(NL);
+  }).join(NL);
+
   return `You are a New York Times crossword editor writing clues.
 
 For each numbered ANSWER below, write ${perWord} crossword ${perWord === 1 ? 'clue' : 'clues'}.
@@ -348,9 +366,9 @@ Rules:
 - Never refer to another entry ("see 14-Across", "with 3-Down") — these puzzles are generated, so the numbers would be meaningless.
 - Never refer to the grid, its theme, circled or shaded squares.
 - Keep each clue short, the way a printed crossword clue is short.
-- Where a meaning is given in brackets, clue THAT meaning and no other.
+- Clue only the meaning indicated. If none is given, work out the most likely reading first.
 
-Reply with ONLY a JSON array of {"i":<answer number>,"c":"<clue>"}, ${perWord} entries per answer. No prose, no code fences.
+Reply with ONLY a JSON array of {"i":<answer number>,"r":"<the reading you clued, e.g. AM I NOT>","c":"<clue>"}, ${perWord} entries per answer. No prose, no code fences.
 
 ${lines}`;
 };
@@ -409,12 +427,13 @@ export const generateCluesBatch = async ({
       }
     }
 
-    for (const { i, clue } of items) {
+    for (const { i, clue, reading } of items) {
       const e = batch[i - 1];
       if (!e) continue;
-      const arr = out.get(e.word) || [];
-      if (!arr.includes(clue)) arr.push(clue);
-      out.set(e.word, arr);
+      const entry = out.get(e.word) || { clues: [], reading: '' };
+      if (!entry.clues.includes(clue)) entry.clues.push(clue);
+      if (!entry.reading && reading) entry.reading = reading;
+      out.set(e.word, entry);
     }
 
     done += batch.length;

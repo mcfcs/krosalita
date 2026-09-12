@@ -2034,7 +2034,8 @@ const CrosswordGenerator = () => {
 
   const openClueStudio = async (word, currentClue, band = 'medium') => {
     if (!word || /_/.test(word)) return;
-    setClueStudio({ word, currentClue, band, candidates: [], loading: true, generating: false, error: '', range: null });
+    setClueStudio({ word, currentClue, band, candidates: [], loading: true, generating: false,
+      error: '', range: null, sense: '', reading: '' });
     try {
       const [model, data] = await Promise.all([loadScorer(), requestClueData([word])]);
       const entry = data[word];
@@ -2080,23 +2081,28 @@ const CrosswordGenerator = () => {
       const generate = makeGenerator({
         baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 6,
       });
-      const fresh = await generate([{ word: st.word }], st.band);
+      // Hand the model how this answer has actually been clued, so it writes in the same
+      // sense — and the same READING, which is what stops a concatenated phrase like
+      // ISITME being clued as though it were about the time.
+      const known = st.candidates.filter((c) => c.source === 'corpus').map((c) => c.clue);
+      const fresh = await generate([{ word: st.word, sense: st.sense, known }], st.band);
+      const got = fresh.get(st.word) || { clues: [], reading: '' };
       const shim = { entries: [{ word: st.word, ...(st.answerFeatures || {}) }],
         clueStore: { wordIndexOf: new Map([[st.word, 0]]), counts: [0], offsets: [0] } };
       const exclude = new Set(st.candidates.map((c) => c.clue.toLowerCase()));
-      let scored = scoreCandidates(shim, model, st.word, fresh.get(st.word) || [], { band: st.band, exclude });
+      let scored = scoreCandidates(shim, model, st.word, got.clues, { band: st.band, exclude });
       // Flag anything that reads unlike this answer's real clues — the model does write
       // confidently wrong ones, and nothing in the difficulty score can see that.
-      const known = st.candidates.filter((c) => c.source === 'corpus').map((c) => ({ clue: c.clue }));
-      if (known.length >= 2) {
+      if (known.length >= 3) {
         scored = await flagImplausible(
-          { clueStore: { wordIndexOf: new Map([[st.word, 0]]), counts: [known.length], __clues: known } },
+          { clueStore: { __mem: new Map([[st.word, known.map((c) => ({ clue: c }))]]) } },
           st.word, scored, { baseUrl: ollamaConfig.baseUrl },
         );
       }
       setClueStudio((s0) => (s0?.word !== st.word ? s0 : {
         ...s0,
         generating: false,
+        reading: got.reading || '',
         candidates: [...s0.candidates, ...scored]
           .sort((a, b) => (b.inBand - a.inBand) || a.percentile - b.percentile),
       }));
@@ -2784,6 +2790,7 @@ const CrosswordGenerator = () => {
             onOpenClueStudio={openClueStudio}
             onCloseClueStudio={() => setClueStudio(null)}
             onClueStudioBand={setClueStudioBand}
+            onClueStudioSense={(v) => setClueStudio((st) => (st ? { ...st, sense: v } : st))}
             onGenerateClues={generateStudioClues}
             onClueAccepted={saveUserClue}
             aiGenerateClues={aiGenerateClues}

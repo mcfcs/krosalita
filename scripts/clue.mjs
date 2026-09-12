@@ -46,14 +46,14 @@ const corpus = decodeCorpus(buf.buffer.slice(buf.byteOffset, buf.byteOffset + bu
 const model = loadClueModel(JSON.parse(
   fs.readFileSync(path.join(ROOT, 'public', 'corpus', 'clue-model.json'), 'utf8')));
 
-const known = corpus.clueStore.wordIndexOf.has(word);
+const inCorpus = corpus.clueStore.wordIndexOf.has(word);
 const af = answerFeaturesFrom(corpus, word);
 const range = answerRange(corpus, model, word);
 const win = BANDS[band];
 
 console.log(`\n${word}  ·  aiming ${win.label} (${win.min}–${win.max === 101 ? 100 : win.max} of 100)`
   + (sense ? `  ·  meaning: ${sense}` : ''));
-if (known) {
+if (inCorpus) {
   console.log(`in the corpus · zipf ${af.zipf?.toFixed(2)} · crosswordese ${af.crosswordese?.toFixed(2)}`
     + (range ? ` · published clues run ${Math.round(range.min)}–${Math.round(range.max)}` : ''));
   if (range && (range.max < win.min || range.min >= win.max)) {
@@ -98,13 +98,20 @@ if (doGen) {
     process.stdout.write(`\n  asking ${GEN_MODEL}…`);
     const t = Date.now();
     const generate = makeGenerator({ baseUrl: OLLAMA, model: GEN_MODEL, perWord: count });
-    const fresh = await generate([{ word, sense }], band);
-    let scored = scoreCandidates(corpus, model, word, fresh.get(word) || [], {
+    const knownClues = corpusCandidates(corpus, model, word, { band }).map((c) => c.clue);
+    const fresh = await generate([{ word, sense, known: knownClues }], band);
+    const got = fresh.get(word) || { clues: [], reading: '' };
+    // Compare as written, not normalised: "AM IN OT" collapses back to AMINOT, and that
+    // mis-split is precisely what you need to see.
+    if (got.reading && got.reading.toUpperCase().trim() !== word) {
+      console.log(`  the model read this as: ${got.reading}`);
+    }
+    let scored = scoreCandidates(corpus, model, word, got.clues, {
       band, exclude: new Set(candidates.map((c) => c.clue.toLowerCase())),
     });
     // Only meaningful when the corpus knows the answer — the check compares against its
     // real clues, and GHAST-like words have none.
-    if (known) scored = await flagImplausible(corpus, word, scored, { baseUrl: 'http://localhost:11434' });
+    if (inCorpus) scored = await flagImplausible(corpus, word, scored, { baseUrl: 'http://localhost:11434' });
     console.log(` ${((Date.now() - t) / 1000).toFixed(0)}s`);
     show(scored.filter((c) => c.inBand), 'written, in band');
     show(scored.filter((c) => !c.inBand), 'written, outside the band');
