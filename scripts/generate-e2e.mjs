@@ -213,6 +213,20 @@ try {
     for (const l of page.console_.slice(-8)) console.log(`    ${l.slice(0, 160)}`);
   }
 
+  // Generating deliberately no longer writes into Create — it used to replace the author's
+  // hand-built grid and every clue they had written, silently. Moving a puzzle across is
+  // now an explicit "Send to Create", so press it before asserting Create holds the fill.
+  const sent = await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')]
+      .find(x => /send to create/i.test((x.textContent || '').trim()) && !x.disabled);
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+  if (sent) ok('Send to Create moved the generated puzzle across');
+  else bad('Send to Create moved the generated puzzle across', 'no enabled "Send to Create" button');
+  await sleep(700);
+
   // ---- Clue Studio, in Create. Works with Ollama off: the corpus supplies candidates
   // and the scorer is local, so only "Write more" needs a model.
   await page.evaluate(`(() => {
@@ -223,8 +237,7 @@ try {
   })()`);
   await sleep(900);
 
-  // A completed auto-fill is copied into the Create tab (syncManualFromAuto), but the
-  // copy lands a render tick after the tab switch — poll rather than guess a delay.
+  // The copy lands a render tick after "Send to Create" — poll rather than guess a delay.
   // Letters live in <span class="xw-letter"> INSIDE the clickable <div class="xw-cell">,
   // so the leaf-node scan used for the proof grid above finds nothing here.
   // Wait for the grid to be FULLY copied, not merely non-empty. A partially synced grid
@@ -718,15 +731,19 @@ const USE_LLM = process.argv.includes('--llm') || process.env.KROSALITA_E2E_LLM 
   if (cleared === 0) ok('cleared the Create grid');
   else bad('cleared the Create grid', `${cleared} letters remain`);
 
+  // Generation is rate-limited to one run per 2s, so a fill that follows another one
+  // immediately finds the button disabled.
+  await sleep(2300);
+
   const ranFill = await page.evaluate(`(() => {
     const b = [...document.querySelectorAll('button')]
-      .find(x => (x.textContent || '').trim() === 'Generate Remaining' && !x.disabled);
+      .find(x => (x.textContent || '').trim() === 'Fill Remaining' && !x.disabled);
     if (!b) return false;
     b.click();
     return true;
   })()`);
   if (!ranFill) {
-    bad('ran Generate Remaining', 'button missing or disabled');
+    bad('ran Fill Remaining', 'button missing or disabled');
   } else {
     let filled = 0;
     let open = 0;
@@ -739,8 +756,8 @@ const USE_LLM = process.argv.includes('--llm') || process.env.KROSALITA_E2E_LLM 
       if (open > 0 && filled >= open) break;
       await sleep(500);
     }
-    if (open > 0 && filled >= open) ok(`Generate Remaining refilled the grid (${filled}/${open})`);
-    else bad('Generate Remaining refilled the grid', `${filled} of ${open} squares`);
+    if (open > 0 && filled >= open) ok(`Fill Remaining refilled the grid (${filled}/${open})`);
+    else bad('Fill Remaining refilled the grid', `${filled} of ${open} squares`);
 
     // Every refilled entry must get a clue — an unclued answer is unsolvable, and this is
     // the path where preset clues used to be re-pinned to the wrong word.

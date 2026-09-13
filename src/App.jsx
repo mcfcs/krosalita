@@ -24,6 +24,10 @@ import { loadJSON, saveJSON } from './utils/storage';
 // being re-fetched on every load, and so they can be exported and fed back into the
 // pipeline later.
 const USER_CLUES_KEY = 'userClues';
+// Rows the user removed from the Lexicon. The corpus CSV is re-fetched on every load, so
+// a deletion has to be recorded as a subtraction over it — there is nowhere else to put it.
+const USER_HIDDEN_KEY = 'userHidden';
+const pairKey = (word, clue) => `${String(word || '').toUpperCase()}\u0000${String(clue || '')}`;
 import { todayKey, seedFromString, getStreak, recordDailySolve, isDailySolved } from './utils/daily';
 import { difficultyLabelFromScore, difficultyColorClass, difficultyTargetOf } from './utils/difficulty';
 import { getOllamaConfig, saveOllamaConfig, generateClues, auditDifficulty } from './utils/ollama';
@@ -52,6 +56,7 @@ const CrosswordGenerator = () => {
   // the packed corpus artifact, so the worker is told which source to index.
   const [usingCustomWords, setUsingCustomWords] = useState(false);
   const [userClues, setUserClues] = useState(() => loadJSON(USER_CLUES_KEY, []));
+  const [userHidden, setUserHidden] = useState(() => new Set(loadJSON(USER_HIDDEN_KEY, [])));
   const [debugMode, setDebugMode] = useState(false);
   const [debugLog, setDebugLog] = useState([]);
   const [layouts, setLayouts] = useState(DEFAULT_LAYOUTS);
@@ -105,6 +110,14 @@ const CrosswordGenerator = () => {
   const [rebusMode, setRebusMode] = useState(false);         // type multiple letters into one cell
   const [gameView, setGameView] = useState(() => typeof window !== 'undefined' && window.matchMedia?.('(max-width: 767px)').matches); // immersive NYT-style view — default on phones
   const [checkedCells, setCheckedCells] = useState(new Set()); // cells shown correctness via one-off Check
+  // Squares in Create whose letter the author put there by hand. Nothing else recorded who
+  // filled a square, so a regenerate had no way to tell the author's letters from the
+  // solver's and simply overwrote everything.
+  const [lockedCells, setLockedCells] = useState(new Set());
+  // Generation is rate-limited: a run takes ~10ms on a warm corpus, so a double-click used
+  // to fire two solves and the second's result raced the first's into the grid.
+  const [cooldownUntil, setCooldownUntil] = useState(0);
+  const [, setNowTick] = useState(0);   // forces the cooldown countdown to re-render
   const [usedAssist, setUsedAssist] = useState(false); // any reveal/check used → not a clean solve
   const [confirmDialog, setConfirmDialog] = useState(null); // { title, message, confirmLabel, onConfirm }
   const [showResult, setShowResult] = useState(false);
@@ -154,6 +167,12 @@ const CrosswordGenerator = () => {
   const playTimerRef = useRef(null);
   const workerRef = useRef(null);
   const restoredRef = useRef(false);
+  // Set by handleDaily, read and cleared by startPlayMode, so only a solve that actually
+  // came from Today's Puzzle can earn the streak.
+  const dailyRequestRef = useRef(false);
+  // Signature of the last Create fill, so Regenerate can tell when it produced the same
+  // grid again and try once more with a different seed.
+  const lastFillSigRef = useRef('');
   const resultShownRef = useRef(false);
 
   // =========== LOGGING ============
@@ -279,18 +298,32 @@ const CrosswordGenerator = () => {
 
   const handleRequiredConfirm = (wordsList, mode, difficulty) => {
     const chosenMode = mode || 'anchor';
+    // setDifficultyChoice does not land before the generate call below runs, so the
+    // choice has to be threaded through explicitly. Reading difficultyChoice here meant
+    // the selector appeared to work only on the second attempt.
+    const chosenDifficulty = difficulty || difficultyChoice;
     if (difficulty) setDifficultyChoice(difficulty);
     setRequiredWords(wordsList);
     setRequiredMode(chosenMode);
     setShowRequiredModal(false);
     if (requiredAction === 'play') {
-      handleAutoGeneratePlayInternal(wordsList, chosenMode);
+      handleAutoGeneratePlayInternal(wordsList, chosenMode, chosenDifficulty);
     } else {
-      handleAutoGenerateInternal(wordsList, chosenMode);
+      handleAutoGenerateInternal(wordsList, chosenMode, chosenDifficulty);
     }
   };
 
-  const generateManualFill = async (wordList = words, requiredWordsList = [], requiredModeInput = 'opportunistic') => {
+  /**
+   * Fill the Create grid.
+   *
+   * mode 'fill'       — keep every letter already on the grid and fill only the blanks.
+   * mode 'regenerate' — keep only the author's pinned letters and reroll everything else.
+   *
+   * @param {'fill'|'regenerate'} opts.mode
+   * @param {number|null} opts.seed  explicit seed, so a retry can force a different fill
+   */
+  const generateManualFill = async (wordList = words, requiredWordsList = [], requiredModeInput = 'opportunistic', opts = {}) => {
+    const { mode = 'fill', seed: seedArg = null } = opts;
     if (!manualGrid) { setError('Create a grid first'); return; }
     if (wordList.length === 0) { setError('Please upload a CSV file first'); return; }
     if (!layouts[currentLayoutIndex]) { setError('Please select a valid layout'); return; }
@@ -302,9 +335,15 @@ const CrosswordGenerator = () => {
     setError('');
     
     const layout = layouts[currentLayoutIndex].grid;
-    const presetGrid = manualGrid.map(row => row.map(cell => {
+    // 'fill' treats every letter on the grid as fixed. 'regenerate' keeps only what the
+    // author pinned, so the solver is free to replace its own previous answers — which is
+    // the whole point: before this there was no way to ask for another fill without
+    // either losing your own words or getting the identical grid back.
+    const keepAll = mode !== 'regenerate';
+    const presetGrid = manualGrid.map((row, r) => row.map((cell, c) => {
       if (cell === '#') return '#';
       if (!cell) return null;
+      if (!keepAll && !lockedCells.has(cellKey(r, c))) return null;
       return cell.toUpperCase();
     }));
     
@@ -320,6 +359,10 @@ const CrosswordGenerator = () => {
       const current = getWordFromGrid(presetGrid, c.row, c.col, c.length, direction);
       if (current.length !== c.length) return;                          // slot no longer complete
       if (c.word && current !== c.word.toUpperCase()) return;           // answer changed under the clue
+      // On a regenerate the answer is only guaranteed to survive where every square of the
+      // slot is pinned. Anywhere else the solver may replace the word, and re-pinning the
+      // old clue would drag it onto a different answer.
+      if (!keepAll && !slotFullyLocked({ row: c.row, col: c.col, length: c.length, direction })) return;
       presetClues[`${direction}-${c.row}-${c.col}`] = c.clue;
     };
     manualClues.across.forEach(c => addPresetClue(c, 'across'));
@@ -338,7 +381,7 @@ const CrosswordGenerator = () => {
       requiredModeInput,
       presetClues,
       difficultyTargetOf(difficultyChoice),
-      null,
+      seedArg,
     );
 
     let picked = result;
@@ -385,6 +428,8 @@ const CrosswordGenerator = () => {
 
     const finalGrid = newGrid || presetGrid;
     setManualGrid(finalGrid);
+    lastFillSigRef.current = gridSignature(finalGrid);
+    startCooldown();
     
     const placementMap = new Map();
     (placements || []).forEach(p => {
@@ -436,8 +481,34 @@ const CrosswordGenerator = () => {
   };
   
   const handleManualGenerate = () => {
+    if (onCooldown || isGenerating) return;
     const manualRequired = parseWordListInput(manualRequiredInput);
-    generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic');
+    generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic', { mode: 'fill' });
+  };
+
+  /**
+   * Reroll the unpinned part of the Create grid.
+   *
+   * The worker already picks a fresh random seed per run, but the solver draws most of its
+   * candidates from the top of the ranked corpus, so a new seed can still land on the same
+   * answers. When that happens, try once more with another seed rather than handing back an
+   * identical grid and looking broken.
+   */
+  const handleManualRegenerate = async () => {
+    if (onCooldown || isGenerating) return;
+    const manualRequired = parseWordListInput(manualRequiredInput);
+    const before = gridSignature(manualGrid);
+    await generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic',
+      { mode: 'regenerate', seed: (Math.random() * 0x7fffffff) | 0 });
+    if (lastFillSigRef.current && lastFillSigRef.current === before && !cancelRef.current) {
+      await generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic',
+        { mode: 'regenerate', seed: (Math.random() * 0x7fffffff) | 0 });
+      if (lastFillSigRef.current === before) {
+        // Worth saying out loud rather than leaving the author clicking a button that
+        // appears to do nothing: a tightly-crossed grid can have very few valid fills.
+        setProgress('That is the only fill this grid allows — unpin a square or two for more variety.');
+      }
+    }
   };
 
   const normalizeLayoutGrid = (gridData) => gridData.map(row => Array.isArray(row) ? row.join('') : row);
@@ -515,6 +586,7 @@ const CrosswordGenerator = () => {
   // three times per click when a difficulty band was selected.
   const pendingRef = useRef(null);
   const clueDataPendingRef = useRef(null);
+  const clueDataSeqRef = useRef(0);
   const corpusFpRef = useRef(null);
 
   const ensureWorker = () => {
@@ -522,7 +594,7 @@ const CrosswordGenerator = () => {
     const w = new Worker(new URL('./worker/crosswordWorker.js', import.meta.url), { type: 'module' });
     w.onmessage = (e) => {
       // Clue data has its own channel so it can't be mistaken for solver progress.
-      if (e.data?.type === 'clueDataResult') { clueDataPendingRef.current?.(e.data.data); return; }
+      if (e.data?.type === 'clueDataResult') { clueDataPendingRef.current?.fn(e.data.data); return; }
       pendingRef.current?.(e.data);
     };
     w.onerror = () => { pendingRef.current?.({ type: 'error', message: 'The solver failed to start.' }); };
@@ -635,7 +707,11 @@ const CrosswordGenerator = () => {
   };
 
   const generatePuzzle = async (layoutIdx = selectedLayoutIndex, autoStartPlay = false, requiredWordsList = requiredWords, requiredModeInput = requiredMode, targetDifficulty = difficultyChoice, seed = null) => {
-    
+    // A solve is ~10ms warm, so without this a double-click fired two of them and the
+    // slower one's result overwrote the faster one's.
+    if (cooldownUntil > Date.now() || isGenerating) return;
+    startCooldown();
+
     // Reset cancellation state
     cancelRef.current = false;
     setIsGenerating(true);
@@ -730,7 +806,10 @@ const CrosswordGenerator = () => {
       setRequiredHighlights(new Set(placedReq));
       setShowRequiredHighlights(placedReq.length > 0);
       setHighlightMissingRequired(true);
-      syncManualFromAuto(newGrid, generatedClues, layoutIdx);
+      // Deliberately NOT pushed into Create. This used to call syncManualFromAuto, which
+      // replaced the author's hand-built grid and every clue they had written with the
+      // generated puzzle, silently and with no undo. Create is its own workspace now; the
+      // "Send to Create" button moves a puzzle across when that is actually wanted.
       if (autoStartPlay) {
         startPlayMode(newGrid, generatedClues);
       }
@@ -755,28 +834,37 @@ const CrosswordGenerator = () => {
       setRequiredHighlights(new Set(placedReq));
       setShowRequiredHighlights(placedReq.length > 0);
       setHighlightMissingRequired(true);
-      syncManualFromAuto(newGrid, generatedClues, layoutIdx);
-      setActiveTab('create');
+      // Same as above: a partial fill is still not a reason to throw away the author's
+      // work, and silently switching tabs on them compounded it.
+      setProgress('');
       setError(picked?.error?.message
         || `Stopped: best result was ${placements.length}/${slots.length} slots filled. You can edit it in Create.`);
       setFailedWord(solveFailedWord || null);
     } else {
-      // Preflight refusals land here: they name the actual blocker (a 2-letter slot,
-      // a required word with nowhere to go, an impossible preset) instead of leaving
-      // the user staring at a spinner for two minutes.
-      setError(picked?.error?.message
-        || 'Could not place any words. Check that your word list has words of the right lengths.');
+      // Cancelling before the first result arrives used to land in the branch below and
+      // accuse the user's word list of having no usable lengths, sending them off to
+      // audit a CSV over a button they pressed themselves.
+      setProgress('');
+      if (cancelRef.current) {
+        setError('Stopped before anything was placed. Press Generate to try again.');
+      } else {
+        // Preflight refusals land here: they name the actual blocker (a 2-letter slot,
+        // a required word with nowhere to go, an impossible preset) instead of leaving
+        // the user staring at a spinner for two minutes.
+        setError(picked?.error?.message
+          || 'Could not place any words. Check that your word list has words of the right lengths.');
+      }
     }
     
     setIsGenerating(false);
   };
 
-  const handleAutoGenerateInternal = (reqWords, mode) => {
-    generatePuzzle(selectedLayoutIndex, false, reqWords, mode, difficultyChoice);
+  const handleAutoGenerateInternal = (reqWords, mode, difficulty = difficultyChoice) => {
+    generatePuzzle(selectedLayoutIndex, false, reqWords, mode, difficulty);
   };
   
-  const handleAutoGeneratePlayInternal = (reqWords, mode) => {
-    generatePuzzle(selectedLayoutIndex, true, reqWords, mode, difficultyChoice);
+  const handleAutoGeneratePlayInternal = (reqWords, mode, difficulty = difficultyChoice) => {
+    generatePuzzle(selectedLayoutIndex, true, reqWords, mode, difficulty);
   };
 
   const syncManualFromAuto = (newGrid, generatedClues, layoutIdx) => {
@@ -785,6 +873,9 @@ const CrosswordGenerator = () => {
     if (!layout) return;
     setCurrentLayoutIndex(layoutIdx);
     setManualGrid(newGrid.map(row => row.map(cell => cell === null ? '' : cell)));
+    // Every letter here came from the solver, so nothing is pinned: a Regenerate in Create
+    // is free to reroll all of it.
+    setLockedCells(new Set());
     const slots = findSlots(layout);
     const numbered = [];
     const numberMap = new Map();
@@ -1157,6 +1248,7 @@ const CrosswordGenerator = () => {
     const cols = layout[0].length;
     const newGrid = Array(rows).fill(null).map((_, r) => Array(cols).fill(null).map((_, c) => layout[r][c] === '#' ? '#' : ''));
     setManualGrid(newGrid);
+    setLockedCells(new Set());   // no letters left, so no pins
     setCurrentLayoutIndex(layoutIdx);
     const slots = findSlots(layout);
     const numbered = [];
@@ -1192,8 +1284,85 @@ const CrosswordGenerator = () => {
   const isFormElement = (el) => {
     if (!el) return false;
     const tag = el.tagName?.toLowerCase();
-    return ['input', 'textarea', 'select', 'button'].includes(tag) || el.isContentEditable;
+    // 'button' is deliberately NOT here. The keydown handler is bound to the root
+    // tabIndex=0 div, so e.target is whichever button last took focus — counting buttons
+    // as form elements killed typing and the arrow keys after every click on a clue,
+    // Check, Reveal or Pause until the user clicked a grid square again.
+    return ['input', 'textarea', 'select'].includes(tag) || el.isContentEditable;
   };
+
+  // ---- author-locked squares -------------------------------------------------------
+  const cellKey = (r, c) => `${r},${c}`;
+
+  const lockCell = (r, c) => setLockedCells((prev) => {
+    const next = new Set(prev);
+    next.add(cellKey(r, c));
+    return next;
+  });
+
+  const unlockCell = (r, c) => setLockedCells((prev) => {
+    if (!prev.has(cellKey(r, c))) return prev;
+    const next = new Set(prev);
+    next.delete(cellKey(r, c));
+    return next;
+  });
+
+  const toggleCellLock = (r, c) => {
+    if (!manualGrid || manualGrid[r]?.[c] === '#' || !manualGrid[r]?.[c]) return;
+    if (lockedCells.has(cellKey(r, c))) unlockCell(r, c); else lockCell(r, c);
+  };
+
+  /**
+   * Pin or unpin every filled square of the current word. Authors think in words, not
+   * squares, so this is the control that gets used; the per-square toggle is the escape
+   * hatch for a single crossing letter.
+   */
+  const toggleCurrentWordLock = () => {
+    const { slot } = getCurrentWord();
+    if (!slot || !manualGrid) return;
+    const cells = [];
+    for (let i = 0; i < slot.length; i++) {
+      const r = slot.direction === 'across' ? slot.row : slot.row + i;
+      const c = slot.direction === 'across' ? slot.col + i : slot.col;
+      if (manualGrid[r]?.[c] && manualGrid[r][c] !== '#') cells.push(cellKey(r, c));
+    }
+    if (!cells.length) return;
+    const allPinned = cells.every((k) => lockedCells.has(k));
+    setLockedCells((prev) => {
+      const next = new Set(prev);
+      cells.forEach((k) => (allPinned ? next.delete(k) : next.add(k)));
+      return next;
+    });
+  };
+
+  /** Compact fingerprint of a filled grid, for "did the regenerate actually change it?". */
+  const gridSignature = (g) => (g || []).map((row) => row.map((c) => c || '.').join('')).join('/');
+
+  /** Release every pin without deleting a letter, so Regenerate may reroll the whole grid. */
+  const unpinAll = () => setLockedCells(new Set());
+
+  /** True when every square of a slot is pinned — the only case where its clue is safe. */
+  const slotFullyLocked = (slot, locks = lockedCells) => {
+    for (let i = 0; i < slot.length; i++) {
+      const r = slot.direction === 'across' ? slot.row : slot.row + i;
+      const c = slot.direction === 'across' ? slot.col + i : slot.col;
+      if (!locks.has(cellKey(r, c))) return false;
+    }
+    return true;
+  };
+
+  const cooldownLeft = Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000));
+  const onCooldown = cooldownLeft > 0;
+
+  // Only ticks while a cooldown is actually running, so there is no idle timer.
+  React.useEffect(() => {
+    if (cooldownUntil <= Date.now()) return;
+    const id = setInterval(() => setNowTick((t) => t + 1), 250);
+    return () => clearInterval(id);
+  }, [cooldownUntil]);
+
+  const GENERATE_COOLDOWN_MS = 2000;
+  const startCooldown = () => setCooldownUntil(Date.now() + GENERATE_COOLDOWN_MS);
 
   const parseWordListInput = (inputText) => inputText
     .split(',')
@@ -1209,16 +1378,19 @@ const CrosswordGenerator = () => {
       if (newGrid[row][col]) {
         newGrid[row][col] = '';
         setManualGrid(newGrid);
+        unlockCell(row, col);       // deleting a letter releases its pin
         sfx.erase();
       } else if (selectedDirection === 'across' && col > 0 && manualGrid[row][col - 1] !== '#') {
         newGrid[row][col - 1] = '';
         setManualGrid(newGrid);
         setSelectedCell({ row, col: col - 1 });
+        unlockCell(row, col - 1);
         sfx.erase();
       } else if (selectedDirection === 'down' && row > 0 && manualGrid[row - 1][col] !== '#') {
         newGrid[row - 1][col] = '';
         setManualGrid(newGrid);
         setSelectedCell({ row: row - 1, col });
+        unlockCell(row - 1, col);
         sfx.erase();
       }
       return;
@@ -1227,6 +1399,8 @@ const CrosswordGenerator = () => {
       const newGrid = manualGrid.map(r => [...r]);
       newGrid[row][col] = key.toUpperCase();
       setManualGrid(newGrid);
+      // Typed by the author, so pinned: Regenerate must leave it alone.
+      lockCell(row, col);
       sfx.type();
       if (selectedDirection === 'across' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') setSelectedCell({ row, col: col + 1 });
       else if (selectedDirection === 'down' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') setSelectedCell({ row: row + 1, col });
@@ -1383,6 +1557,17 @@ const CrosswordGenerator = () => {
       newGrid[r][c] = suggestion.word[i];
     }
     setManualGrid(newGrid);
+    // The author picked this word off the suggestion list, so it is theirs, not the
+    // solver's — pin it like anything typed.
+    setLockedCells((prev) => {
+      const next = new Set(prev);
+      for (let i = 0; i < suggestion.word.length; i++) {
+        const r = slot.direction === 'across' ? slot.row : slot.row + i;
+        const c = slot.direction === 'across' ? slot.col + i : slot.col;
+        next.add(cellKey(r, c));
+      }
+      return next;
+    });
     const direction = slot.direction;
     const clueList = direction === 'across' ? [...manualClues.across] : [...manualClues.down];
     const clueIndex = clueList.findIndex(c => c.row === slot.row && c.col === slot.col);
@@ -1405,6 +1590,10 @@ const CrosswordGenerator = () => {
   
   const startPlayMode = (sourceGrid, sourceClues, extras = {}) => {
     if (!sourceGrid || !sourceClues) return;
+
+    // Only a solve that came from handleDaily counts toward the streak.
+    setIsDailyMode(dailyRequestRef.current);
+    dailyRequestRef.current = false;
 
     // Create empty play grid (keep structure, clear letters)
     const emptyGrid = sourceGrid.map(row =>
@@ -1694,6 +1883,14 @@ const CrosswordGenerator = () => {
   const doRevealAll = () => {
     if (!playAnswers) return;
     setPlayGrid(playAnswers.map(r => [...r]));
+    // Reveal Cell and Reveal Word both record their cells; without the same here every
+    // letter came back styled `text-correct`, so a board you gave up on was
+    // indistinguishable from one you actually solved.
+    const all = new Set();
+    playAnswers.forEach((row, r) => row.forEach((cell, c) => {
+      if (cell && cell !== '#') all.add(`${r},${c}`);
+    }));
+    setRevealedCells(all);
     setUsedAssist(true);
     sfx.reveal();
     setPlayComplete(true);
@@ -1824,7 +2021,33 @@ const CrosswordGenerator = () => {
     setTimeout(() => setProgress(''), 3000);
   };
   
+  /**
+   * Remove one Lexicon row for good.
+   *
+   * `words` is rebuilt from the corpus CSV on every load, so mutating state alone made the
+   * row reappear on refresh — the count even went back up. A row the user added lives in
+   * userClues and is removed from there; a corpus row cannot be edited in place, so it is
+   * recorded as a subtraction instead.
+   *
+   * Note the scope: this makes the Lexicon truthful and keeps the deletion across reloads.
+   * The packed corpus the solver reads is unchanged, so the answer only stops being
+   * *placeable* for as long as usingCustomWords stays set — this session.
+   */
   const deleteWordFromDictionary = (index) => {
+    const row = words[index];
+    if (!row) return;
+    const key = pairKey(row.word, row.clue);
+    const inUserClues = userClues.some((e) => pairKey(e.word, e.clue) === key);
+    if (inUserClues) {
+      const next = userClues.filter((e) => pairKey(e.word, e.clue) !== key);
+      saveJSON(USER_CLUES_KEY, next);
+      setUserClues(next);
+    } else {
+      const next = new Set(userHidden);
+      next.add(key);
+      saveJSON(USER_HIDDEN_KEY, [...next]);
+      setUserHidden(next);
+    }
     setWords(prev => prev.filter((_, i) => i !== index));
     setUsingCustomWords(true);
     corpusFpRef.current = null;
@@ -1844,6 +2067,26 @@ const CrosswordGenerator = () => {
     
     if (!word || !clue) return;
     
+    // Same reasoning as the delete above: the edit has to be expressed as "hide the old
+    // pair, add the new one", or the CSV reload puts the original back.
+    const original = words[editingWordIndex];
+    if (original && (original.word !== word || original.clue !== clue)) {
+      const oldKey = pairKey(original.word, original.clue);
+      const wasMine = userClues.some((e) => pairKey(e.word, e.clue) === oldKey);
+      const date = original.date || new Date().toISOString().split('T')[0];
+      const nextClues = [
+        ...userClues.filter((e) => pairKey(e.word, e.clue) !== oldKey),
+        { date, word, clue },
+      ];
+      saveJSON(USER_CLUES_KEY, nextClues);
+      setUserClues(nextClues);
+      if (!wasMine) {
+        const nextHidden = new Set(userHidden);
+        nextHidden.add(oldKey);
+        saveJSON(USER_HIDDEN_KEY, [...nextHidden]);
+        setUserHidden(nextHidden);
+      }
+    }
     setUsingCustomWords(true);
     corpusFpRef.current = null;
     setWords(prev => prev.map((w, i) => 
@@ -1912,7 +2155,9 @@ const CrosswordGenerator = () => {
             // Merge the user's own clues over the corpus; they are additive, never a
             // replacement, so a fresh CSV never silently drops them.
             const mine = loadJSON(USER_CLUES_KEY, []);
-            setWords(mine.length ? [...parsed, ...mine.map((e) => ({ ...e, difficulty: '' }))] : parsed);
+            const hidden = new Set(loadJSON(USER_HIDDEN_KEY, []));
+            const kept = hidden.size ? parsed.filter((e) => !hidden.has(pairKey(e.word, e.clue))) : parsed;
+            setWords(mine.length ? [...kept, ...mine.map((e) => ({ ...e, difficulty: '' }))] : kept);
           }
         }
       } catch { console.log('No default crosswords.csv found'); }
@@ -2120,8 +2365,25 @@ const CrosswordGenerator = () => {
 
   const requestClueData = useCallback((words) => new Promise((resolve) => {
     const w = ensureWorker();
-    const timer = setTimeout(() => { clueDataPendingRef.current = null; resolve({}); }, 15000);
-    clueDataPendingRef.current = (data) => { clearTimeout(timer); clueDataPendingRef.current = null; resolve(data || {}); };
+    // One slot per request, keyed by id. A single shared slot meant a second request
+    // overwrote the first's resolver: the worker's FIRST reply went to the SECOND caller,
+    // the second reply arrived to a null ref and was dropped, and the first request hung
+    // for 15s then resolved {} — which made a whole-puzzle re-clue report "nothing found"
+    // for every answer while the corpus had clues for all of them.
+    const id = ++clueDataSeqRef.current;
+    const timer = setTimeout(() => {
+      // Only clear the slot if it is still ours.
+      if (clueDataPendingRef.current?.id === id) clueDataPendingRef.current = null;
+      resolve({});
+    }, 15000);
+    clueDataPendingRef.current = {
+      id,
+      fn: (data) => {
+        clearTimeout(timer);
+        if (clueDataPendingRef.current?.id === id) clueDataPendingRef.current = null;
+        resolve(data || {});
+      },
+    };
     const send = () => w.postMessage({ type: 'clueData', payload: { words } });
     if (corpusFpRef.current) send();
     else {
@@ -2293,17 +2555,24 @@ const CrosswordGenerator = () => {
     const seed = seedFromString(todayKey());
     const layoutIdx = layouts.length ? seed % layouts.length : 0;
     setSelectedLayoutIndex(layoutIdx);
+    // startPlayMode reads and clears this, so any solve NOT started from here is
+    // explicitly marked non-daily. Previously isDailyMode was only ever cleared by the
+    // streak effect, so abandoning the daily and solving anything else credited the day.
+    dailyRequestRef.current = true;
     setIsDailyMode(true);
     generatePuzzle(layoutIdx, true, [], 'anchor', 'random', seed);
   };
 
   // Record a streak when the daily puzzle is completed (once per day).
   React.useEffect(() => {
-    if (playComplete && isDailyMode && !isDailySolved()) {
+    // usedAssist matters as much as isDailyMode here: doRevealAll sets playComplete
+    // directly, so without this Reveal Puzzle earned the day's streak and stamped
+    // lastSolved, making the genuine solve uncountable.
+    if (playComplete && isDailyMode && !usedAssist && !isDailySolved()) {
       setStreak(recordDailySolve());
       setIsDailyMode(false);
     }
-  }, [playComplete, isDailyMode]);
+  }, [playComplete, isDailyMode, usedAssist]);
 
   // Celebrate on completion (once per solve): chime, confetti, result card.
   React.useEffect(() => {
@@ -2325,7 +2594,14 @@ const CrosswordGenerator = () => {
     restoredRef.current = true;
     const s = loadJSON('session', null);
     if (!s) return;
-    if (typeof s.selectedLayoutIndex === 'number') setSelectedLayoutIndex(s.selectedLayoutIndex);
+    // Custom layouts are saved with the session; without them a saved index can point
+    // past the end of DEFAULT_LAYOUTS and every layout lookup returns undefined.
+    const restoredLayouts = Array.isArray(s.layouts) && s.layouts.length ? s.layouts : DEFAULT_LAYOUTS;
+    if (restoredLayouts !== DEFAULT_LAYOUTS) setLayouts(restoredLayouts);
+    const clampIdx = (i) => Math.min(Math.max(0, i | 0), restoredLayouts.length - 1);
+    if (typeof s.selectedLayoutIndex === 'number') setSelectedLayoutIndex(clampIdx(s.selectedLayoutIndex));
+    if (typeof s.currentLayoutIndex === 'number') setCurrentLayoutIndex(clampIdx(s.currentLayoutIndex));
+    if (Array.isArray(s.lockedCells)) setLockedCells(new Set(s.lockedCells));
     if (s.difficultyChoice) setDifficultyChoice(s.difficultyChoice);
     if (s.grid) { setGrid(s.grid); setClues(s.clues || { across: [], down: [] }); }
     if (s.latestGrid) { setLatestGrid(s.latestGrid); setLatestClues(s.latestClues || null); }
@@ -2334,6 +2610,8 @@ const CrosswordGenerator = () => {
       setPlayGrid(s.play.playGrid);
       setPlayClues(s.play.playClues || { across: [], down: [] });
       setRevealedCells(new Set(s.play.revealedCells || []));
+      setCheckedCells(new Set(s.play.checkedCells || []));
+      setUsedAssist(!!s.play.usedAssist);
       setPlayTimer(s.play.playTimer || 0);
       setPlayComplete(!!s.play.playComplete);
       setPlayCircles(new Set(s.play.circles || []));
@@ -2352,6 +2630,11 @@ const CrosswordGenerator = () => {
     saveJSON('session', {
       activeTab,
       selectedLayoutIndex,
+      currentLayoutIndex,
+      // Custom layouts live only in state; without them a restored index points past the
+      // end of DEFAULT_LAYOUTS and every layout lookup returns undefined.
+      layouts,
+      lockedCells: [...lockedCells],
       difficultyChoice,
       grid,
       clues,
@@ -2362,6 +2645,11 @@ const CrosswordGenerator = () => {
         playGrid,
         playClues,
         revealedCells: [...revealedCells],
+        // revealedCells was saved but usedAssist and checkedCells were not, so a reload
+        // turned an assisted solve into a clean one — the revealed letters still showed,
+        // but the flag that said help was used had gone.
+        checkedCells: [...checkedCells],
+        usedAssist,
         playTimer,
         playComplete,
         playDirection,
@@ -2370,9 +2658,40 @@ const CrosswordGenerator = () => {
         shades: [...playShades],
       } : null,
     });
-  }, [activeTab, selectedLayoutIndex, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, playTimer, playComplete, playDirection, isDailyMode, playCircles, playShades]);
+    // playTimer is deliberately absent from the dependency list. It ticks once a second,
+    // and with it here the whole puzzle — every grid, every clue list — was
+    // JSON.stringify'd and written to localStorage every second of every solve. The
+    // interval below picks up the clock instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedLayoutIndex, currentLayoutIndex, layouts, lockedCells, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, checkedCells, usedAssist, playComplete, playDirection, isDailyMode, playCircles, playShades]);
+
+  // Catch up the clock roughly, rather than on every tick. Losing a few seconds of
+  // elapsed time to a hard refresh is a far better trade than a 6 MB-per-minute write
+  // loop, and saveJSON quietly returns false on a full quota, so the cheaper the writes
+  // the less there is to lose.
+  React.useEffect(() => {
+    if (!playAnswers || playComplete) return;
+    const id = setInterval(() => {
+      const prev = loadJSON('session', null);
+      if (prev?.play) saveJSON('session', { ...prev, play: { ...prev.play, playTimer } });
+    }, 15000);
+    return () => clearInterval(id);
+  }, [playAnswers, playComplete, playTimer]);
 
   const layoutIndexForTab = Math.min(activeTab === 'create' ? currentLayoutIndex : selectedLayoutIndex, Math.max(layouts.length - 1, 0));
+
+  // The Required Words modal's stats are read on every render whether it is open or not,
+  // so this has to hold up when the layout is missing. findSlots([]) reads layout[0].length
+  // and throws; that exception used to take the entire app down to a white screen.
+  const layoutStatsForModal = React.useMemo(() => {
+    const layoutGrid = layouts[selectedLayoutIndex]?.grid;
+    if (!layoutGrid || !layoutGrid.length) return { slots: 0, lengthCounts: {} };
+    const stats = getLayoutStats(layoutGrid);
+    return {
+      slots: stats.slots || findSlots(layoutGrid).length,
+      lengthCounts: stats.lengthCounts || {},
+    };
+  }, [layouts, selectedLayoutIndex]);
 
   // Best complete puzzle to host in multiplayer (a full solution grid + clues).
   const hostablePuzzle = playAnswers
@@ -2387,6 +2706,9 @@ const CrosswordGenerator = () => {
   // used by the multiplayer Rematch flow.
   const generateFreshPuzzle = async () => {
     if (!words.length) throw new Error('Load a word list first.');
+    // Without this a single "Stop the Press" leaves cancelRef true for the rest of the
+    // session, and every multiplayer Rematch cancels itself within 60 ms.
+    cancelRef.current = false;
     const layout = layouts[selectedLayoutIndex]?.grid;
     if (!layout) throw new Error('No layout selected.');
     const result = await generateCrossword(
@@ -2429,6 +2751,10 @@ const CrosswordGenerator = () => {
     setLayouts((prev) => [...prev, { name: data.meta?.title || 'Saved puzzle', grid: layoutGrid }]);
     setCurrentLayoutIndex(newIndex);
     setManualGrid(data.grid.map((row) => row.map((c) => (c === '#' ? '#' : (c || '')))));
+    // A loaded puzzle is not the author's hand-typed work, so nothing is pinned and a
+    // Regenerate may reroll all of it. Hand-written clues still survive, because a clue is
+    // only dropped when its answer changes under it.
+    setLockedCells(new Set());
     setManualClues({ across: data.clues?.across || [], down: data.clues?.down || [] });
     setSelectedCell(null);
     setActiveTab('create');
@@ -2562,8 +2888,8 @@ const CrosswordGenerator = () => {
             )}
 
             {activeTab === 'auto' && !isGenerating && (
-              <button onClick={handleDaily} disabled={words.length === 0} className="btn btn-gold" title="Build & play today's puzzle — solve it to grow your streak">
-                <Flame size={15} />Today’s Puzzle
+              <button onClick={handleDaily} disabled={words.length === 0 || onCooldown} className="btn btn-gold" title="Build & play today's puzzle — solve it to grow your streak">
+                <Flame size={15} />{onCooldown ? `Wait ${cooldownLeft}s` : 'Today’s Puzzle'}
               </button>
             )}
 
@@ -2580,8 +2906,26 @@ const CrosswordGenerator = () => {
             )}
 
             {activeTab === 'create' && !isGenerating && (
-              <button onClick={handleManualGenerate} disabled={words.length === 0} className="btn btn-accent">
-                <RefreshCw size={16} />Generate Remaining
+              <button
+                onClick={handleManualGenerate}
+                disabled={words.length === 0 || onCooldown}
+                title="Fill the empty squares and leave every letter already on the grid alone"
+                className="btn btn-accent"
+              >
+                <RefreshCw size={16} />{onCooldown ? `Wait ${cooldownLeft}s` : 'Fill Remaining'}
+              </button>
+            )}
+
+            {activeTab === 'create' && !isGenerating && (
+              <button
+                onClick={handleManualRegenerate}
+                disabled={words.length === 0 || onCooldown}
+                title={lockedCells.size
+                  ? `Reroll the grid, keeping your ${lockedCells.size} pinned ${lockedCells.size === 1 ? 'square' : 'squares'}`
+                  : 'Reroll the whole grid — nothing is pinned yet, so everything may change'}
+                className="btn"
+              >
+                <RefreshCw size={16} />{onCooldown ? `Wait ${cooldownLeft}s` : 'Regenerate'}
               </button>
             )}
 
@@ -2594,6 +2938,37 @@ const CrosswordGenerator = () => {
             {activeTab === 'auto' && grid && (
               <button onClick={() => startPlayMode(grid, clues)} className="btn btn-ink">
                 <Play size={13} />Play This Puzzle
+              </button>
+            )}
+
+            {activeTab === 'auto' && grid && (
+              <button
+                onClick={() => {
+                  // Generating no longer writes into Create behind the author's back, so
+                  // moving a puzzle across is explicit — and asks first if there is
+                  // hand-typed work in there to lose.
+                  const hasOwnWork = lockedCells.size > 0;
+                  if (hasOwnWork) {
+                    setConfirmDialog({
+                      title: 'Replace your Create grid?',
+                      message: `Create holds ${lockedCells.size} pinned ${lockedCells.size === 1 ? 'square' : 'squares'} you typed. Sending this puzzle over replaces the grid and its clues. This can’t be undone.`,
+                      confirmLabel: 'Replace it',
+                      danger: true,
+                      onConfirm: () => {
+                        setConfirmDialog(null);
+                        syncManualFromAuto(grid, clues, selectedLayoutIndex);
+                        setActiveTab('create');
+                      },
+                    });
+                    return;
+                  }
+                  syncManualFromAuto(grid, clues, selectedLayoutIndex);
+                  setActiveTab('create');
+                }}
+                className="btn"
+                title="Copy this puzzle into Create so you can edit it"
+              >
+                <PenTool size={13} />Send to Create
               </button>
             )}
 
@@ -2943,6 +3318,10 @@ const CrosswordGenerator = () => {
             aiGenerateClues={aiGenerateClues}
             onOpenSettings={() => setShowSettings(true)}
             onVirtualKey={applyManualKey}
+            lockedCells={lockedCells}
+            onToggleCellLock={toggleCellLock}
+            onToggleWordLock={toggleCurrentWordLock}
+            onUnpinAll={unpinAll}
             onOpenReclue={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
           />
         )}
@@ -3113,8 +3492,11 @@ const CrosswordGenerator = () => {
         stats={{
           rows: layouts[selectedLayoutIndex]?.grid.length || 0,
           cols: layouts[selectedLayoutIndex]?.grid[0]?.length || 0,
-          slots: getLayoutStats(layouts[selectedLayoutIndex]?.grid || []).slots || findSlots(layouts[selectedLayoutIndex]?.grid || []).length,
-          lengthCounts: getLayoutStats(layouts[selectedLayoutIndex]?.grid || []).lengthCounts || {}
+          // Computed on every render, open or not, so it must survive a missing layout.
+          // findSlots([]) reads layout[0].length and throws, which used to white-screen the
+          // whole app on reload whenever selectedLayoutIndex pointed past the end.
+          slots: layoutStatsForModal.slots,
+          lengthCounts: layoutStatsForModal.lengthCounts
         }}
         modeView={requiredViewMode}
         onModeChange={setRequiredViewMode}

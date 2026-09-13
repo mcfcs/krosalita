@@ -261,12 +261,44 @@
   }
   .xw-cell--block { background: var(--ink); box-shadow: none; cursor: default; }
 
+  /* Right/wrong was signalled by colour alone — rgb(27 154 85) against rgb(214 58 52),
+     a protan/deutan confusion pair. The slash gives wrongness a second, non-colour
+     channel, which also makes it readable in greyscale print. */
+  .xw-cell--mark-wrong::before {
+    content: '';
+    position: absolute;
+    inset: 12%;
+    background: linear-gradient(to top right, transparent 46%, currentColor 46%, currentColor 54%, transparent 54%);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  .xw-cell:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    z-index: 1;
+  }
+
   /* ---- Create-grid cell states ----
      These MUST paint an opaque base. The grid's own backdrop is --ink, and a
      translucent utility fill (the old `bg-gold/15`) overrides .xw-cell's white
      background entirely, so the tint composited over near-black and buried the
      letter at ~1.2:1. Lay the token tint over --paper-raised instead: same hue,
      same meaning, letter back above WCAG AA (>= 6.3:1 in both themes). */
+  /* A square whose letter the author pinned. The mark is a shape, not a colour, so it
+     survives a colourblind palette and a greyscale print — and it sits bottom-right,
+     clear of the clue number in the top-left corner. */
+  .xw-cell--pinned::after {
+    content: '';
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-bottom: 5px solid rgb(var(--ink-rgb) / 0.55);
+    pointer-events: none;
+  }
+
   .xw-cell--needs-clue,
   .xw-cell--needs-clue-strong,
   .xw-cell--required,

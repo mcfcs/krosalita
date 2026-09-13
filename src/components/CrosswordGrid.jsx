@@ -26,9 +26,9 @@ const CrosswordGrid = ({
   };
 
   return (
-    <div className={gridClassName} style={{ '--cols': playGrid[0]?.length || 15 }}>
+    <div className={gridClassName} role="grid" aria-label="Crossword grid" style={{ '--cols': playGrid[0]?.length || 15 }}>
       {playGrid.map((row, r) => (
-        <div key={r} className="flex">
+        <div key={r} className="flex" role="row">
           {row.map((cell, c) => {
             const isSelected = playSelectedCell?.row === r && playSelectedCell?.col === c;
             const isInWord = inActiveWord(r, c);
@@ -73,7 +73,19 @@ const CrosswordGrid = ({
               <div
                 key={c}
                 onClick={() => onCellClick(r, c)}
-                className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${fill}`}
+                role="gridcell"
+                // Roving tabindex: Tab reaches the grid once and lands on the current
+                // square, rather than walking 225 separate stops.
+                tabIndex={cell === '#' ? -1 : (isSelected ? 0 : -1)}
+                aria-selected={isSelected || undefined}
+                aria-label={cell === '#'
+                  ? 'Blocked square'
+                  : `Row ${r + 1}, column ${c + 1}`
+                    + (clueNumber ? `, clue ${clueNumber}` : '')
+                    + `. ${cell ? cell : 'Empty'}`
+                    + (isWrong ? ', incorrect' : isCorrect ? ', correct' : '')
+                    + (isRevealed ? ', revealed' : '')}
+                className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${fill} ${isWrong ? `xw-cell--mark-wrong ${letterColor}` : ''}`}
               >
                 {shaded && <span className="absolute inset-0 pointer-events-none bg-ink/15" />}
                 {circled && <span className="absolute inset-[9%] pointer-events-none rounded-full border border-ink/45" />}

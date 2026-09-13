@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap } from './Icons';
+import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap, Lock, Unlock } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
 import ClueStudio from './ClueStudio';
@@ -50,7 +50,11 @@ const ManualEditor = ({
   onGenerateClues = () => {},
   onClueAccepted = () => {},
   onOpenReclue = () => {},
-  onVirtualKey = () => {}
+  onVirtualKey = () => {},
+  lockedCells = new Set(),
+  onToggleCellLock = () => {},
+  onToggleWordLock = () => {},
+  onUnpinAll = () => {}
 }) => {
 
 
@@ -58,22 +62,62 @@ const ManualEditor = ({
   const cluesContainerRef = useRef(null);
   const clueRefs = useRef({});
 
+  // getCurrentWord() builds a NEW object every render, so using it as a dependency fired
+  // this on every render — typing one character into the required-words box snapped the
+  // clue pane back to the selection. Key off a scalar id instead, and only scroll when the
+  // clue is actually off-screen, which is what PlayView already does.
+  const activeClueEntry = currentWord?.slot
+    ? (currentWord.slot.direction === 'across' ? manualClues.across : manualClues.down)
+      .find(c => c.row === currentWord.slot.row && c.col === currentWord.slot.col)
+    : null;
+  const activeClueId = activeClueEntry
+    ? `${currentWord.slot.direction}-${activeClueEntry.number}`
+    : null;
+
   useEffect(() => {
-    if (!currentWord?.slot) return;
-    const direction = currentWord.slot.direction;
-    const clueList = direction === 'across' ? manualClues.across : manualClues.down;
-    const clue = clueList.find(c => c.row === currentWord.slot.row && c.col === currentWord.slot.col);
-    if (!clue) return;
-    const id = `${direction}-${clue.number}`;
-    const el = clueRefs.current[id];
+    if (!activeClueId) return;
+    const el = clueRefs.current[activeClueId];
     const container = cluesContainerRef.current;
-    if (el && container) {
-      const targetTop = el.offsetTop - 8;
-      container.scrollTop = Math.max(0, targetTop);
+    if (!el || !container) return;
+    const top = el.offsetTop;
+    const bottom = top + el.offsetHeight;
+    if (top < container.scrollTop || bottom > container.scrollTop + container.clientHeight) {
+      container.scrollTop = Math.max(0, top - 8);
     }
-  }, [currentWord, manualClues]);
+  }, [activeClueId]);
 
   const wordComplete = !!currentWord?.word && !currentWord.word.includes('_');
+
+  // Right-click is the desktop gesture for pinning a single square; touch has no
+  // equivalent, so a ~500ms press does the same. The timer is cancelled on move so a
+  // scroll never pins a square by accident.
+  const longPress = useRef({ timer: null, fired: false });
+  const startLongPress = (r, c) => {
+    longPress.current.fired = false;
+    clearTimeout(longPress.current.timer);
+    longPress.current.timer = setTimeout(() => {
+      longPress.current.fired = true;
+      onToggleCellLock(r, c);
+      if (navigator.vibrate) navigator.vibrate(8);
+    }, 500);
+  };
+  const cancelLongPress = () => clearTimeout(longPress.current.timer);
+  useEffect(() => () => clearTimeout(longPress.current.timer), []);
+
+  const pinnedCount = lockedCells.size;
+  const currentWordPinned = (() => {
+    const slot = currentWord?.slot;
+    if (!slot || !manualGrid) return false;
+    let any = false;
+    for (let i = 0; i < slot.length; i++) {
+      const r = slot.direction === 'across' ? slot.row : slot.row + i;
+      const c = slot.direction === 'across' ? slot.col + i : slot.col;
+      if (!manualGrid[r]?.[c] || manualGrid[r][c] === '#') continue;
+      any = true;
+      if (!lockedCells.has(`${r},${c}`)) return false;
+    }
+    return any;
+  })();
 
   const openStudio = () => {
     const slot = currentWord?.slot;
@@ -186,9 +230,48 @@ const ManualEditor = ({
                           : missingClue && cell
                             ? 'xw-cell--needs-clue'
                             : '';
-              return <div key={c} onClick={() => handleCellClick(r, c)} className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${cellClass}`}>{cell !== '#' && clueNumber && <span className="xw-num">{clueNumber}</span>}{cell !== '#' && cell && <span className="xw-letter text-ink">{cell}</span>}</div>;
+              const pinned = cell !== '#' && cell && lockedCells.has(`${r},${c}`);
+              return (
+                <div
+                  key={c}
+                  onClick={() => { if (!longPress.current.fired) handleCellClick(r, c); }}
+                  onContextMenu={(e) => { if (cell !== '#' && cell) { e.preventDefault(); onToggleCellLock(r, c); } }}
+                  onTouchStart={() => { if (cell !== '#' && cell) startLongPress(r, c); }}
+                  onTouchEnd={cancelLongPress}
+                  onTouchMove={cancelLongPress}
+                  onTouchCancel={cancelLongPress}
+                  title={cell !== '#' && cell
+                    ? (pinned ? 'Pinned — Regenerate will keep this letter. Right-click or long-press to unpin.'
+                      : 'Right-click or long-press to pin this letter')
+                    : undefined}
+                  className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${cellClass} ${pinned ? 'xw-cell--pinned' : ''}`}
+                >
+                  {cell !== '#' && clueNumber && <span className="xw-num">{clueNumber}</span>}
+                  {cell !== '#' && cell && <span className="xw-letter text-ink">{cell}</span>}
+                </div>
+              );
             })}</div>)}
           </div></div>
+
+          {/* Pinned squares are the contract between the author and Regenerate, so say
+              plainly how many there are and offer the way out. */}
+          <div className="mt-2 flex items-center justify-center gap-2 flex-wrap text-[11px] text-ink-faint">
+            {pinnedCount > 0 ? (
+              <>
+                <Lock size={12} className="text-ink-soft" />
+                <span>
+                  <b className="text-ink-soft font-semibold">{pinnedCount}</b>{' '}
+                  {pinnedCount === 1 ? 'square is' : 'squares are'} pinned — Regenerate keeps
+                  {pinnedCount === 1 ? ' it' : ' them'}.
+                </span>
+                <button onClick={onUnpinAll} className="underline hover:text-ink transition">
+                  Unpin all
+                </button>
+              </>
+            ) : (
+              <span>Type a letter to pin it. Pinned squares survive Regenerate.</span>
+            )}
+          </div>
         </div>
 
         {/* ---- selection / clue editor ---- */}
@@ -205,6 +288,17 @@ const ManualEditor = ({
                 {words.length > 0 && <button onClick={() => { setShowSuggestions(!showSuggestions); setSuggestions(findSuggestionsForSlot()); }} className="btn btn-sm btn-accent"><Sparkles size={15} />Auto-fill</button>}
                 <button onClick={openStudio} disabled={!wordComplete} title={wordComplete ? 'Browse and write clues at a chosen difficulty' : 'Fill the word first'} className="btn btn-sm btn-gold"><Zap size={15} />Clues</button>
                 <button onClick={onOpenReclue} title="Re-clue the whole puzzle at a chosen difficulty" className="btn btn-sm"><Sparkles size={15} />Re-clue all</button>
+                <button
+                  onClick={onToggleWordLock}
+                  disabled={!currentWord?.word}
+                  title={currentWordPinned
+                    ? 'Unpin this word so Regenerate may change it'
+                    : 'Pin this word so Regenerate keeps it'}
+                  className={`btn btn-sm ${currentWordPinned ? 'btn-ink' : ''}`}
+                >
+                  {currentWordPinned ? <Lock size={15} /> : <Unlock size={15} />}
+                  {currentWordPinned ? 'Pinned' : 'Pin word'}
+                </button>
               </div>
             </div>
 

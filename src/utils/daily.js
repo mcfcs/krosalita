@@ -1,5 +1,5 @@
 // Deterministic "Puzzle of the Day" + solve-streak tracking.
-import { loadJSON, saveJSON } from './storage';
+import { loadJSON, saveJSON } from './storage.js';
 
 // Local calendar day as YYYY-MM-DD (uses the device's local timezone).
 export const todayKey = (d = new Date()) => {
