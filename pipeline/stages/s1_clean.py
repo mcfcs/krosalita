@@ -1,6 +1,6 @@
 """Stage 1 -- clean.
 
-Reads the RAW corpus (public/nytcrosswordspure.csv, 781,573 rows) rather than the
+Reads the RAW corpus (pipeline/data/nytcrosswordspure.csv, 781,573 rows) rather than the
 already-processed crosswords.csv, so the broken cross-reference filter is redone from
 scratch instead of patched.
 
@@ -33,7 +33,14 @@ from clue_filters import reject_reason  # noqa: E402
 
 NAME = "s1_clean"
 ROOT = os.path.dirname(os.path.dirname(HERE))
-SRC = os.path.join(ROOT, "public", "nytcrosswordspure.csv")
+# Lives in pipeline/data/, NOT public/: everything under public/ is copied into dist/ and
+# deployed, so a 28 MB raw scrape sitting there was being served from the live site. The
+# old location is still accepted so an existing checkout keeps working.
+SRC = os.path.join(ROOT, "pipeline", "data", "nytcrosswordspure.csv")
+if not os.path.exists(SRC):
+    _legacy = os.path.join(ROOT, "public", "nytcrosswordspure.csv")
+    if os.path.exists(_legacy):
+        SRC = _legacy
 OUT_DIR = os.path.join(os.path.dirname(HERE), "out")
 OUT = os.path.join(OUT_DIR, "pairs.csv")
 
