@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { X, Check, RefreshCw, Play } from './Icons';
-import { getGuestId, getSavedName, saveName, colorFor } from '../multiplayer/identity';
-import { createGame, joinGame } from '../multiplayer/client';
+import { X, Check, RefreshCw, Play } from './Icons.jsx';
+import { getGuestId, getSavedName, saveName, colorFor } from '../multiplayer/identity.js';
+import { createGame, joinGame } from '../multiplayer/client.js';
 
 // Host a loaded puzzle or join by 5-digit code. Returns { game, me } on success.
 const LobbyModal = ({ isOpen, onClose, puzzle, defaultMode = 'host', initialCode = '', authUser, onReady }) => {
@@ -12,6 +12,22 @@ const LobbyModal = ({ isOpen, onClose, puzzle, defaultMode = 'host', initialCode
   const [spectator, setSpectator] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  // The modal stays mounted while closed, so useState's initial values are the
+  // props from MultiplayerView's FIRST render (mode 'host', empty code). Re-sync
+  // the pane + prefilled code on each open. This is the documented "adjust state
+  // when a prop changes" pattern: a render-phase update, so no flash of the wrong
+  // pane, and `mode` stays plain state the tab buttons can still change by hand.
+  const requested = isOpen ? `${defaultMode}:${initialCode}` : null;
+  const [appliedRequest, setAppliedRequest] = useState(requested);
+  if (requested !== appliedRequest) {
+    setAppliedRequest(requested);
+    if (isOpen) {
+      setMode(defaultMode);
+      setCode(initialCode);
+      setError('');
+    }
+  }
 
   if (!isOpen) return null;
 

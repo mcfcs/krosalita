@@ -1,6 +1,6 @@
 // Player identity for multiplayer. Guests get a stable ephemeral id in
 // localStorage; a signed-in user's auth uid is used instead when available.
-import { loadString, saveString } from '../utils/storage';
+import { loadString, saveString } from '../utils/storage.js';
 
 const uuid = () => (globalThis.crypto?.randomUUID?.() || `g${Date.now()}${Math.floor(Math.random() * 1e9)}`);
 

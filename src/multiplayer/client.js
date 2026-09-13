@@ -1,7 +1,7 @@
 // Supabase-backed multiplayer transport: game lifecycle (create/join) via
 // Postgres, live sync via a Realtime channel (broadcast + presence).
-import { supabase } from '../lib/supabase';
-import { makeCode } from './identity';
+import { supabase } from '../lib/supabase.js';
+import { makeCode } from './identity.js';
 
 const blankFrom = (answersGrid) =>
   answersGrid.map((row) => row.map((cell) => (cell === '#' ? '#' : '')));

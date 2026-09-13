@@ -3,13 +3,13 @@
 // scores, fills, chat, reactions, toasts, host actions, rematch). Cell edits +
 // host/social actions sync via a Supabase Realtime channel; cursors via presence.
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { findSlots, getCellNumber } from '../utils/crosswordUtils';
-import { supabase } from '../lib/supabase';
-import { sfx } from '../utils/sound';
+import { findSlots, getCellNumber } from '../utils/crosswordUtils.js';
+import { supabase } from '../lib/supabase.js';
+import { sfx } from '../utils/sound.js';
 import {
   openChannel, loadPlayers, persistState, loadState, updateGameFields, addScore,
   addFills, resetPlayers, sendChatRow, loadChat, kickPlayer, setHost,
-} from './client';
+} from './client.js';
 
 const key = (r, c) => `${r},${c}`;
 const blank = (answers) => answers.map((row) => row.map((c) => (c === '#' ? '#' : '')));
@@ -59,6 +59,11 @@ export function useMultiplayerGame(game, me) {
   const cursorTimer = useRef(null);
   const lastCursor = useRef(0);
   const myFillsRef = useRef(0);
+  // Authoritative running score for THIS player. `scores` state is one render
+  // behind when several bumps happen in the same tick (one letter can finish an
+  // Across and a Down at once), so the broadcast payload is derived from this
+  // ref instead — it advances by exactly the same deltas the server row does.
+  const myScoreRef = useRef(0);
   const prevPlayersRef = useRef(new Map());
   const seqRef = useRef(0);
 
@@ -147,7 +152,7 @@ export function useMultiplayerGame(game, me) {
     setPuzzle(newPuzzle);
     setGrid(blank(newPuzzle.grid));
     setRevealedCells(new Set());
-    setScores({}); setFills({}); myFillsRef.current = 0;
+    setScores({}); setFills({}); myFillsRef.current = 0; myScoreRef.current = 0;
     scoredCells.current = new Set(); scoredWords.current = new Set();
     setComplete(false); setTimer(0); setSelectedCell(null);
     pushToast('New puzzle — rematch!');
@@ -172,7 +177,7 @@ export function useMultiplayerGame(game, me) {
     });
     ch.on('broadcast', { event: 'autocheck' }, ({ payload }) => setAutoCheckState(payload.value));
     ch.on('broadcast', { event: 'check' }, () => flashCheck());
-    ch.on('broadcast', { event: 'gamemode' }, ({ payload }) => { setGamemodeState(payload.value); setScores({}); scoredCells.current = new Set(); scoredWords.current = new Set(); });
+    ch.on('broadcast', { event: 'gamemode' }, ({ payload }) => { setGamemodeState(payload.value); setScores({}); myScoreRef.current = 0; scoredCells.current = new Set(); scoredWords.current = new Set(); });
     ch.on('broadcast', { event: 'score' }, ({ payload }) => setScores((s) => ({ ...s, [payload.playerId]: payload.score })));
     ch.on('broadcast', { event: 'fills' }, ({ payload }) => setFills((f) => ({ ...f, [payload.playerId]: payload.fills })));
     ch.on('broadcast', { event: 'chat' }, ({ payload }) => setChat((c) => [...c, payload.msg]));
@@ -205,8 +210,11 @@ export function useMultiplayerGame(game, me) {
         broadcastCursor();
         await reconcile();
         const ps = await loadPlayers(game.id);
-        setScores(Object.fromEntries(ps.map((p) => [p.player_id, p.score])));
+        setScores(Object.fromEntries(ps.map((p) => [p.player_id, p.score || 0])));
         setFills(Object.fromEntries(ps.map((p) => [p.player_id, p.fills || 0])));
+        // Re-seed the running score from the server row, or the first bump after
+        // a reconnect would broadcast a value that ignores everything earned so far.
+        myScoreRef.current = ps.find((p) => p.player_id === me.id)?.score || 0;
         myFillsRef.current = ps.find((p) => p.player_id === me.id)?.fills || 0;
         setChat(await loadChat(game.id));
       } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
@@ -252,11 +260,12 @@ export function useMultiplayerGame(game, me) {
 
   // ---- scoring + fills ----
   const bump = useCallback((delta) => {
-    const next = (scores[me.id] || 0) + delta;
+    const next = myScoreRef.current + delta;
+    myScoreRef.current = next;
     setScores((s) => ({ ...s, [me.id]: next }));
     chanRef.current?.send({ type: 'broadcast', event: 'score', payload: { playerId: me.id, score: next } });
     addScore(game.id, me.id, delta);
-  }, [scores, me.id, game.id]);
+  }, [me.id, game.id]);
 
   const bumpFills = useCallback(() => {
     myFillsRef.current += 1;
@@ -381,7 +390,7 @@ export function useMultiplayerGame(game, me) {
   const setGamemode = useCallback((value) => {
     setGamemodeState(value);
     scoredCells.current = new Set(); scoredWords.current = new Set();
-    setScores({});
+    setScores({}); myScoreRef.current = 0;
     chanRef.current?.send({ type: 'broadcast', event: 'gamemode', payload: { value } });
     updateGameFields(game.id, { gamemode: value });
   }, [game.id]);

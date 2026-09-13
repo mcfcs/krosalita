@@ -1,5 +1,5 @@
 // CRUD for a signed-in user's saved puzzles (RLS-guarded server-side).
-import { supabase } from './supabase';
+import { supabase } from './supabase.js';
 
 export async function savePuzzle({ title, data, isPublic = false }) {
   if (!supabase) throw new Error('Supabase is not configured.');
