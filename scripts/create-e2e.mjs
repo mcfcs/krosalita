@@ -68,7 +68,16 @@ async function connect(port) {
 
 let preview, edge, profile;
 function cleanup() {
-  try { edge?.kill(); } catch { /* ignore */ }
+  // A plain kill() leaves Edge's renderer and GPU children running, which keeps the
+  // profile directory locked so the rmSync below silently fails. Runs were stranding ~10
+  // processes and a profile dir each; tree-kill the browser the way the preview already is.
+  try {
+    if (edge?.pid) {
+      try { spawnSync('taskkill', ['/PID', String(edge.pid), '/T', '/F'], { stdio: 'ignore' }); }
+      catch { /* not windows */ }
+    }
+    edge?.kill();
+  } catch { /* ignore */ }
   try {
     if (preview?.pid) {
       try { spawnSync('taskkill', ['/PID', String(preview.pid), '/T', '/F'], { stdio: 'ignore' }); }
@@ -358,6 +367,91 @@ try {
     if (createAfter === createBefore) ok('generating on the Generate tab left Create untouched (3A)');
     else bad('generating on the Generate tab left Create untouched (3A)', `"${createBefore.slice(0, 24)}" -> "${createAfter.slice(0, 24)}"`);
   } else bad('generating on the Generate tab left Create untouched (3A)', 'no Generate tab found');
+
+  // ---------- 1A: a custom layout must survive a reload ----------
+  // This used to white-screen the app: selectedLayoutIndex was persisted but `layouts` was
+  // not, so after a reload the index pointed past the end of DEFAULT_LAYOUTS, and the
+  // Required Words modal's stats prop — computed on every render, open or not — reached
+  // findSlots([]) -> layout[0].length and threw. The second reload recovered, but only by
+  // overwriting the saved session with the blank initial state, taking the in-progress
+  // solve with it.
+  // "New" lives inside the layout selector, which is collapsed by default — the button
+  // showing the current layout's name opens it.
+  await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')]
+      .find(x => /15x15|5x5|layout/i.test((x.textContent||'').trim()) && x.classList.contains('btn'));
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(700);
+  const openedEditor = await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')].find(x => /^new$/i.test((x.textContent||'').trim()));
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+  await sleep(700);
+  if (openedEditor) {
+    const named = await page.evaluate(`(() => {
+      const i = document.querySelector('input[placeholder="My Custom Layout"]');
+      if (!i) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(i, 'E2E Custom');
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
+    const saved = named && await page.evaluate(`(() => {
+      const b = [...document.querySelectorAll('button')].find(x => /save layout/i.test((x.textContent||'').trim()) && !x.disabled);
+      if (!b) return false;
+      b.click();
+      return true;
+    })()`);
+    if (saved) {
+      await sleep(900);
+      await page.send('Page.reload');
+      // A reload re-parses the 552k-row CSV and re-decodes the packed corpus, so the grid
+      // takes a few seconds to appear. Poll, or a slow machine reads as a white screen.
+      let alive = null;
+      for (let i = 0; i < 40; i++) {
+        await sleep(500);
+        alive = await page.evaluate(`(() => ({
+          cells: document.querySelectorAll('.xw-cell').length,
+          buttons: document.querySelectorAll('button').length,
+          bodyLen: (document.body.innerText || '').length,
+          layoutName: (document.body.innerText || '').includes('E2E Custom'),
+          text: (document.body.innerText || '').slice(0, 700),
+          tab: [...document.querySelectorAll('button')].filter(b => b.className.includes('tab-active')).map(b => b.textContent.trim()),
+          session: (() => { try { const j = JSON.parse(localStorage.getItem('krosalita:session')); return { tab: j.activeTab, cur: j.currentLayoutIndex, sel: j.selectedLayoutIndex, nLayouts: (j.layouts||[]).length }; } catch (e) { return String(e); } })(),
+        }))()`);
+        if (alive.buttons > 5 && alive.bodyLen > 200) break;
+      }
+      // The crash rendered a completely blank document — no buttons, no text. Which tab it
+      // restores to is not the point, so assert the app is alive, then go to Create and
+      // confirm a grid actually builds against the restored custom layout.
+      if (alive.buttons > 5 && alive.bodyLen > 200) {
+        ok(`the app survives a reload after saving a custom layout — 1A (${alive.buttons} controls)`);
+      } else {
+        bad('the app survives a reload after saving a custom layout (1A)', `white screen: ${JSON.stringify(alive)}`);
+      }
+      const tabPt = await page.evaluate(`(() => {
+        const b = [...document.querySelectorAll('button')].find(x => /^create$/i.test((x.textContent||'').trim()));
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+      })()`);
+      if (tabPt) await realClick(tabPt.x, tabPt.y);
+      let cellsAfter = 0;
+      for (let i = 0; i < 30; i++) {
+        await sleep(400);
+        cellsAfter = await page.evaluate(`document.querySelectorAll('.xw-cell').length`);
+        if (cellsAfter > 0) break;
+      }
+      if (cellsAfter > 0) ok(`Create builds a grid from the restored custom layout (${cellsAfter} cells)`);
+      else bad('Create builds a grid from the restored custom layout', 'no cells rendered');
+      if (alive.layoutName) ok('the custom layout itself survived the reload');
+      else bad('the custom layout itself survived the reload', 'the saved layout name is gone');
+    } else bad('the app survives a reload after saving a custom layout (1A)', 'could not save a layout');
+  } else bad('the app survives a reload after saving a custom layout (1A)', 'no New layout button');
 
   // ---------- no page-level exceptions throughout ----------
   if (page.errors.length === 0) ok('no page-level JS errors captured');

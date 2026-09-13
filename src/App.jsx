@@ -518,18 +518,24 @@ const CrosswordGenerator = () => {
     let updatedLayouts = layouts;
 
     if (layoutEditorMode === 'edit' && editingLayoutIndex !== null) {
+      // The re-init used to be gated on being ON the Create tab, which left manualGrid —
+      // and now the pinned-square coordinates — describing the OLD shape while every slot
+      // lookup read the new one. Gate it on the shape actually changing instead, so a
+      // rename leaves the author's work alone but a real edit rebuilds the grid.
+      const shapeChanged = (layouts[editingLayoutIndex]?.grid || []).join('|') !== normalizedGrid.join('|');
       updatedLayouts = layouts.map((layout, idx) => idx === editingLayoutIndex ? { ...layout, name, grid: normalizedGrid } : layout);
       setLayouts(updatedLayouts);
       setSelectedLayoutIndex(editingLayoutIndex);
       setCurrentLayoutIndex(editingLayoutIndex);
-      if (activeTab === 'create') initializeManualGrid(editingLayoutIndex, updatedLayouts);
+      if (shapeChanged || activeTab === 'create') initializeManualGrid(editingLayoutIndex, updatedLayouts);
     } else {
       updatedLayouts = [...layouts, { name, grid: normalizedGrid }];
       const newIndex = updatedLayouts.length - 1;
       setLayouts(updatedLayouts);
       setSelectedLayoutIndex(newIndex);
       setCurrentLayoutIndex(newIndex);
-      if (activeTab === 'create') initializeManualGrid(newIndex, updatedLayouts);
+      // A brand-new layout always has a new shape, so this is unconditional.
+      initializeManualGrid(newIndex, updatedLayouts);
     }
 
     return true;
@@ -708,8 +714,14 @@ const CrosswordGenerator = () => {
 
   const generatePuzzle = async (layoutIdx = selectedLayoutIndex, autoStartPlay = false, requiredWordsList = requiredWords, requiredModeInput = requiredMode, targetDifficulty = difficultyChoice, seed = null) => {
     // A solve is ~10ms warm, so without this a double-click fired two of them and the
-    // slower one's result overwrote the faster one's.
-    if (cooldownUntil > Date.now() || isGenerating) return;
+    // slower one's result overwrote the faster one's. The buttons are disabled during the
+    // cooldown, but this path is also reachable from the Required Words dialog, so it says
+    // what happened rather than appearing to do nothing.
+    if (isGenerating) return;
+    if (cooldownUntil > Date.now()) {
+      setProgress(`One puzzle at a time — try again in ${Math.ceil((cooldownUntil - Date.now()) / 1000)}s.`);
+      return;
+    }
     startCooldown();
 
     // Reset cancellation state
@@ -2882,8 +2894,8 @@ const CrosswordGenerator = () => {
             </div>
 
             {activeTab === 'auto' && !isGenerating && (
-              <button onClick={() => { setRequiredAction('auto'); setShowRequiredModal(true); }} disabled={words.length === 0} className="btn btn-accent">
-                <RefreshCw size={16} />Generate
+              <button onClick={() => { setRequiredAction('auto'); setShowRequiredModal(true); }} disabled={words.length === 0 || onCooldown} className="btn btn-accent">
+                <RefreshCw size={16} />{onCooldown ? `Wait ${cooldownLeft}s` : 'Generate'}
               </button>
             )}
 

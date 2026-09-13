@@ -82,7 +82,16 @@ async function connect(port) {
 
 let preview, edge, profile;
 function cleanup() {
-  try { edge?.kill(); } catch { /* ignore */ }
+  // A plain kill() leaves Edge's renderer and GPU children running, which keeps the
+  // profile directory locked so the rmSync below silently fails. Runs were stranding ~10
+  // processes and a profile dir each; tree-kill the browser the way the preview already is.
+  try {
+    if (edge?.pid) {
+      try { spawnSync('taskkill', ['/PID', String(edge.pid), '/T', '/F'], { stdio: 'ignore' }); }
+      catch { /* not windows */ }
+    }
+    edge?.kill();
+  } catch { /* ignore */ }
   try {
     // shell:true means `preview.pid` is the shell, not the node process it
     // spawned. Killing only the shell leaks a vite preview that keeps the port

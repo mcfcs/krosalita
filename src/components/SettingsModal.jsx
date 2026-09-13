@@ -113,7 +113,10 @@ const SettingsModal = ({ isOpen, onClose, config, onSave }) => {
           <div className="text-ink-faint/80">This page’s origin: <span className="font-mono text-ink-soft break-all">{origin || 'unknown'}</span></div>
         </div>
 
-        <div className="flex gap-3 mt-5">
+        {/* Sticky, because the card scrolls internally and on a 844px-tall phone these
+            two buttons started ~64px below the fold — reachable, but only if you knew to
+            scroll past a long help article to find them. */}
+        <div className="flex gap-3 mt-5 sticky bottom-0 -mx-6 px-6 pt-3 pb-1 bg-paper-raised border-t border-line">
           <button onClick={save} className="btn btn-accent flex-1"><Check size={16} />Save</button>
           <button onClick={onClose} className="btn btn-ghost flex-1"><X size={16} />Cancel</button>
         </div>

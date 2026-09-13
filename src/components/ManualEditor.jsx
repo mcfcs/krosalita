@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap, Lock, Unlock } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
+import { keepClearOfDock } from '../utils/keepClearOfDock';
 import ClueStudio from './ClueStudio';
 import { difficultyColorClass } from '../utils/difficulty';
 
@@ -73,6 +74,15 @@ const ManualEditor = ({
   const activeClueId = activeClueEntry
     ? `${currentWord.slot.direction}-${activeClueEntry.number}`
     : null;
+
+  // The on-screen keyboard is fixed to the bottom of the viewport and covers the lower
+  // rows of the grid; a tap on a covered square hits the dock, so the selection never
+  // moves. Nudge the square clear whenever the selection changes.
+  useEffect(() => {
+    if (!selectedCell) return;
+    const el = document.querySelector('.xw-cell[data-sel="1"]');
+    if (el) keepClearOfDock(el);
+  }, [selectedCell]);
 
   useEffect(() => {
     if (!activeClueId) return;
@@ -149,7 +159,7 @@ const ManualEditor = ({
   if (!manualGrid) return null;
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-rise-in pb-72 lg:pb-0">
+    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-rise-in solve-dock-pad">
       <div className="xl:col-span-2 space-y-5">
         {/* ---- grid composer ---- */}
         <div className="panel panel-pad">
@@ -234,6 +244,7 @@ const ManualEditor = ({
               return (
                 <div
                   key={c}
+                  data-sel={isSelected ? '1' : undefined}
                   onClick={() => { if (!longPress.current.fired) handleCellClick(r, c); }}
                   onContextMenu={(e) => { if (cell !== '#' && cell) { e.preventDefault(); onToggleCellLock(r, c); } }}
                   onTouchStart={() => { if (cell !== '#' && cell) startLongPress(r, c); }}
@@ -264,7 +275,10 @@ const ManualEditor = ({
                   {pinnedCount === 1 ? 'square is' : 'squares are'} pinned — Regenerate keeps
                   {pinnedCount === 1 ? ' it' : ' them'}.
                 </span>
-                <button onClick={onUnpinAll} className="underline hover:text-ink transition">
+                <button
+                  onClick={onUnpinAll}
+                  className="underline hover:text-ink transition px-2 py-2 -my-1 rounded-sm"
+                >
                   Unpin all
                 </button>
               </>

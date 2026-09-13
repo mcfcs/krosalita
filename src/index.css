@@ -226,7 +226,9 @@
   .xw-grid {
     --cols: 15;
     --cell-max: 2.5rem;
-    --cell: min(var(--cell-max), calc((100vw - 5.5rem) / var(--cols)));
+    /* 5.5rem of reserve was ~22px more than the grid's wrapper actually needs, which
+       cost every cell ~1.5px on a phone — 20.1px squares on a 390px screen. */
+    --cell: min(var(--cell-max), calc((100vw - 4rem) / var(--cols)));
     display: inline-block;
     background: var(--ink);
     border: 2.5px solid var(--ink);
@@ -234,6 +236,27 @@
     box-shadow: 0 8px 24px -18px rgba(26, 26, 26, 0.55);
   }
   .xw-grid--play { --cell-max: 2.75rem; }
+
+  /* The on-screen keyboard exists for devices without a hardware one. Screen WIDTH was
+     standing in for that test, and an iPad in landscape — 1180px, touch, no keyboard —
+     failed it: the dock was hidden and there was no other way to enter a letter at all.
+     Decide on the pointer instead, and keep the spacer in step with it so the controls
+     under the grid stay reachable. */
+  .solve-dock { display: block; }
+  .solve-dock-pad { padding-bottom: 18rem; }
+  @media (min-width: 1024px) and (pointer: fine) {
+    .solve-dock { display: none; }
+    .solve-dock-pad { padding-bottom: 0; }
+  }
+
+  /* Touch targets. 44px is the comfortable threshold; these were 27-37px, and on a phone
+     the difference is a mis-tap rather than a preference. Only on coarse pointers, so the
+     desktop layout keeps its density. */
+  @media (pointer: coarse) {
+    .btn { min-height: 44px; }
+    .btn-sm { min-height: 40px; }
+    input[type="range"] { height: 28px; }
+  }
   @media (min-width: 640px) {
     /* on tablet/desktop just use the max size (no fitting needed) */
     .xw-grid { --cell: var(--cell-max); }

@@ -18,7 +18,7 @@ const MobileSolveDock = ({ clueNumber, clueDirection, clueText, onPrev, onNext, 
   // Portal to <body> so the fixed dock anchors to the viewport, not to any
   // transformed ancestor (e.g. the animated PlayView container).
   return createPortal((
-    <div className="fixed inset-x-0 bottom-0 z-40 lg:hidden bg-paper/95 backdrop-blur border-t border-line shadow-[0_-8px_24px_-18px_rgba(26,26,26,0.5)]"
+    <div className="solve-dock fixed inset-x-0 bottom-0 z-40 bg-paper/95 backdrop-blur border-t border-line shadow-[0_-8px_24px_-18px_rgba(26,26,26,0.5)]"
          style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
       {/* current clue bar */}
       <div className="flex items-stretch gap-2 px-2 pt-2">

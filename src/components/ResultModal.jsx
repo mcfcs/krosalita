@@ -7,7 +7,7 @@ const ResultModal = ({ open, timeText, clean, difficulty, onClose, onShare, onPl
   return (
     <div className="fixed inset-0 z-[1300] bg-ink/55 backdrop-blur-[2px] flex items-center justify-center p-4">
       <div className="panel w-full max-w-sm p-7 text-center animate-rise-in relative">
-        <button onClick={onClose} className="absolute top-3 right-3 text-ink-faint hover:text-ink"><X size={18} /></button>
+        <button onClick={onClose} aria-label="Close" className="absolute top-1.5 right-1.5 p-2.5 text-ink-faint hover:text-ink"><X size={18} /></button>
         <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-accent/10 text-accent mb-3"><Trophy size={32} /></div>
         <h3 className="font-display text-3xl font-semibold text-ink mb-1">Solved!</h3>
         {clean

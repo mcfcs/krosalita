@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Trophy, Maximize } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import CrosswordGrid from './CrosswordGrid';
 import { renderRich } from '../utils/richText';
+import { keepClearOfDock } from '../utils/keepClearOfDock';
 import { difficultyColorClass } from '../utils/difficulty';
 
 const PlayView = ({
@@ -58,6 +59,15 @@ const PlayView = ({
   // Scroll the active clue into view ONLY when it changes and is off-screen —
   // never on every render (e.g. the 1s timer tick), so manual scrolling of the
   // clue list is never hijacked back to the current clue.
+  // Same as in the Create editor: the on-screen keyboard covers the lower rows of the
+  // grid, and a tap on a covered square lands on the dock rather than the square.
+  // CrosswordGrid marks the selection with aria-selected, so it is addressable here.
+  useEffect(() => {
+    if (!playSelectedCell) return;
+    const el = document.querySelector('.xw-cell[aria-selected="true"]');
+    if (el) keepClearOfDock(el);
+  }, [playSelectedCell]);
+
   useEffect(() => {
     if (!activeClueId) return;
     const el = clueRefs.current[activeClueId];
@@ -73,7 +83,7 @@ const PlayView = ({
   if (!playGrid) return null;
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-rise-in pb-72 lg:pb-0">
+    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-rise-in solve-dock-pad">
       <div className="xl:col-span-2 space-y-5">
         {/* ---- solve toolbar ---- */}
         <div className="panel p-4">
