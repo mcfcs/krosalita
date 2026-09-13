@@ -67,17 +67,29 @@ async function connect(port) {
 }
 
 let preview, edge, profile;
-function cleanup() {
-  // A plain kill() leaves Edge's renderer and GPU children running, which keeps the
-  // profile directory locked so the rmSync below silently fails. Runs were stranding ~10
-  // processes and a profile dir each; tree-kill the browser the way the preview already is.
+
+/**
+ * Kill the headless browser by its PROFILE, not by pid.
+ *
+ * `spawn(EDGE, ...)` returns the launcher process, which forks the real browser and exits
+ * immediately — so by teardown time `edge.pid` no longer exists ("ERROR: The process
+ * ... not found") and the ~14 processes it left behind are orphans in nobody's tree. A
+ * `/T` tree-kill on that pid is therefore a no-op, which is how runs were stranding
+ * hundreds of processes and locked profile directories. Each run gets a unique
+ * --user-data-dir, so that is the reliable handle.
+ */
+function killEdgeByProfile(dir) {
+  if (!dir) return;
+  const tag = dir.split(/[\/]/).pop();            // unique mkdtemp basename, no metachars
   try {
-    if (edge?.pid) {
-      try { spawnSync('taskkill', ['/PID', String(edge.pid), '/T', '/F'], { stdio: 'ignore' }); }
-      catch { /* not windows */ }
-    }
-    edge?.kill();
-  } catch { /* ignore */ }
+    spawnSync('powershell', ['-NoProfile', '-Command',
+      `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like '*${tag}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+    ], { stdio: 'ignore' });
+  } catch { /* not windows */ }
+}
+
+function cleanup() {
+  try { killEdgeByProfile(profile); edge?.kill(); } catch { /* ignore */ }
   try {
     if (preview?.pid) {
       try { spawnSync('taskkill', ['/PID', String(preview.pid), '/T', '/F'], { stdio: 'ignore' }); }
