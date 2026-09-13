@@ -1,9 +1,10 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Upload, Download, RefreshCw, Bug, Puzzle, PenTool, X, Check, ChevronRight, ChevronDown, Save, FolderOpen, Grid3X3, Play, BookOpen, Languages, Settings, Flame, DownloadCloud, Zap, Share, Search, Volume2, VolumeX, Maximize } from './components/Icons';
+import { Upload, Download, RefreshCw, Bug, Puzzle, PenTool, X, Check, ChevronRight, ChevronDown, Save, FolderOpen, Grid3X3, Play, BookOpen, Languages, Settings, Flame, DownloadCloud, Zap, Share, Search, Volume2, VolumeX, Maximize, Trophy } from './components/Icons';
 import BrowseView from './components/BrowseView';
 import MultiplayerView from './components/MultiplayerView';
 import AuthModal from './components/AuthModal';
 import MyPuzzlesView from './components/MyPuzzlesView';
+import SolveHistory from './components/SolveHistory';
 import ConfirmModal from './components/ConfirmModal';
 import ResultModal from './components/ResultModal';
 import DictionaryModal from './components/DictionaryModal';
@@ -38,7 +39,9 @@ import {
 } from './utils/clueSource';
 import { memoryClueStore } from './utils/clueIndex';
 import { useAuth } from './hooks/useAuth';
-import { savePuzzle } from './lib/puzzles';
+import { savePuzzle, fetchByCode } from './lib/puzzles';
+import { recordSolve, syncOnSignIn } from './lib/solves';
+import { formatCode, codeError } from './lib/shareCode';
 import { sfx, isSoundOn, setSoundOn, getVolume, setVolume } from './utils/sound';
 import { burstConfetti } from './utils/confetti';
 import { renderRich } from './utils/richText';
@@ -114,6 +117,15 @@ const CrosswordGenerator = () => {
   // filled a square, so a regenerate had no way to tell the author's letters from the
   // solver's and simply overwrote everything.
   const [lockedCells, setLockedCells] = useState(new Set());
+  // Circled squares in Create. Circles were previously read-only — they arrived with an
+  // imported puzzle and there was no way to author one.
+  const [manualCircles, setManualCircles] = useState(new Set());
+  // Rebus authoring: several letters typed into one square, the way LEBRON[JAM]ES and
+  // [JAM]PACKED share a square.
+  const [manualRebusMode, setManualRebusMode] = useState(false);
+  const [shareCodeInput, setShareCodeInput] = useState('');
+  const [shareCodeBusy, setShareCodeBusy] = useState(false);
+  const [shareCodeError, setShareCodeError] = useState('');
   // Generation is rate-limited: a run takes ~10ms on a warm corpus, so a double-click used
   // to fire two solves and the second's result raced the first's into the grid.
   const [cooldownUntil, setCooldownUntil] = useState(0);
@@ -173,6 +185,10 @@ const CrosswordGenerator = () => {
   // Signature of the last Create fill, so Regenerate can tell when it produced the same
   // grid again and try once more with a different seed.
   const lastFillSigRef = useRef('');
+  // Where the puzzle being played came from, so a finished solve can be recorded under a
+  // stable identity rather than an anonymous hash.
+  const playMetaRef = useRef(null);
+  const solveRecordedRef = useRef(false);
   const resultShownRef = useRef(false);
 
   // =========== LOGGING ============
@@ -480,8 +496,25 @@ const CrosswordGenerator = () => {
     setIsGenerating(false);
   };
   
+  /**
+   * A rebus square holds several letters, but the solver reasons a letter at a time: its
+   * preset reader tests each square against /^[A-Z]$/, so a square holding JAM is not a
+   * valid constraint and every entry through it becomes unsatisfiable. Rather than let that
+   * surface as a mystifying "couldn't fill this grid", say what is actually in the way.
+   * This matches how constructors work anyway — fill first, add the rebus afterwards.
+   */
+  const blockedByRebus = () => {
+    const squares = rebusSquares();
+    if (!squares.length) return false;
+    setError(`Automatic fill can't run while the grid has ${squares.length} rebus `
+      + `${squares.length === 1 ? 'square' : 'squares'} — the solver works one letter at a `
+      + 'time. Fill the grid first, then add the rebus squares.');
+    return true;
+  };
+
   const handleManualGenerate = () => {
     if (onCooldown || isGenerating) return;
+    if (blockedByRebus()) return;
     const manualRequired = parseWordListInput(manualRequiredInput);
     generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic', { mode: 'fill' });
   };
@@ -496,6 +529,7 @@ const CrosswordGenerator = () => {
    */
   const handleManualRegenerate = async () => {
     if (onCooldown || isGenerating) return;
+    if (blockedByRebus()) return;
     const manualRequired = parseWordListInput(manualRequiredInput);
     const before = gridSignature(manualGrid);
     await generateManualFill(words, manualRequired, manualRequiredMode || 'opportunistic',
@@ -823,7 +857,16 @@ const CrosswordGenerator = () => {
       // generated puzzle, silently and with no undo. Create is its own workspace now; the
       // "Send to Create" button moves a puzzle across when that is actually wanted.
       if (autoStartPlay) {
-        startPlayMode(newGrid, generatedClues);
+        startPlayMode(newGrid, generatedClues, {
+          meta: {
+            seed,
+            layoutName: layouts[layoutIdx]?.name,
+            layoutIndex: layoutIdx,
+            difficulty: targetDifficulty,
+            corpusFingerprint: corpusFpRef.current || undefined,
+            title: layouts[layoutIdx]?.name,
+          },
+        });
       }
       setProgress(`Success! All ${slots.length} slots filled.`);
       setTimeout(() => setProgress(''), 5000);
@@ -888,6 +931,7 @@ const CrosswordGenerator = () => {
     // Every letter here came from the solver, so nothing is pinned: a Regenerate in Create
     // is free to reroll all of it.
     setLockedCells(new Set());
+    setManualCircles(new Set());
     const slots = findSlots(layout);
     const numbered = [];
     const numberMap = new Map();
@@ -930,6 +974,10 @@ const CrosswordGenerator = () => {
         across: currentClues.across.map(c => ({ number: c.number, row: c.row, col: c.col, length: c.length || c.word?.length, word: c.word || getWordFromGrid(currentGrid, c.row, c.col, c.length, 'across'), clue: c.clue })),
         down: currentClues.down.map(c => ({ number: c.number, row: c.row, col: c.col, length: c.length || c.word?.length, word: c.word || getWordFromGrid(currentGrid, c.row, c.col, c.length, 'down'), clue: c.clue }))
       },
+      // Circles and rebus squares are part of the puzzle, not decoration — a grid exported
+      // without them comes back as a different puzzle.
+      circles: [...manualCircles],
+      hasRebus: currentGrid.some((row) => row.some((c) => c && c !== '#' && c.length > 1)),
       exportedAt: new Date().toISOString()
     };
     const blob = new Blob([JSON.stringify(puzzleData, null, 2)], { type: 'application/json' });
@@ -1032,7 +1080,11 @@ const CrosswordGenerator = () => {
         setSelectedLayoutIndex(layoutIdx);
         
         // // Also set up play mode
-        startPlayMode(puzzleData.grid, importedClues, { circles: puzzleData.circles, shades: puzzleData.shades });
+        startPlayMode(puzzleData.grid, importedClues, {
+          circles: puzzleData.circles,
+          shades: puzzleData.shades,
+          meta: { source: 'imported', title: puzzleData.meta?.title || puzzleData.layoutName },
+        });
         
         setError('');
         setProgress(`Puzzle loaded! Click Play to start.`);
@@ -1261,6 +1313,8 @@ const CrosswordGenerator = () => {
     const newGrid = Array(rows).fill(null).map((_, r) => Array(cols).fill(null).map((_, c) => layout[r][c] === '#' ? '#' : ''));
     setManualGrid(newGrid);
     setLockedCells(new Set());   // no letters left, so no pins
+    setManualCircles(new Set());
+    setManualRebusMode(false);
     setCurrentLayoutIndex(layoutIdx);
     const slots = findSlots(layout);
     const numbered = [];
@@ -1350,6 +1404,27 @@ const CrosswordGenerator = () => {
   /** Compact fingerprint of a filled grid, for "did the regenerate actually change it?". */
   const gridSignature = (g) => (g || []).map((row) => row.map((c) => c || '.').join('')).join('/');
 
+  const toggleManualCircle = (r, c) => {
+    if (!manualGrid || manualGrid[r]?.[c] === '#') return;
+    setManualCircles((prev) => {
+      const next = new Set(prev);
+      const k = cellKey(r, c);
+      if (next.has(k)) next.delete(k); else next.add(k);
+      return next;
+    });
+  };
+
+  /** Squares holding more than one letter. The solver works a letter at a time, so these
+   *  are the squares an automatic fill cannot reason about. */
+  const rebusSquares = () => {
+    const out = [];
+    if (!manualGrid) return out;
+    manualGrid.forEach((row, r) => row.forEach((cell, c) => {
+      if (cell && cell !== '#' && cell.length > 1) out.push(cellKey(r, c));
+    }));
+    return out;
+  };
+
   /** Release every pin without deleting a letter, so Regenerate may reroll the whole grid. */
   const unpinAll = () => setLockedCells(new Set());
 
@@ -1385,6 +1460,20 @@ const CrosswordGenerator = () => {
   const applyManualKey = (key) => {
     if (!selectedCell || !manualGrid) return;
     const { row, col } = selectedCell;
+    if (key === 'Enter') { setManualRebusMode(false); return; }
+
+    // In rebus mode backspace trims the square rather than clearing it outright.
+    if (manualRebusMode && key === 'Backspace') {
+      const cur = manualGrid[row][col] && manualGrid[row][col] !== '#' ? manualGrid[row][col] : '';
+      if (cur.length > 1) {
+        const newGrid = manualGrid.map(r => [...r]);
+        newGrid[row][col] = cur.slice(0, -1);
+        setManualGrid(newGrid);
+        sfx.erase();
+        return;
+      }
+    }
+
     if (key === 'Backspace') {
       const newGrid = manualGrid.map(r => [...r]);
       if (newGrid[row][col]) {
@@ -1407,6 +1496,18 @@ const CrosswordGenerator = () => {
       }
       return;
     }
+    // Rebus: letters pile into the current square instead of advancing, so one square can
+    // hold JAM. Enter leaves the mode. The cap matches the play-mode one.
+    if (manualRebusMode && key.length === 1 && /[a-zA-Z]/.test(key)) {
+      const cur = manualGrid[row][col] && manualGrid[row][col] !== '#' ? manualGrid[row][col] : '';
+      const newGrid = manualGrid.map(r => [...r]);
+      newGrid[row][col] = (cur + key.toUpperCase()).slice(0, 8);
+      setManualGrid(newGrid);
+      lockCell(row, col);
+      sfx.type();
+      return;
+    }
+
     if (key.length === 1 && /[a-zA-Z]/.test(key)) {
       const newGrid = manualGrid.map(r => [...r]);
       newGrid[row][col] = key.toUpperCase();
@@ -1604,8 +1705,17 @@ const CrosswordGenerator = () => {
     if (!sourceGrid || !sourceClues) return;
 
     // Only a solve that came from handleDaily counts toward the streak.
-    setIsDailyMode(dailyRequestRef.current);
+    const fromDaily = dailyRequestRef.current;
+    setIsDailyMode(fromDaily);
     dailyRequestRef.current = false;
+
+    // Everything the solve log needs to name this puzzle the same way on another device.
+    playMetaRef.current = {
+      ...(extras.meta || {}),
+      source: extras.meta?.source || (fromDaily ? 'daily' : 'generated'),
+      day: fromDaily ? todayKey() : (extras.meta?.day || undefined),
+    };
+    solveRecordedRef.current = false;
 
     // Create empty play grid (keep structure, clear letters)
     const emptyGrid = sourceGrid.map(row =>
@@ -2586,6 +2696,40 @@ const CrosswordGenerator = () => {
     }
   }, [playComplete, isDailyMode, usedAssist]);
 
+  // Record every finished solve — daily, generated, imported or shared. Local first, so it
+  // works signed out and offline; the upload is fire-and-forget and syncOnSignIn reconciles.
+  React.useEffect(() => {
+    if (!playComplete || !playAnswers || solveRecordedRef.current) return;
+    solveRecordedRef.current = true;
+    const meta = playMetaRef.current || {};
+    try {
+      recordSolve({
+        ...meta,
+        grid: playAnswers,
+        seconds: playTimer,
+        usedHelp: usedAssist,
+        difficultyScore: difficultyInfo?.score ?? null,
+        difficultyLabel: difficultyInfo?.label || '',
+      });
+    } catch { /* a solve log is never worth breaking the finish screen over */ }
+  }, [playComplete, playAnswers, playTimer, usedAssist, difficultyInfo]);
+
+  // Signing in reconciles the device's history with the account's, both ways.
+  React.useEffect(() => {
+    if (!auth.user?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await syncOnSignIn(auth.user.id);
+        if (!cancelled && !r.skipped && (r.uploaded || r.downloaded)) {
+          setProgress(`Synced your solves — ${r.uploaded} up, ${r.downloaded} down.`);
+          setTimeout(() => setProgress(''), 4000);
+        }
+      } catch { /* offline; the next sign-in reconciles */ }
+    })();
+    return () => { cancelled = true; };
+  }, [auth.user?.id]);
+
   // Celebrate on completion (once per solve): chime, confetti, result card.
   React.useEffect(() => {
     if (playComplete && !resultShownRef.current) {
@@ -2614,6 +2758,7 @@ const CrosswordGenerator = () => {
     if (typeof s.selectedLayoutIndex === 'number') setSelectedLayoutIndex(clampIdx(s.selectedLayoutIndex));
     if (typeof s.currentLayoutIndex === 'number') setCurrentLayoutIndex(clampIdx(s.currentLayoutIndex));
     if (Array.isArray(s.lockedCells)) setLockedCells(new Set(s.lockedCells));
+    if (Array.isArray(s.manualCircles)) setManualCircles(new Set(s.manualCircles));
     if (s.difficultyChoice) setDifficultyChoice(s.difficultyChoice);
     if (s.grid) { setGrid(s.grid); setClues(s.clues || { across: [], down: [] }); }
     if (s.latestGrid) { setLatestGrid(s.latestGrid); setLatestClues(s.latestClues || null); }
@@ -2647,6 +2792,7 @@ const CrosswordGenerator = () => {
       // end of DEFAULT_LAYOUTS and every layout lookup returns undefined.
       layouts,
       lockedCells: [...lockedCells],
+      manualCircles: [...manualCircles],
       difficultyChoice,
       grid,
       clues,
@@ -2675,7 +2821,7 @@ const CrosswordGenerator = () => {
     // JSON.stringify'd and written to localStorage every second of every solve. The
     // interval below picks up the clock instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, selectedLayoutIndex, currentLayoutIndex, layouts, lockedCells, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, checkedCells, usedAssist, playComplete, playDirection, isDailyMode, playCircles, playShades]);
+  }, [activeTab, selectedLayoutIndex, currentLayoutIndex, layouts, lockedCells, manualCircles, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, checkedCells, usedAssist, playComplete, playDirection, isDailyMode, playCircles, playShades]);
 
   // Catch up the clock roughly, rather than on every tick. Losing a few seconds of
   // elapsed time to a hard refresh is a far better trade than a 6 MB-per-minute write
@@ -2734,13 +2880,53 @@ const CrosswordGenerator = () => {
     return { grid: result.grid, clues: clueSet, meta: { title: 'Rematch puzzle' } };
   };
 
+  // ---- Playing somebody else's puzzle from its code ----
+  // codeError() names the specific problem so the message can too: "that is not valid" tells
+  // the user nothing about which of the eight characters they got wrong.
+  const CODE_MESSAGES = {
+    empty: 'Enter the code you were given.',
+    length: 'A puzzle code is 8 characters, like KR7F-2Q9X.',
+    charset: 'Codes only use digits 2-9 and letters — check for a typo.',
+    confusable: 'Codes never contain O, 0, I, 1, L or U. One of those is in there — try the digit or letter it looks like.',
+  };
+
+  const playByShareCode = async () => {
+    const bad = codeError(shareCodeInput);
+    if (bad) { setShareCodeError(CODE_MESSAGES[bad] || 'That code is not valid.'); return; }
+    setShareCodeBusy(true);
+    setShareCodeError('');
+    try {
+      const row = await fetchByCode(shareCodeInput);
+      const d = row.data || {};
+      if (!d.grid || !d.clues) throw new Error('That puzzle is missing its grid or clues.');
+      startPlayMode(d.grid, d.clues, {
+        circles: d.circles,
+        shades: d.shades,
+        meta: { source: 'shared', remoteId: row.id, title: row.title || 'Shared puzzle' },
+      });
+      setShareCodeInput('');
+      setProgress(`Opened ${formatCode(row.share_code || shareCodeInput)}.`);
+      setTimeout(() => setProgress(''), 4000);
+    } catch (err) {
+      setShareCodeError(err.message || 'Could not open that puzzle.');
+    } finally {
+      setShareCodeBusy(false);
+    }
+  };
+
   // ---- Saved puzzles (Supabase) ----
   const buildCurrentPuzzleData = () => {
     const cg = activeTab === 'auto' ? grid : activeTab === 'play' ? playAnswers : manualGrid;
     const cc = activeTab === 'auto' ? clues : activeTab === 'play' ? playClues : manualClues;
     if (!cg) return null;
     const layout = cg.map((row) => row.map((c) => (c === '#' ? '#' : '.')).join(''));
-    return { version: '1.0', layout, grid: cg, clues: cc, meta: { title: 'My puzzle' } };
+    const circles = activeTab === 'play' ? [...playCircles] : [...manualCircles];
+    const shades = activeTab === 'play' ? [...playShades] : [];
+    return {
+      version: '1.0', layout, grid: cg, clues: cc, circles, shades,
+      hasRebus: cg.some((row) => row.some((c) => c && c !== '#' && c.length > 1)),
+      meta: { title: 'My puzzle' },
+    };
   };
 
   const saveCurrentPuzzle = async () => {
@@ -2767,6 +2953,8 @@ const CrosswordGenerator = () => {
     // Regenerate may reroll all of it. Hand-written clues still survive, because a clue is
     // only dropped when its answer changes under it.
     setLockedCells(new Set());
+    setManualCircles(new Set(data.circles || []));
+    setManualRebusMode(false);
     setManualClues({ across: data.clues?.across || [], down: data.clues?.down || [] });
     setSelectedCell(null);
     setActiveTab('create');
@@ -2865,6 +3053,9 @@ const CrosswordGenerator = () => {
                 <Save size={14} />My Puzzles
               </button>
             )}
+            <button onClick={() => setActiveTab('history')} className={`tab ${activeTab === 'history' ? 'tab-active' : ''}`}>
+              <Trophy size={14} />History
+            </button>
             <button onClick={() => setShowDictionary(true)} className="tab">
               <BookOpen size={15} />Dictionary
             </button>
@@ -2908,6 +3099,24 @@ const CrosswordGenerator = () => {
             {activeTab === 'auto' && isGenerating && (
               <button onClick={cancelGeneration} className="btn btn-ink">
                 <X size={16} />Stop the Press
+              </button>
+            )}
+
+            {activeTab === 'create' && manualGrid && (
+              <button
+                onClick={() => {
+                  // Create had no way to play what you had just built — the only Play buttons
+                  // belonged to the Generate tab. Circles travel with it.
+                  const empty = manualGrid.some((row) => row.some((c) => c !== '#' && !c));
+                  if (empty) { setError('Fill every square before playing this puzzle.'); return; }
+                  startPlayMode(manualGrid, manualClues, {
+                    circles: [...manualCircles],
+                    meta: { source: 'generated', layoutName: layouts[currentLayoutIndex]?.name, title: 'My puzzle' },
+                  });
+                }}
+                className="btn btn-ink"
+              >
+                <Play size={13} />Play This Puzzle
               </button>
             )}
 
@@ -3104,6 +3313,29 @@ const CrosswordGenerator = () => {
               </button>
             )}
 
+            {activeTab === 'play' && (
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-1.5">
+                <input
+                  value={shareCodeInput}
+                  onChange={(e) => { setShareCodeInput(e.target.value); setShareCodeError(''); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') playByShareCode(); }}
+                  placeholder="Puzzle code"
+                  aria-label="Play a shared puzzle by its code"
+                  spellCheck={false}
+                  autoCapitalize="characters"
+                  className="w-32 px-2.5 py-1.5 rounded-sm border border-ink/25 bg-paper-raised font-mono text-sm uppercase tracking-wider placeholder:normal-case placeholder:tracking-normal placeholder:text-ink-faint"
+                />
+                <button onClick={playByShareCode} disabled={shareCodeBusy} className="btn btn-sm">
+                  {shareCodeBusy ? <RefreshCw size={14} className="animate-spin" /> : <Play size={13} />}Open
+                </button>
+                </div>
+                {shareCodeError && (
+                  <span className="text-[11px] text-accent max-w-[17rem] leading-snug">{shareCodeError}</span>
+                )}
+              </div>
+            )}
+
             <label className="btn cursor-pointer">
               <FolderOpen size={16} />Import to Play
               <input type="file" accept=".json" onChange={(e) => { importPuzzlePlay(e); }} ref={puzzleFileInputRef} className="hidden" />
@@ -3135,7 +3367,16 @@ const CrosswordGenerator = () => {
 
         {activeTab === 'browse' && (
           <BrowseView
-            onPlay={(puzzle) => startPlayMode(puzzle.grid, puzzle.clues, { circles: puzzle.circles, shades: puzzle.shades })}
+            onPlay={(puzzle) => startPlayMode(puzzle.grid, puzzle.clues, {
+              circles: puzzle.circles,
+              shades: puzzle.shades,
+              meta: {
+                source: 'imported',
+                sourceId: puzzle.meta?.pid || puzzle.pid,
+                sourceName: 'crosswithfriends',
+                title: puzzle.meta?.title,
+              },
+            })}
             onHost={(puzzle) => { setMpSeedPuzzle(puzzle); setActiveTab('multiplayer'); }}
           />
         )}
@@ -3151,11 +3392,19 @@ const CrosswordGenerator = () => {
           />
         )}
 
+        {activeTab === 'history' && (
+          <SolveHistory authUser={auth.user} onSignIn={() => setShowAuth(true)} />
+        )}
+
         {activeTab === 'mypuzzles' && (
           <MyPuzzlesView
             authUser={auth.user}
             onSignIn={() => setShowAuth(true)}
-            onPlay={(data) => startPlayMode(data.grid, data.clues)}
+            onPlay={(data, row) => startPlayMode(data.grid, data.clues, {
+              circles: data.circles,
+              shades: data.shades,
+              meta: { source: 'imported', remoteId: row?.id, title: row?.title || data.meta?.title },
+            })}
             onEdit={(data) => loadPuzzleIntoCreate(data)}
             onHost={(data) => { setMpSeedPuzzle({ grid: data.grid, clues: data.clues, meta: data.meta }); setActiveTab('multiplayer'); }}
           />
@@ -3331,6 +3580,10 @@ const CrosswordGenerator = () => {
             onOpenSettings={() => setShowSettings(true)}
             onVirtualKey={applyManualKey}
             lockedCells={lockedCells}
+            circles={manualCircles}
+            onToggleCircle={toggleManualCircle}
+            rebusOn={manualRebusMode}
+            onToggleRebus={() => setManualRebusMode((v) => !v)}
             onToggleCellLock={toggleCellLock}
             onToggleWordLock={toggleCurrentWordLock}
             onUnpinAll={unpinAll}

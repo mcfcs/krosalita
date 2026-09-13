@@ -11,7 +11,10 @@
     "e2e": "node scripts/generate-e2e.mjs",
     "e2e:sound": "node scripts/sound-e2e.mjs",
     "e2e:create": "node scripts/create-e2e.mjs",
-    "e2e:responsive": "node scripts/responsive-e2e.mjs"
+    "e2e:responsive": "node scripts/responsive-e2e.mjs",
+    "test:solves": "node scripts/test-solves.mjs",
+    "test:rebus": "node scripts/test-rebus.mjs",
+    "check:icons": "node scripts/check-icons.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.0",

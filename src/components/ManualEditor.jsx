@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap, Lock, Unlock } from './Icons';
+import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap, Lock, Unlock, Circle } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
 import { keepClearOfDock } from '../utils/keepClearOfDock';
@@ -54,6 +54,10 @@ const ManualEditor = ({
   onVirtualKey = () => {},
   lockedCells = new Set(),
   onToggleCellLock = () => {},
+  circles = new Set(),
+  onToggleCircle = () => {},
+  rebusOn = false,
+  onToggleRebus = () => {},
   onToggleWordLock = () => {},
   onUnpinAll = () => {}
 }) => {
@@ -241,11 +245,21 @@ const ManualEditor = ({
                             ? 'xw-cell--needs-clue'
                             : '';
               const pinned = cell !== '#' && cell && lockedCells.has(`${r},${c}`);
+              const circled = cell !== '#' && circles.has(`${r},${c}`);
+              // A rebus square holds several letters, so it needs the smaller type the play
+              // grid already uses — otherwise JAM overflows the square.
+              const isRebus = cell && cell !== '#' && cell.length > 1;
               return (
                 <div
                   key={c}
                   data-sel={isSelected ? '1' : undefined}
-                  onClick={() => { if (!longPress.current.fired) handleCellClick(r, c); }}
+                  onClick={(e) => {
+                    if (longPress.current.fired) return;
+                    // Shift-click toggles a circle: quick for the common case of ringing a
+                    // run of squares, without leaving the grid for the toolbar.
+                    if (e.shiftKey && cell !== '#') { onToggleCircle(r, c); return; }
+                    handleCellClick(r, c);
+                  }}
                   onContextMenu={(e) => { if (cell !== '#' && cell) { e.preventDefault(); onToggleCellLock(r, c); } }}
                   onTouchStart={() => { if (cell !== '#' && cell) startLongPress(r, c); }}
                   onTouchEnd={cancelLongPress}
@@ -257,8 +271,11 @@ const ManualEditor = ({
                     : undefined}
                   className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${cellClass} ${pinned ? 'xw-cell--pinned' : ''}`}
                 >
+                  {circled && <span className="absolute inset-[9%] pointer-events-none rounded-full border border-ink/45" />}
                   {cell !== '#' && clueNumber && <span className="xw-num">{clueNumber}</span>}
-                  {cell !== '#' && cell && <span className="xw-letter text-ink">{cell}</span>}
+                  {cell !== '#' && cell && (
+                    <span className={`xw-letter text-ink ${isRebus ? 'text-[0.42em] leading-[1.05] font-bold px-0.5 text-center' : ''}`}>{cell}</span>
+                  )}
                 </div>
               );
             })}</div>)}
@@ -302,6 +319,21 @@ const ManualEditor = ({
                 {words.length > 0 && <button onClick={() => { setShowSuggestions(!showSuggestions); setSuggestions(findSuggestionsForSlot()); }} className="btn btn-sm btn-accent"><Sparkles size={15} />Auto-fill</button>}
                 <button onClick={openStudio} disabled={!wordComplete} title={wordComplete ? 'Browse and write clues at a chosen difficulty' : 'Fill the word first'} className="btn btn-sm btn-gold"><Zap size={15} />Clues</button>
                 <button onClick={onOpenReclue} title="Re-clue the whole puzzle at a chosen difficulty" className="btn btn-sm"><Sparkles size={15} />Re-clue all</button>
+                <button
+                  onClick={() => selectedCell && onToggleCircle(selectedCell.row, selectedCell.col)}
+                  disabled={!selectedCell}
+                  title="Ring this square (or shift-click any square)"
+                  className={`btn btn-sm ${selectedCell && circles.has(`${selectedCell.row},${selectedCell.col}`) ? 'btn-ink' : ''}`}
+                >
+                  <Circle size={15} />Circle
+                </button>
+                <button
+                  onClick={onToggleRebus}
+                  title="Rebus: type several letters into one square (Enter to leave)"
+                  className={`btn btn-sm ${rebusOn ? 'btn-accent' : ''}`}
+                >
+                  <Zap size={15} />{rebusOn ? 'Rebus on' : 'Rebus'}
+                </button>
                 <button
                   onClick={onToggleWordLock}
                   disabled={!currentWord?.word}

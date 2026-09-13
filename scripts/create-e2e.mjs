@@ -465,6 +465,61 @@ try {
     } else bad('the app survives a reload after saving a custom layout (1A)', 'could not save a layout');
   } else bad('the app survives a reload after saving a custom layout (1A)', 'no New layout button');
 
+  // ---------- circles and rebus can be AUTHORED, not just imported ----------
+  // Both used to be read-only: circles arrived with an imported puzzle and rebus entry
+  // existed only in Play, so a constructor could not put either into their own grid.
+  await clickCell(0);
+  const circled = await page.evaluate(`(() => {
+    const cells = [...document.querySelectorAll('.xw-cell')].filter(d => !d.className.includes('xw-cell--block'));
+    const before = document.querySelectorAll('.xw-cell .rounded-full').length;
+    const b = [...document.querySelectorAll('button')].find(x => (x.textContent||'').trim() === 'Circle' && !x.disabled);
+    if (!b) return { ok: false, why: 'no Circle button' };
+    b.click();
+    return { ok: true, before };
+  })()`);
+  await sleep(300);
+  if (circled.ok) {
+    const after = await page.evaluate(`document.querySelectorAll('.xw-cell .rounded-full').length`);
+    if (after === circled.before + 1) ok('the Circle button rings the selected square');
+    else bad('the Circle button rings the selected square', `${circled.before} -> ${after}`);
+    // and toggles back off
+    await page.evaluate(`(() => { const b = [...document.querySelectorAll('button')].find(x => (x.textContent||'').trim() === 'Circle'); b.click(); })()`);
+    await sleep(300);
+    const off = await page.evaluate(`document.querySelectorAll('.xw-cell .rounded-full').length`);
+    if (off === circled.before) ok('the Circle button toggles the ring back off');
+    else bad('the Circle button toggles the ring back off', `expected ${circled.before}, got ${off}`);
+  } else bad('the Circle button rings the selected square', circled.why);
+
+  // rebus: three letters into one square
+  await clickCell(0);
+  const rebusOn = await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')].find(x => /^rebus/i.test((x.textContent||'').trim()));
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+  await sleep(250);
+  if (rebusOn) {
+    for (const ch of 'jam') await key(ch);
+    const sq = await page.evaluate(`(() => {
+      const sel = document.querySelector('.xw-cell[data-sel="1"]');
+      return sel ? (sel.querySelector('.xw-letter')?.textContent || '') : null;
+    })()`);
+    if (sq === 'JAM') ok('rebus mode types three letters into one square (JAM)');
+    else bad('rebus mode types three letters into one square (JAM)', `square holds ${JSON.stringify(sq)}`);
+
+    // and an automatic fill must refuse honestly rather than fail obscurely
+    await sleep(2200);
+    await clickByLabel('fill remaining');
+    await sleep(700);
+    const msg = await page.evaluate(`(document.body.innerText || '')`);
+    if (/rebus/i.test(msg) && /one letter at a time|fill the grid first/i.test(msg)) {
+      ok('Fill Remaining refuses a rebus grid and says why');
+    } else {
+      bad('Fill Remaining refuses a rebus grid and says why', 'no explanatory message found');
+    }
+  } else bad('rebus mode types three letters into one square (JAM)', 'no Rebus button');
+
   // ---------- no page-level exceptions throughout ----------
   if (page.errors.length === 0) ok('no page-level JS errors captured');
   else bad('no page-level JS errors captured', page.errors.slice(0, 2).join(' | '));

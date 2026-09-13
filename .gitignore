@@ -39,13 +39,16 @@ context/
 venv
 
 .vercel
-.env*
+# NOTE: this must not be a bare `.env*` — that silently re-ignores .env.example,
+# which is tracked on purpose as the documentation of which vars are needed.
+.env
+.env.local
+.env.*.local
 
 # Pipeline: live SQLite state (held open by the monitor) and bulk intermediates
 pipeline/state.sqlite*
 pipeline/out/
 pipeline/__pycache__/
 **/__pycache__/
-scripts/generate-e2e.png
-scripts/reclue-e2e.png
-scripts/senses-e2e.png
+# e2e screenshots are build artifacts, not source
+scripts/*-e2e.png
