@@ -99,6 +99,31 @@ const pct = (a, p) => (a.length ? a.slice().sort((x, y) => x - y)[Math.min(a.len
 const hist = (grid) => Object.entries(getLayoutStats(grid).lengthCounts || {})
   .sort((a, b) => a[0] - b[0]).map(([l, n]) => `${l}x${n}`).join(' ');
 
+// ---------------------------------------------------------------- determinism
+// The daily puzzle is "solve layout L with seed derived from the date", so the same seed
+// must give the same grid forever. --determinism solves every layout twice per seed and
+// compares. Cheap, and the one gate that a variety/ordering change can silently break.
+if (argv.includes('--determinism')) {
+  let bad = 0;
+  for (const layout of LAYOUTS) {
+    const timeoutMs = timeoutFor(sizeOf(layout.grid));
+    for (let s = 0; s < Math.min(SEEDS, 3); s++) {
+      const seed = 1000 + s * 7919;
+      const opts = { index, layout: layout.grid, seed, timeoutMs, difficultyTarget: 0.5 };
+      const a = solveCrossword(opts);
+      const b = solveCrossword(opts);
+      const ga = JSON.stringify(a.grid), gb = JSON.stringify(b.grid);
+      if (ga !== gb || a.complete !== b.complete) {
+        bad++;
+        console.log(`NON-DETERMINISTIC  ${layout.name} seed ${seed}`);
+      }
+    }
+  }
+  console.log(bad ? `\n${bad} non-deterministic case(s)`
+    : `\ndeterminism ok — ${LAYOUTS.length} layouts, same seed, identical grids`);
+  process.exit(bad ? 1 : 0);
+}
+
 // ---------------------------------------------------------------- sweep
 console.log('=== fill sweep ===');
 console.log('layout                    size  slots  difficulty   filled     p50     p95     max  timeouts');

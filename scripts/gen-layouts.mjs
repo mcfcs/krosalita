@@ -133,6 +133,74 @@ const toRows = (g) => {
   return out;
 };
 
+// --check validates every SHIPPED layout instead of generating new ones: rotational
+// symmetry, no run under 3 or over MAX_WORD_LEN, white squares all connected and all
+// checked. Exits 1 on any violation, so it can be wired into a gate later.
+if (argv.includes('--check')) {
+  const mod = await import(url('src/data/layouts.js'));
+  const all = [...(mod.DEFAULT_LAYOUTS || []), ...(mod.EXTRA_LAYOUTS || [])];
+  let bad = 0;
+  console.log('layout                       size  slots  blocks  sym  min  max  conn  lengths');
+  for (const l of all) {
+    const rows = l.grid.map((r) => (Array.isArray(r) ? r.join('') : r));
+    const n = rows.length;
+    const w = rows[0].length;
+    const sym = rows.every((r, i) => r.split('').every((ch, j) =>
+      (ch === '#') === (rows[n - 1 - i][w - 1 - j] === '#')));
+    const slots = findSlots(rows.map((r) => r.split('')));
+    const stats = getLayoutStats(rows);
+    const lens = slots.map((s) => s.length);
+    const min = Math.min(...lens);
+    const max = Math.max(...lens);
+    // Every white square must sit in BOTH an across and a down entry (no unchecked cells).
+    const covered = new Set();
+    for (const s of slots) {
+      for (let i = 0; i < s.length; i++) {
+        const r = s.direction === 'across' ? s.row : s.row + i;
+        const c = s.direction === 'across' ? s.col + i : s.col;
+        covered.add(`${s.direction}:${r},${c}`);
+      }
+    }
+    let unchecked = 0;
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < w; c++) {
+        if (rows[r][c] === '#') continue;
+        if (!covered.has(`across:${r},${c}`) || !covered.has(`down:${r},${c}`)) unchecked++;
+      }
+    }
+    const g = new Uint8Array(n * w);
+    for (let r = 0; r < n; r++) for (let c = 0; c < w; c++) g[r * w + c] = rows[r][c] === '#' ? 1 : 0;
+    const conn = (() => {
+      const seen = new Uint8Array(n * w);
+      let start = -1, white = 0;
+      for (let i = 0; i < n * w; i++) if (!g[i]) { white++; if (start < 0) start = i; }
+      const st = [start]; seen[start] = 1; let cnt = 0;
+      while (st.length) {
+        const i = st.pop(); cnt++;
+        const r = (i / w) | 0, c = i % w;
+        for (const [rr, cc] of [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]]) {
+          if (rr < 0 || cc < 0 || rr >= n || cc >= w) continue;
+          const j = rr * w + cc;
+          if (g[j] || seen[j]) continue;
+          seen[j] = 1; st.push(j);
+        }
+      }
+      return cnt === white;
+    })();
+    const ok = sym && min >= 3 && max <= MAX_WORD_LEN && conn && unchecked === 0;
+    if (!ok) bad++;
+    const hist = Object.entries(stats.lengthCounts).sort((a, b) => a[0] - b[0])
+      .map(([len, k]) => `${len}x${k}`).join(' ');
+    console.log(`${l.name.padEnd(28)}${String(n + 'x' + w).padStart(5)}`
+      + `${String(slots.length).padStart(7)}${String(stats.blackCells).padStart(8)}`
+      + `${(sym ? '  y' : '  N').padStart(5)}${String(min).padStart(5)}${String(max).padStart(5)}`
+      + `${(conn ? '  y' : '  N').padStart(6)}  ${hist}${unchecked ? `  UNCHECKED:${unchecked}` : ''}`);
+  }
+  console.log(bad ? `\n${bad} layout(s) violate the rules`
+    : `\nall ${all.length} layouts well-formed`);
+  process.exit(bad ? 1 : 0);
+}
+
 const rng = mulberry32(SEED >>> 0);
 const found = [];
 const seen = new Set();

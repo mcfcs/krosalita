@@ -391,7 +391,7 @@ const CrosswordGenerator = () => {
     const result = await generateCrossword(
       layout,
       setProgress,
-      15000,
+      solveBudgetMs(layout),
       presetGrid,
       requiredMerged,
       requiredModeInput,
@@ -657,6 +657,17 @@ const CrosswordGenerator = () => {
       : { url: `${import.meta.env.BASE_URL || '/'}corpus/corpus.bin` }
   ), [usingCustomWords, words, tagalogMode]);
 
+  /**
+   * How long to let a fill run, by area. A flat 15s was fine when every layout was 15x15
+   * or 5x5; a 21x21 has nearly twice the squares and 134 entries, and a Sunday that needs
+   * 1.2s on this machine could need well past 15s on a slower one. Floor at the old value
+   * so nothing small got faster, cap so a hopeless grid still fails while you are watching.
+   */
+  const solveBudgetMs = (layout) => {
+    const cells = (layout?.length || 15) * (layout?.[0]?.length || 15);
+    return Math.min(60000, Math.max(15000, Math.round(15000 * (cells / 225))));
+  };
+
   const generateCrossword = (layout, onProgress, timeoutMs = 10000, presetGrid = null, requiredWordsList = [], requiredModeArg = 'anchor', presetClues = {}, difficultyTarget = null, seed = null) =>
     new Promise((resolve) => {
       const emptyResult = {
@@ -787,7 +798,7 @@ const CrosswordGenerator = () => {
     // One solve, not three. Difficulty is steered inside the search by biasing value
     // ordering toward a running residual target, so a single run lands in the band;
     // re-rolling whole puzzles and picking the closest was both slower and less accurate.
-    const timeoutMs = 15000;
+    const timeoutMs = solveBudgetMs(layout);
     const result = await generateCrossword(
       layout,
       setProgress,
@@ -2679,7 +2690,14 @@ const CrosswordGenerator = () => {
     // seededShuffle all 552k rows to imitate determinism, which the solver then threw
     // away by calling Math.random() internally.
     const seed = seedFromString(todayKey());
-    const layoutIdx = layouts.length ? seed % layouts.length : 0;
+    // Rotate over the 15x15s only. Two reasons: a daily that is a 5x5 Mini one morning and
+    // a 21x21 Sunday the next is not a daily, it is a lucky dip; and `seed % layouts.length`
+    // over the whole list means ADDING a layout silently reassigns every past date's grid.
+    // Keyed by name so the mapping survives reordering too.
+    const dailyPool = layouts.filter((l) => l.grid.length === 15 && l.grid[0].length === 15);
+    const pool = dailyPool.length ? dailyPool : layouts;
+    const chosen = pool[seed % pool.length];
+    const layoutIdx = Math.max(0, layouts.indexOf(chosen));
     setSelectedLayoutIndex(layoutIdx);
     // startPlayMode reads and clears this, so any solve NOT started from here is
     // explicitly marked non-daily. Previously isDailyMode was only ever cleared by the
@@ -2874,7 +2892,7 @@ const CrosswordGenerator = () => {
     const layout = layouts[selectedLayoutIndex]?.grid;
     if (!layout) throw new Error('No layout selected.');
     const result = await generateCrossword(
-      layout, () => {}, 15000, null, [], 'anchor', {}, difficultyTargetOf(difficultyChoice), null);
+      layout, () => {}, solveBudgetMs(layout), null, [], 'anchor', {}, difficultyTargetOf(difficultyChoice), null);
     if (!result?.grid || !result.complete) throw new Error('Could not generate a full puzzle — try Crosswithfriends.');
     const numbered = assignNumbers(result.placements || []);
     const clueSet = {

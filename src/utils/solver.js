@@ -937,12 +937,12 @@ export function solveCrossword(opts) {
   // Which slot LENGTHS the search actually starved on, counted at the one place every
   // dead end routes through. On a big grid this is the difference between "it failed"
   // and "every 9-letter slot ran dry" — see the starvation report assembled at the end.
-  const starveEvents = new Map();
+  const starveEvents = new Int32Array(MAXLEN + 1);
 
   /** @returns {boolean} false when this restart is exhausted. */
   function handleFailure(t) {
     if (t < 0) return false;
-    starveEvents.set(slotLen[t], (starveEvents.get(slotLen[t]) || 0) + 1);
+    starveEvents[slotLen[t]]++;
     for (let i = 0; i < slotLen[t]; i++) cellWeight[slotCellOf[t * MAXLEN + i]] += 1;
 
     let jump = 0;
@@ -1140,7 +1140,7 @@ export function solveCrossword(opts) {
         byLen.set(L, (e = {
           len: L, slots: 0, filled: 0, unfilled: 0, starved: 0,
           corpus: li ? li.count + li.extra : 0,
-          deadEnds: starveEvents.get(L) || 0,
+          deadEnds: starveEvents[L] || 0,
           _cand: [],
         }));
       }
@@ -1164,7 +1164,7 @@ export function solveCrossword(opts) {
     const worst = rows.filter((r) => r.starved > 0)
       .sort((a, b) => b.starved - a.starved || a.len - b.len);
     const phrase = (r) => `${r.starved} slot${r.starved === 1 ? '' : 's'} of length ${r.len} `
-      + `(${r.medianCandidates} candidate${r.medianCandidates === 1 ? '' : 's'} left after crossings; `
+      + `(${r.medianCandidates.toLocaleString()} candidate${r.medianCandidates === 1 ? '' : 's'} left after crossings; `
       + `the word list has ${r.corpus.toLocaleString()} ${r.len}-letter answers)`;
     // A timeout usually stops with a SPARSE best grid, where almost nothing has starved
     // yet — the honest account there is where the search kept dying, not where the best
@@ -1173,7 +1173,7 @@ export function solveCrossword(opts) {
     const thrash = rows.filter((r) => r.deadEnds > 0)
       .sort((a, b) => b.deadEnds - a.deadEnds || a.len - b.len);
     const thrashPhrase = (r) => `length ${r.len} (${r.deadEnds.toLocaleString()} dead ends; `
-      + `${r.medianCandidates} of the word list's ${r.corpus.toLocaleString()} `
+      + `${r.medianCandidates.toLocaleString()} of the word list's ${r.corpus.toLocaleString()} `
       + `${r.len}-letter answers still fit the crossings)`;
     let summary = null;
     if (worst.length) {

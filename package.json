@@ -14,7 +14,9 @@
     "e2e:responsive": "node scripts/responsive-e2e.mjs",
     "test:solves": "node scripts/test-solves.mjs",
     "test:rebus": "node scripts/test-rebus.mjs",
-    "check:icons": "node scripts/check-icons.mjs"
+    "check:icons": "node scripts/check-icons.mjs",
+    "test:determinism": "node scripts/test-determinism.mjs",
+    "bench:bigrid": "node scripts/bench-bigrid.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.0",
