@@ -38,6 +38,52 @@ const K_RAND = 16;             // extra random candidates, for variety across se
 // so a narrow pool can simply contain nothing near the requested difficulty.
 const K_TOP_TARGETED = 128;
 const K_RAND_TARGETED = 64;
+// Variety. Clicking Generate again used to hand back the same puzzle: the candidate pool
+// was EXACTLY the first kTop set bits (the corpus is stored in descending quality order),
+// so a fresh seed competed over an identical shortlist and MRV ordering walked it to the
+// same fill. Two seeded knobs fix that:
+//
+//   VARIETY_WINDOW  draw kTop candidates at random from the best kTop*window of the
+//                   domain. This is the strong lever, and the cheap one for quality:
+//                   every candidate still comes from the top of the ranking, only WHICH
+//                   of them compete changes per seed.
+//   VARIETY_JITTER  +/- this many q units on each candidate's ranking score, so near-ties
+//                   break differently per seed. q is dominated by the crossing-support
+//                   term (0..4.2) rather than by quality (ALPHA_QUALITY * 0..1), so
+//                   jitter here spends search guidance, not answer quality -- but it does
+//                   spend guidance, so keep it small.
+//
+// Tuned on scripts/bench-variety.mjs; that file's header says what is measured.
+const VARIETY_WINDOW = 2;
+const VARIETY_JITTER = 0.05;
+const SLOT_JITTER = 0.08;      // slot-order tie-break noise: path variety at no quality cost
+// Variety costs search guidance, and on the most open layouts that guidance is exactly
+// what the search needs (Open 15x15: p50 0.9s greedy against 4.5s with the window wide
+// open). So it is spent where it is free: full strength while the fill is going in
+// cleanly, then decayed as the search starts to thrash, which hands a layout that fights
+// back the old greedy ordering instead of a ten-second fill. Decay keys off BACKTRACKS,
+// not restarts -- a hard fill here blows its time inside a single run (Open 15x15 solves
+// with 0 restarts and 200 backtracks), so a restart counter never fires at all.
+const VARIETY_BACKTRACKS = 8;   // backtracks that halve the variety knobs
+// ...and the point where variety is abandoned outright: the search restarts greedy, from
+// clean dom-wdeg weights (see the bail-out itself). Needed because on a
+// tight layout the damage is done by the FIRST few picks -- Open 15x15 fills in 9
+// backtracks greedily and 200+ when an early slot takes a different (equally good) word,
+// which is 5s of work -- so decaying variety after the fact cannot undo it. Bailing out
+// early caps the wasted effort at a few hundred milliseconds. (Confining variety to the
+// first quarter of the fill instead was measured and did nothing: the expensive choices
+// ARE the early ones.)
+//
+// The budget is in work units -- backtracks x slots -- not backtracks, because what a
+// backtrack costs scales with the grid: on Open 15x15 one costs ~25ms and 12 of them are
+// the whole budget, while a 5x5 mini can take 90 and still finish in a tenth of a second.
+// Measured on a flat 12-backtrack rule, minis lost variety (2 of 16 fills coincided) for
+// no speed they needed.
+const VARIETY_GIVEUP_WORK = 900;
+// Penalty on an answer the caller asked to steer away from (`avoidWords`). Big enough to
+// lose a near-tie, small enough that a clearly better word still wins, and never a hard
+// exclusion -- so a grid with only one possible fill still fills.
+const AVOID_PENALTY = 0.6;
 const LOOKAHEAD_WORDS = 32;    // u32 words scanned when sizing a crossing domain
 const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted work
 // Skip an arc whose allowed-letter set is this wide: it prunes little for its cost.
@@ -87,6 +133,14 @@ export function solveCrossword(opts) {
     seed = 1,
     difficultyTarget = null,
     difficultyWeight = DEFAULT_BETA_DIFF,
+    // Answers to steer away from -- pass the previous fill's words so a Regenerate press
+    // cannot hand back the same grid. A soft bias, never a constraint.
+    avoidWords = [],
+    varietyWindow = VARIETY_WINDOW,
+    varietyJitter = VARIETY_JITTER,
+    varietyBacktracks = VARIETY_BACKTRACKS,
+    varietyGiveupWork = VARIETY_GIVEUP_WORK,
+    slotJitter = SLOT_JITTER,
     onProgress = () => {},
     onBest = () => {},
     now = () => Date.now(),
@@ -660,6 +714,19 @@ export function solveCrossword(opts) {
     if (!set) requiredIdx.set(w.length, (set = new Set()));
     set.add(i);
   }
+  // Soft "different from last time" bias, resolved to per-length word indices once so the
+  // hot path is a Set.has on an integer.
+  const avoidIdx = new Map();
+  for (const raw of (avoidWords || [])) {
+    const w = String(raw || '').toUpperCase().trim();
+    if (!w) continue;
+    const wi = index.lookup[w.length]?.get(w);
+    if (wi === undefined) continue;
+    let set = avoidIdx.get(w.length);
+    if (!set) avoidIdx.set(w.length, (set = new Set()));
+    set.add(wi);
+  }
+
   const requiredList = requiredWords
     .map((w) => ({ word: w, len: w.length, idx: index.lookup[w.length]?.get(w) }))
     .filter((r) => r.idx !== undefined);
@@ -708,12 +775,40 @@ export function solveCrossword(opts) {
       if (requiredMode !== 'off' && slotHasRequired(s)) {
         sc *= requiredMode === 'anchor' ? 0.001 : 0.05;
       }
-      sc *= 1 + 0.02 * rng();
+      sc *= 1 + slotJitter * rng();
       if (sc < bestScore || (sc === bestScore && nCross > bestCross)) {
         bestScore = sc; best = s; bestCross = nCross;
       }
     }
     return best;
+  }
+
+  let varietyActive = true;
+  const varietyGiveup = Math.max(6, Math.round(varietyGiveupWork / S));
+  const varietyScale = () => (varietyActive
+    ? 1 / (1 + stats.backtracks / varietyBacktracks + stats.restarts)
+    : 0);
+
+  /**
+   * A uniformly random value from dom[s], by RANK. Selecting a rank used to mean walking
+   * set bits one at a time -- up to ~12,000 nextSetBit calls per sample, per node; this
+   * skips whole 32-bit words by popcount, so it is O(W) with the same distribution.
+   */
+  function randomValue(s) {
+    const off = domOff[s];
+    let target = randInt(rng, domCount[s]);
+    for (let i = domFirst[s]; i <= domLast[s]; i++) {
+      const wv = domArena[off + i];
+      if (wv === 0) continue;
+      const c = popcount32(wv);
+      if (target < c) {
+        let v = wv;
+        for (let k = 0; k < target; k++) v &= v - 1;
+        return (i << 5) + ctz32(v);
+      }
+      target -= c;
+    }
+    return -1;
   }
 
   function orderValues(s) {
@@ -738,24 +833,40 @@ export function solveCrossword(opts) {
       }
     }
 
+    const nReq = nc;
+
     // Indices are stored in descending quality order, so the best candidates are simply
-    // the first set bits — an O(K) scan instead of ranking the whole domain.
+    // the first set bits — an O(K) scan instead of ranking the whole domain. Taking
+    // exactly the first kTop of them is what made every seed converge on one fill, so
+    // reservoir-sample kTop out of the first kTop*varietyWindow instead: uniform over a
+    // window that is still entirely the top of the ranking.
     const kTop = difficultyTarget == null ? K_TOP : K_TOP_TARGETED;
+    const capTop = Math.min(kTop, candBuf.length - nReq);
+    const vs = varietyScale();
+    const windowN = Math.max(capTop, Math.round(capTop * (1 + (varietyWindow - 1) * vs)));
+    let nStream = 0;                     // how many candidates the window has offered
     let b = nextSetBit(domArena, off, W, 0);
-    while (b >= 0 && nc < kTop) {
+    while (b >= 0 && nStream < windowN) {
       let dup = false;
-      for (let j = 0; j < nc; j++) if (candBuf[j] === b) { dup = true; break; }
-      if (!dup) candBuf[nc++] = b;
+      for (let j = 0; j < nReq; j++) if (candBuf[j] === b) { dup = true; break; }
+      if (!dup) {
+        if (nc - nReq < capTop) candBuf[nc++] = b;
+        else {
+          // Algorithm R: the item at stream position nStream survives with probability
+          // capTop/(nStream+1), which makes the kept set uniform over the window.
+          const j = randInt(rng, nStream + 1);
+          if (j < capTop) candBuf[nReq + j] = b;
+        }
+        nStream++;
+      }
       b = nextSetBit(domArena, off, W, b + 1);
     }
     const total = domCount[s];
     if (total > nc) {
       const kRand = difficultyTarget == null ? K_RAND : K_RAND_TARGETED;
       for (let k = 0; k < kRand && nc < candBuf.length; k++) {
-        const target = randInt(rng, total);
-        let hit = nextSetBit(domArena, off, W, 0);
-        for (let j = 0; j < target && hit >= 0; j++) hit = nextSetBit(domArena, off, W, hit + 1);
-        if (hit < 0) continue;
+        const hit = randomValue(s);
+        if (hit < 0) break;
         let dup = false;
         for (let j = 0; j < nc; j++) if (candBuf[j] === hit) { dup = true; break; }
         if (!dup) candBuf[nc++] = hit;
@@ -764,6 +875,8 @@ export function solveCrossword(opts) {
 
     const target = residualDiffTarget();
     const reqSet = requiredIdx.get(len);
+    const avoidSet = avoidIdx.get(len);
+    const jitter = varietyJitter * vs;
     let n = 0;
     for (let ci = 0; ci < nc; ci++) {
       if ((ci & 63) === 63) checkClock();
@@ -789,6 +902,8 @@ export function solveCrossword(opts) {
       // asking for "easy" moved the finished puzzle's rating by about two points.
       const suppAvg = nSupp ? supp / nSupp : Math.log1p(LOOKAHEAD_CAP);
       let q = suppAvg + ALPHA_QUALITY * (li.score[w] / 65535);
+      if (jitter > 0) q += jitter * (rng() * 2 - 1);
+      if (avoidSet !== undefined && avoidSet.has(w)) q -= AVOID_PENALTY;
       if (reqSet && reqSet.has(w) && !usedRequired.has(reqKey(len, w))) q += 1000;
       if (target != null) q -= difficultyWeight * Math.abs(li.diff[w] / 255 - target);
       // insertion sort, descending
@@ -1073,6 +1188,16 @@ export function solveCrossword(opts) {
     for (;;) {
       checkClock();
       stats.nodes++;
+      // Variety is a first-attempt luxury. Once the search is thrashing, drop it and
+      // restart greedy rather than pay for a diverse fill in seconds.
+      if (varietyActive && stats.backtracks > varietyGiveup) {
+        varietyActive = false;
+        // Drop the dom-wdeg weights too. They were learned about a search that is being
+        // abandoned, and carrying them into the greedy retry mis-orders its slots -- the
+        // measured difference between a ~1s fallback fill and a 10s timeout.
+        cellWeight.fill(1);
+        return 'RESTART';
+      }
       if (placedCount === S) {
         // A full grid that quietly dropped one of the user's required words is not a
         // success -- "required" has to mean required. Anchoring re-shuffles its order
