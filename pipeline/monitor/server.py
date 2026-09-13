@@ -158,7 +158,7 @@ def main():
     state.connect()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
-    print(f"monitor: http://{a.host}:{a.port}  (Tailscale: http://100.71.83.125:{a.port})")
+    print(f"monitor: http://{a.host}:{a.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

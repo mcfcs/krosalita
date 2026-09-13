@@ -1,5 +1,6 @@
 import React from 'react';
 import { BookOpen, Plus, Download, Search, Check, X, Edit3, Trash2 } from './Icons';
+import { renderRich } from '../utils/richText.jsx';
 
 const DictionaryModal = ({
   isOpen,
@@ -116,7 +117,7 @@ const DictionaryModal = ({
                     ) : (
                       <>
                         <span className="w-24 sm:w-32 shrink-0 font-mono font-semibold text-accent tracking-wide break-words">{item.word}</span>
-                        <span className="flex-1 min-w-0 text-ink-soft text-sm break-words">{item.clue}</span>
+                        <span className="flex-1 min-w-0 text-ink-soft text-sm break-words">{renderRich(item.clue)}</span>
                         <button onClick={() => startEditWord(originalIndex)} className="shrink-0 p-2 text-ink-faint hover:text-ink hover:bg-ink/[0.06] rounded-sm transition">
                           <Edit3 size={15} />
                         </button>

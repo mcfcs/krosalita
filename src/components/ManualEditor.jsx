@@ -428,7 +428,7 @@ const ManualEditor = ({
                   {suggestions.length === 0 ? <div className="p-4 text-ink-faint text-center text-sm">No matching words found</div> : suggestions.map((s, i) => (
                     <button key={i} onClick={() => applySuggestion(s)} className="w-full px-4 py-2.5 text-left hover:bg-ink/[0.04] transition border-b border-ink/8 last:border-0">
                       <div className="font-mono font-semibold text-accent tracking-wide">{s.word}</div>
-                      <div className="text-ink-soft text-sm truncate">{s.clue}</div>
+                      <div className="text-ink-soft text-sm truncate">{renderRich(s.clue)}</div>
                     </button>
                   ))}
                 </div>

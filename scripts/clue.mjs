@@ -33,7 +33,7 @@ const count = Number(flag('--count', 6));
 const sense = flag('--sense', '');
 const doGen = !argv.includes('--no-generate');
 const bySense = argv.includes('--senses');
-const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
+const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://localhost:11434';
 const GEN_MODEL = flag('--model', 'qwen3.5:27b');
 
 if (!word) {

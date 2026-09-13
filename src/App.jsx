@@ -44,7 +44,7 @@ import { recordSolve, syncOnSignIn } from './lib/solves';
 import { formatCode, codeError } from './lib/shareCode';
 import { sfx, isSoundOn, setSoundOn, getVolume, setVolume } from './utils/sound';
 import { burstConfetti } from './utils/confetti';
-import { renderRich } from './utils/richText';
+import { renderRich, plainRich } from './utils/richText';
 
 const CrosswordGenerator = () => {
   const [activeTab, setActiveTab] = useState('auto');
@@ -1112,8 +1112,10 @@ const CrosswordGenerator = () => {
     const gridWidth = cols * cellSize;
     const gridHeight = rows * cellSize;
     
-    const acrossCluesText = currentClues.across.map(c => `${c.number}. ${c.clue || '(No clue)'}`);
-    const downCluesText = currentClues.down.map(c => `${c.number}. ${c.clue || '(No clue)'}`);
+    // Canvas cannot render markup, so strip the markers rather than draw them: this PNG is
+    // the one export that ends up in somebody else's hands with **King** printed literally.
+    const acrossCluesText = currentClues.across.map(c => `${c.number}. ${plainRich(c.clue) || '(No clue)'}`);
+    const downCluesText = currentClues.down.map(c => `${c.number}. ${plainRich(c.clue) || '(No clue)'}`);
     
     const tempCanvas = document.createElement('canvas');
     const tempCtx = tempCanvas.getContext('2d');
@@ -2233,7 +2235,9 @@ const CrosswordGenerator = () => {
       csv += `${cell(w.date || '')},${cell(w.word)},${cell(w.clue)}\n`;
     });
     
-    const blob = new Blob([csv], { type: 'text/csv' });
+    // Excel reads a BOM-less CSV in the system ANSI codepage, so accented clues arrive as
+    // mojibake for anyone who double-clicks the file. The JSON export stays BOM-less.
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -3502,7 +3506,7 @@ const CrosswordGenerator = () => {
                           <li key={`${h.number}-${h.direction}`}>
                             <span className="font-mono text-ink-faint mr-1.5">{Math.round(h.difficulty)}</span>
                             <span className="font-semibold">{h.number} {h.direction === 'across' ? 'A' : 'D'}</span>
-                            {' '}{h.word} — {h.clue}
+                            {' '}{h.word} — {renderRich(h.clue)}
                           </li>
                         ))}
                       </ul>

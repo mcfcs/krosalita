@@ -52,3 +52,20 @@ pipeline/__pycache__/
 **/__pycache__/
 # e2e screenshots are build artifacts, not source
 scripts/*-e2e.png
+
+# Bulk source data and scratch notebooks.
+#
+# These are NOT in the repo on purpose. public/ is copied into dist/ and deployed, so
+# anything here was also being served from the live site. The app needs only
+# crosswords.csv, corpus/ and the tagalog CSV; everything below is either pipeline input
+# or a scratch notebook, and the notebooks additionally embed local absolute paths.
+# nytcrosswordspure.csv is the raw scrape that pipeline/stages/s1_clean.py reads — keep
+# your own copy at that path to run the pipeline.
+public/nytcrosswordspure.csv
+public/2012nytmondays.csv
+public/tagalogdefinitionpure.csv
+public/*.ipynb
+tagalog-scraper/*.ipynb
+tagalog-scraper/*.csv
+tagalog_bugtong.csv
+.ipynb_checkpoints/

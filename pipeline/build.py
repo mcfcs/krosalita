@@ -6,7 +6,7 @@
 
 Watch it (including from a phone over Tailscale):
 
-    python pipeline/monitor/server.py               # http://100.71.83.125:11211
+    python pipeline/monitor/server.py               # http://localhost:11211
 
 Stages
     s1_clean     raw NYT csv -> deduped (Word, Clue) pairs, cross-reference clues removed

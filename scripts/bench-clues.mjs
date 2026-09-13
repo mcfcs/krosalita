@@ -27,7 +27,7 @@ const argv = process.argv.slice(2);
 const arg = (k, d) => { const i = argv.indexOf(k); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
 const N = Number(arg('--n', 60));
 const DO_GEN = argv.includes('--generate');
-const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
+const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://localhost:11434';
 const GEN_MODEL = arg('--model', 'qwen3.5:27b');
 
 const buf = fs.readFileSync(path.join(ROOT, 'public', 'corpus', 'corpus.bin'));

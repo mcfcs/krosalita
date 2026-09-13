@@ -109,7 +109,7 @@ export default function ReclueReview({
                     )}
                   </div>
                   {r.current?.clue && (
-                    <div className="text-[11px] text-ink-faint line-through truncate">{r.current.clue}</div>
+                    <div className="text-[11px] text-ink-faint line-through truncate">{renderRich(r.current.clue)}</div>
                   )}
                 </div>
                 <span className={`eyebrow text-[0.55rem] shrink-0 pt-1 ${st.tone}`}>{st.label}</span>

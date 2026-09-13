@@ -320,18 +320,25 @@ try {
   if (!(await clickLabel('Edit Clue'))) bad('Create: Edit Clue dialog opens', 'no Edit Clue button');
   await sleep(500);
 
+  // The class `field` is NOT unique: the Create toolbar's "required words" box carries it
+  // too and comes FIRST in the document, so querying by class typed the whole clue into
+  // the wrong control while the dialog sat there empty — and Save then wrote "".
+  // Match the Edit Clue box by its placeholder instead.
+  const CLUE_BOX = `([...document.querySelectorAll('textarea')]
+    .find(t => (t.placeholder || '').startsWith('Enter your clue')) || null)`;
+
   // Two-step on purpose.
   //
   // (1) Real keystrokes first, to prove the dialog takes typed input at all — including
   //     the '*' that carries the markup.
-  await page.evaluate(`(() => { const t = document.querySelector('textarea.field'); if (t) t.focus(); return !!t; })()`);
+  await page.evaluate(`(() => { const t = ${CLUE_BOX}; if (t) t.focus(); return !!t; })()`);
   for (const ch of '*e2e*') {
     await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch });
     await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
     await sleep(50);
   }
   await sleep(250);
-  const typedByHand = await page.evaluate(`(document.querySelector('textarea.field')?.value || '')`);
+  const typedByHand = await page.evaluate(`(${CLUE_BOX}?.value || '')`);
   if (typedByHand === '*e2e*') ok('Create: the Edit Clue box accepts real keystrokes, asterisks included');
   else bad('Create: the Edit Clue box accepts real keystrokes', `got ${JSON.stringify(typedByHand)}`);
 
@@ -342,14 +349,14 @@ try {
   //     is still empty, so Save writes an empty clue. The prototype setter + a bubbling
   //     'input' event is the one path React reliably picks up.
   await page.evaluate(`(() => {
-    const t = document.querySelector('textarea.field');
+    const t = ${CLUE_BOX};
     const set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
     set.call(t, ${JSON.stringify(CREATE_CLUE)});
     t.dispatchEvent(new Event('input', { bubbles: true }));
     return t.value;
   })()`);
   await sleep(350);
-  const typed = await page.evaluate(`(document.querySelector('textarea.field')?.value || '')`);
+  const typed = await page.evaluate(`(${CLUE_BOX}?.value || '')`);
   if (typed === CREATE_CLUE) ok('Create: the Edit Clue box holds the markup, accents, Greek and emoji verbatim');
   else bad('Create: the Edit Clue box holds the clue verbatim', `got ${JSON.stringify(typed)}`);
 
@@ -377,7 +384,7 @@ try {
   }
   await sleep(700);
   const after = await page.evaluate(`(() => ({
-    dialogOpen: !!document.querySelector('textarea.field'),
+    dialogOpen: !!${CLUE_BOX},
     current: ([...document.querySelectorAll('.eyebrow')].find(e => e.textContent.trim() === 'Current Clue')
       ?.nextElementSibling?.textContent) || null,
   }))()`);

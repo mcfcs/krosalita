@@ -415,7 +415,7 @@ try {
 
   // Optional: the AI difficulty audit, only when the configured Ollama is actually up.
   // Skipped rather than failed so this harness stays useful offline.
-  const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://100.102.10.69:11434';
+  const OLLAMA = process.env.KROSALITA_OLLAMA || 'http://localhost:11434';
 // LLM steps are OPT-IN. The model server is shared with other work, so a test run must
 // never reach for it by accident — pass --llm (or KROSALITA_E2E_LLM=1) to include the
 // audit, sense discovery and clue generation. Everything else runs without it: the

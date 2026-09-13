@@ -37,7 +37,7 @@ PAIRS = os.path.join(PIPE, "out", "pairs.csv")
 FEATURES = os.path.join(PIPE, "out", "features.csv")
 EMBED = os.path.join(PIPE, "out", "embed.csv")
 
-DEFAULT_URL = "http://100.102.10.69:11434"
+DEFAULT_URL = os.environ.get("KROSALITA_OLLAMA", "http://localhost:11434")
 DEFAULT_MODEL = "qwen3.5:27b"
 BATCH = 20
 

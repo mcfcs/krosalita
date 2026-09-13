@@ -161,7 +161,7 @@ export function solveCrossword(opts) {
 
   const fail = (e) => ({
     grid: null, placements: [], complete: false, attempts: 0, requiredPlaced: 0,
-    failedWord: null, failedSlot: null, difficultyScore: null,
+    failedWord: null, failedSlot: null, difficultyScore: null, starvation: null,
     error: e, stats: { ...stats, ms: now() - t0 },
   });
 
@@ -934,9 +934,15 @@ export function solveCrossword(opts) {
     return m;
   }
 
+  // Which slot LENGTHS the search actually starved on, counted at the one place every
+  // dead end routes through. On a big grid this is the difference between "it failed"
+  // and "every 9-letter slot ran dry" — see the starvation report assembled at the end.
+  const starveEvents = new Map();
+
   /** @returns {boolean} false when this restart is exhausted. */
   function handleFailure(t) {
     if (t < 0) return false;
+    starveEvents.set(slotLen[t], (starveEvents.get(slotLen[t]) || 0) + 1);
     for (let i = 0; i < slotLen[t]; i++) cellWeight[slotCellOf[t * MAXLEN + i]] += 1;
 
     let jump = 0;
@@ -1081,6 +1087,109 @@ export function solveCrossword(opts) {
       out += popcount32(m) === 1 ? String.fromCharCode(A_CODE + ctz32(m)) : '_';
     }
     return out;
+  }
+
+  // ---- failure diagnosis -------------------------------------------------
+  // "It failed" is not actionable. What a caller can act on is WHICH slot lengths ran out
+  // of answers and how many the word list really offers at those lengths ONCE THE
+  // CROSSING LETTERS ARE APPLIED — the number that collapses from "8,031 eight-letter
+  // answers" to "none that start B-L-_-_-Z". Both numbers are reported.
+
+  /** Answers of slot `s`'s length still consistent with the letters standing in `g`. */
+  function candidatesForSlot(s, g, usedIdx) {
+    const len = slotLen[s];
+    const li = index.byLen[len];
+    if (!li) return 0;
+    const W = li.W;
+    for (let i = 0; i < W; i++) scratch[i] = li.all[i];
+    for (let i = 0; i < len; i++) {
+      const ci = slotCellOf[s * MAXLEN + i];
+      const ch = g?.[(ci / cols) | 0]?.[ci % cols];
+      if (!ch || ch === '#' || ch.length !== 1) continue;
+      const l = ch.charCodeAt(0) - A_CODE;
+      if (l < 0 || l > 25) continue;
+      const row = (i * 26 + l) * W;
+      for (let w = 0; w < W; w++) scratch[w] &= li.byLetter[row + w];
+    }
+    let n = 0;
+    for (let w = 0; w < W; w++) n += popcount32(scratch[w]);
+    // Answers can't repeat, so one already standing in the grid is not available here.
+    if (usedIdx) {
+      for (const wi of usedIdx) {
+        if ((scratch[wi >>> 5] & (1 << (wi & 31))) !== 0) n--;
+      }
+    }
+    return n < 0 ? 0 : n;
+  }
+
+  function diagnoseStarvation(g, placed) {
+    const usedByLen = new Map();
+    for (const p of placed) {
+      const L = p.word.length;
+      let set = usedByLen.get(L);
+      if (!set) usedByLen.set(L, (set = new Set()));
+      set.add(p.wordIndex);
+    }
+    const placedIds = new Set(placed.map((p) => p.slot.id));
+    const byLen = new Map();
+    for (let s = 0; s < S; s++) {
+      const L = slotLen[s];
+      let e = byLen.get(L);
+      if (!e) {
+        const li = index.byLen[L];
+        byLen.set(L, (e = {
+          len: L, slots: 0, filled: 0, unfilled: 0, starved: 0,
+          corpus: li ? li.count + li.extra : 0,
+          deadEnds: starveEvents.get(L) || 0,
+          _cand: [],
+        }));
+      }
+      e.slots++;
+      if (placedIds.has(slots[s].id)) { e.filled++; continue; }
+      e.unfilled++;
+      const n = candidatesForSlot(s, g, usedByLen.get(L));
+      e._cand.push(n);
+      if (n === 0) e.starved++;
+    }
+    const rows = [...byLen.values()].sort((a, b) => a.len - b.len).map((e) => {
+      const c = e._cand.sort((a, b) => a - b);
+      delete e._cand;
+      return {
+        ...e,
+        minCandidates: c.length ? c[0] : null,
+        medianCandidates: c.length ? c[c.length >> 1] : null,
+        maxCandidates: c.length ? c[c.length - 1] : null,
+      };
+    });
+    const worst = rows.filter((r) => r.starved > 0)
+      .sort((a, b) => b.starved - a.starved || a.len - b.len);
+    const phrase = (r) => `${r.starved} slot${r.starved === 1 ? '' : 's'} of length ${r.len} `
+      + `(${r.medianCandidates} candidate${r.medianCandidates === 1 ? '' : 's'} left after crossings; `
+      + `the word list has ${r.corpus.toLocaleString()} ${r.len}-letter answers)`;
+    // A timeout usually stops with a SPARSE best grid, where almost nothing has starved
+    // yet — the honest account there is where the search kept dying, not where the best
+    // partial happens to be tight. Both are reported; the summary picks whichever
+    // actually describes this failure.
+    const thrash = rows.filter((r) => r.deadEnds > 0)
+      .sort((a, b) => b.deadEnds - a.deadEnds || a.len - b.len);
+    const thrashPhrase = (r) => `length ${r.len} (${r.deadEnds.toLocaleString()} dead ends; `
+      + `${r.medianCandidates} of the word list's ${r.corpus.toLocaleString()} `
+      + `${r.len}-letter answers still fit the crossings)`;
+    let summary = null;
+    if (worst.length) {
+      summary = `Ran out of answers for ${worst.slice(0, 3).map(phrase).join(', ')}`
+        + (worst.length > 3 ? `, and ${worst.length - 3} more lengths` : '') + '.';
+    } else if (thrash.length) {
+      summary = `The search kept dead-ending on ${thrash.slice(0, 2).map(thrashPhrase).join(' and ')}.`;
+    }
+    return {
+      filledSlots: placed.length,
+      totalSlots: S,
+      byLength: rows,
+      worstLengths: worst.map((r) => r.len),
+      deadEndLengths: thrash.map((r) => r.len),
+      summary,
+    };
   }
 
   // ---- best-partial tracking --------------------------------------------
@@ -1337,7 +1446,7 @@ export function solveCrossword(opts) {
     return {
       grid: null, placements: [], complete: false, attempts: 0, requiredPlaced: 0,
       failedWord: null, failedSlot: preflightError.detail?.slot ?? null,
-      difficultyScore: null, error: preflightError, stats,
+      difficultyScore: null, starvation: null, error: preflightError, stats,
     };
   }
 
@@ -1394,6 +1503,23 @@ export function solveCrossword(opts) {
     failedSlot = worst >= 0 ? worst : null;
   }
 
+  // A failed fill carries its diagnosis: the slot lengths that starved, and how many
+  // answers the word list still offers at those lengths with the crossing letters in
+  // place. Computed only on failure, and only once — it is a few thousand u32 ANDs.
+  let starvation = null;
+  let failError = null;
+  if (!complete) {
+    starvation = diagnoseStarvation(grid, placements);
+    const tail = starvation.summary ? ` ${starvation.summary}` : '';
+    failError = outcome === 'ABORTED'
+      ? err('TIMEOUT',
+        `Couldn't fill this grid in ${(timeoutMs / 1000).toFixed(0)}s — got ${placements.length} of ${S} answers.${tail}`,
+        { starvation })
+      : err('NO_SOLUTION',
+        `No complete fill exists for this layout with the current word list — got ${placements.length} of ${S} answers.${tail}`,
+        { starvation });
+  }
+
   cleanup();
   return {
     grid,
@@ -1405,9 +1531,8 @@ export function solveCrossword(opts) {
     failedSlot: failedSlot != null ? slots[failedSlot]?.id ?? null : null,
     difficultyScore,
     difficultyMean,
-    error: complete ? null : (outcome === 'ABORTED'
-      ? err('TIMEOUT', `Couldn't fill this grid in ${(timeoutMs / 1000).toFixed(0)}s — got ${placements.length} of ${S} answers. Try another layout, or widen the difficulty.`)
-      : err('NO_SOLUTION', `No complete fill exists for this layout with the current word list — got ${placements.length} of ${S} answers.`)),
+    starvation,
+    error: failError,
     stats,
   };
 }

@@ -3,6 +3,17 @@ import React from 'react';
 // Lightweight clue markup so constructors can add emphasis:
 //   **bold**   *italic*   _italic_
 // Symbols / accents / emoji just pass through as normal text.
+/**
+ * The same markup with the markers taken off, for places that cannot render elements —
+ * a canvas, a .txt answer key. Without this, a clue written as **King** is drawn into the
+ * downloadable PNG with the asterisks visible, which is the one place the leak ends up in
+ * a file the author hands to somebody else.
+ */
+export function plainRich(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1').replace(/_([^_]+)_/g, '$1');
+}
+
 export function renderRich(text) {
   if (!text || typeof text !== 'string') return text;
   const re = /(\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_)/g;
