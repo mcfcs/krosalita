@@ -185,6 +185,12 @@ const CrosswordGenerator = () => {
   // Signature of the last Create fill, so Regenerate can tell when it produced the same
   // grid again and try once more with a different seed.
   const lastFillSigRef = useRef('');
+  // The difficulty the SOLVER measured, tagged with the grid it describes. The effect below
+  // recomputes difficulty whenever the grid changes — which includes the moment a generate
+  // finishes — so without this it immediately overwrote the worker's clue percentile with
+  // the cruder CSV-label average, and the number the user saw was never the one the
+  // generator had steered toward.
+  const solverDiffRef = useRef(null);
   // Where the puzzle being played came from, so a finished solve can be recorded under a
   // stable identity rather than an anonymous hash.
   const playMetaRef = useRef(null);
@@ -290,16 +296,70 @@ const CrosswordGenerator = () => {
     return { score: avg * 100, label: difficultyLabelFromScore(avg) };
   }, [getDateInfoForWord, getDateInfoForWordClue]);
 
+  /**
+   * What difficulty to show for the puzzle on screen.
+   *
+   * Three sources, in descending order of how much they actually know:
+   *
+   *  1. The solver, when this is the grid it just built. It measured the difficulty of the
+   *     clues it chose, against the corpus's own clue distribution.
+   *  2. The distilled clue model, scoring the real clue TEXT. This is the only thing that
+   *     works for a puzzle the app did not build — a Browse import, a shared code, a file.
+   *  3. computePuzzleDifficulty, the old CSV-label average, if the model cannot be loaded.
+   *
+   * (2) matters more than it sounds. The old path looked each answer up in crosswords.csv
+   * and, when the imported clue text did not match any row — which it almost never does —
+   * fell back to `list[0]`, the difficulty of A DIFFERENT CLUE that merely shares the
+   * answer. Measured across five real Crosswithfriends puzzles, 224 clues: 8% matched
+   * exactly, 84% took an unrelated clue's label, 8% got the 0.5 default. So the number was
+   * close to noise, and it showed: a plain 15x15 daily was labelled Hard (72) while the
+   * genuinely fiendish CRYPTIC in the same batch came out at 68. Scoring the text puts the
+   * cryptic at 88 and the daily at 44.
+   */
   useEffect(() => {
-    let info = { score: null, label: '' };
-    if (activeTab === 'play' && playAnswers && playClues) {
-      info = computePuzzleDifficulty(playAnswers, playClues);
-    } else if (activeTab === 'create' && manualGrid && manualClues) {
-      info = computePuzzleDifficulty(manualGrid, manualClues);
-    } else if (grid && clues) {
-      info = computePuzzleDifficulty(grid, clues);
+    const gridData = activeTab === 'play' ? playAnswers : activeTab === 'create' ? manualGrid : grid;
+    const clueSet = activeTab === 'play' ? playClues : activeTab === 'create' ? manualClues : clues;
+    if (!gridData || !clueSet) { setDifficultyInfo({ score: null, label: '' }); return undefined; }
+
+    // (1) the solver already answered this, for this exact grid.
+    const sig = gridSignature(gridData);
+    const solved = solverDiffRef.current;
+    if (solved && solved.sig === sig && solved.score != null) {
+      setDifficultyInfo({ score: solved.score, label: solved.label });
+      return undefined;
     }
-    setDifficultyInfo(info);
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const model = await loadScorer();
+        const all = [...(clueSet.across || []), ...(clueSet.down || [])];
+        const pcts = [];
+        for (const c of all) {
+          const word = (c.word
+            || getWordFromGrid(gridData, c.row, c.col, c.length, c.direction || 'across') || '').toUpperCase();
+          if (!word || !c.clue || word.includes('_')) continue;
+          // No corpus on this thread, so the answer features are absent and the trees take
+          // their missing-value branch. That is the model's documented cold-start path.
+          const pct = cluePercentile(model, word, c.clue, {});
+          if (typeof pct === 'number' && Number.isFinite(pct)) pcts.push(pct);
+        }
+        if (cancelled) return;
+        if (!pcts.length) { setDifficultyInfo(computePuzzleDifficulty(gridData, clueSet)); return; }
+        // Median, not mean: one deliberately fiendish clue should not relabel the puzzle.
+        pcts.sort((a, b) => a - b);
+        const score = pcts[pcts.length >> 1];
+        setDifficultyInfo({ score, label: difficultyLabelFromScore(score / 100) });
+      } catch {
+        if (!cancelled) setDifficultyInfo(computePuzzleDifficulty(gridData, clueSet));
+      }
+    })();
+    return () => { cancelled = true; };
+    // loadScorer is deliberately NOT in this list. It is a `const` declared further down the
+    // component, and a dependency array is evaluated DURING render — naming it here throws
+    // "Cannot access 'loadScorer' before initialization" and takes the whole app down to a
+    // white screen. Calling it inside the effect body is fine: that runs after render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, playAnswers, playClues, manualGrid, manualClues, grid, clues, computePuzzleDifficulty]);
 
   // Clear failed highlight if the word is no longer present in the current grid
@@ -858,6 +918,11 @@ const CrosswordGenerator = () => {
       setClues(generatedClues);
       setLatestGrid(newGrid);
       setLatestClues(generatedClues);
+      // Tag it with the grid it describes so the scoring effect defers to it instead of
+      // recomputing a cruder number over the top.
+      solverDiffRef.current = difficultyMeta && difficultyMeta.score != null
+        ? { sig: gridSignature(newGrid), score: difficultyMeta.score, label: difficultyMeta.label }
+        : null;
       setDifficultyInfo(difficultyMeta || computePuzzleDifficulty(newGrid, generatedClues));
       const placedReq = computePlacedRequired(newGrid, layoutIdx, requiredMerged);
       setRequiredHighlights(new Set(placedReq));
@@ -911,6 +976,11 @@ const CrosswordGenerator = () => {
       setClues(generatedClues);
       setLatestGrid(newGrid);
       setLatestClues(generatedClues);
+      // Tag it with the grid it describes so the scoring effect defers to it instead of
+      // recomputing a cruder number over the top.
+      solverDiffRef.current = difficultyMeta && difficultyMeta.score != null
+        ? { sig: gridSignature(newGrid), score: difficultyMeta.score, label: difficultyMeta.label }
+        : null;
       setDifficultyInfo(difficultyMeta || computePuzzleDifficulty(newGrid, generatedClues));
       const placedReq = computePlacedRequired(newGrid, layoutIdx, requiredMerged);
       setRequiredHighlights(new Set(placedReq));

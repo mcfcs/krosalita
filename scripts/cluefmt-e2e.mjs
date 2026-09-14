@@ -472,6 +472,44 @@ try {
   if (page.errors.length === 0) ok('no page-level JS errors captured');
   else bad('no page-level JS errors captured', page.errors.slice(0, 3).join(' | '));
 
+  // ========== 4b. an imported puzzle is scored from its own clue TEXT ==========
+  // This fixture was imported from a file, so it has no difficulty metadata and its clues
+  // are not in the corpus — exactly a Browse import's situation. The old path looked each
+  // ANSWER up in crosswords.csv and, when the clue text matched no row (it almost never
+  // does), used `list[0]` — the label of a DIFFERENT clue sharing that answer. Measured
+  // over 224 clues from five real Crosswithfriends puzzles: 8% matched exactly, 84% took
+  // an unrelated clue's label, 8% got a flat 0.5. Scoring the text is now async, so what
+  // this guards is that it resolves at all and puts a real number on screen.
+  await clickTab('Play');
+  await sleep(900);
+  let diffChip = null;
+  for (let i = 0; i < 30; i++) {
+    await sleep(500);
+    // The evaluated string below contains no backslashes on purpose: it is interpolated
+    // into a JS template literal first, where an escape sequence is either eaten or turned
+    // into a real control character inside the regex literal. Hence the [^!-~] split
+    // instead of a whitespace character class.
+    diffChip = await page.evaluate(`(() => {
+      // There are two "Difficulty" labels on screen: the band SELECTOR in the header
+      // (Random/Easy/Fair/...) and the solve toolbar chip that reports what this puzzle
+      // actually is. Only the second carries a parenthesised score, so match on that.
+      const labs = [...document.querySelectorAll('*')].filter(e => e.children.length === 0
+        && /^difficulty$/i.test((e.textContent || '').trim()));
+      const lab = labs.find(e => e.parentElement && /[(][0-9]+[)]/.test(e.parentElement.textContent || ''));
+      if (!lab || !lab.parentElement) return null;
+      const t = (lab.parentElement.innerText || '').split(/[^!-~]+/).filter(Boolean).join(' ').trim();
+      const m = t.match(/([0-9]+)/);
+      return { text: t, score: m ? Number(m[1]) : null };
+    })()`);
+    if (diffChip && diffChip.score != null) break;
+  }
+  if (diffChip && diffChip.score != null && diffChip.score >= 0 && diffChip.score <= 100) {
+    ok(`an imported puzzle is scored from its own clues ("${diffChip.text}")`);
+  } else {
+    bad('an imported puzzle is scored from its own clues',
+      `no score rendered — the async scoring never resolved (${JSON.stringify(diffChip)})`);
+  }
+
   // ============ 5. the highlighted row must clear its sticky heading ============
   // LAST, and after a reload. Selecting an entry changes the active clue, and doing that
   // mid-run would break the dock and GameView assertions above, which read whichever clue
