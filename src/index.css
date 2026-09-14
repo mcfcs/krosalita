@@ -243,6 +243,13 @@
      Decide on the pointer instead, and keep the spacer in step with it so the controls
      under the grid stay reachable. */
   .solve-dock { display: block; }
+  /* The exact complement of .solve-dock, so the current clue is shown once and only once:
+     the dock carries it on anything with a coarse pointer or a narrow screen, this bar
+     carries it everywhere else. Before this a desktop had neither. */
+  .desk-clue-bar { display: none; }
+  @media (min-width: 1024px) and (pointer: fine) {
+    .desk-clue-bar { display: flex; }
+  }
   .solve-dock-pad { padding-bottom: 18rem; }
   @media (min-width: 1024px) and (pointer: fine) {
     .solve-dock { display: none; }

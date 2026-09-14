@@ -26,14 +26,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 const ok = (n) => { results.push({ n, pass: true }); console.log(`  PASS  ${n}`); };
 const bad = (n, d) => { results.push({ n, pass: false, d }); console.log(`  FAIL  ${n}${d ? ` — ${d}` : ''}`); };
+const skip = (n, d) => console.log(`  skip  ${n}${d ? ` — ${d}` : ''}`);
 
 // ------------------------------------------------------------------ fixtures
 // Every awkward character class in one place: markup, an em dash, a curly apostrophe,
 // two accents, a lowercase and an uppercase Greek letter, and two astral-plane emoji
 // (which are surrogate PAIRS in UTF-16 — the classic place a truncating exporter breaks).
 const SYMBOLS = ['—', '’', 'é', 'ñ', 'π', 'Δ', '🎉', '☕'];
-const ACROSS_CLUE = 'Akron’s **King** — *four-time* MVP, at a café with π and 🎉';
-const DOWN_CLUE = '_Crammed_ full, like a piñata at a Δ party — ☕';
+// The corpus carries real HTML as well as this app's markdown: 70 of 209,427 clues have
+// tags (<em> x46, <span>, <sup>, <i>, <br />) and 25 have entities (&mdash;, &deg;,
+// &#x1F602;). Those rendered literally — "<i>White Men Can't Jump</i> star Wesley" showed
+// its tags on screen and ROFL's clue read "&#x1F602; &#x1F602; &#x1F602;". Both
+// vocabularies are in the fixture so neither can regress.
+const ACROSS_CLUE = 'Akron’s **King** — <i>four-time</i> MVP, at a caf&eacute; with &#x3C0; and 🎉';
+const DOWN_CLUE = '<em>Crammed</em> full, like a pi&ntilde;ata at a Δ party &mdash; ☕ <span>x</span>';
 const CREATE_CLUE = 'A **bold** and *italic* café — piñata, Δ, π, 🎉 ☕ test';
 
 const answers = [
@@ -223,9 +229,11 @@ try {
     } else {
       bad(`${name}: renders real <strong>/<em>`, `strong=${JSON.stringify(p.strong)} em=${JSON.stringify(p.em)} html=${p.html}`);
     }
-    const leaked = /\*\*|\*|_/.test(p.text) ? p.text.match(/\*+|_/g) : null;
-    if (!leaked) ok(`${name}: no literal * / ** / _ left in the visible text`);
-    else bad(`${name}: no literal markup left in the visible text`, `leaked ${JSON.stringify(leaked)} in "${p.text}"`);
+    // Markdown markers, HTML tags and HTML entities must all be gone from the VISIBLE
+    // text — a clue reading "<i>...</i>" or "&#x1F602;" is not a clue.
+    const leaked = p.text.match(/\*+|_|<\/?[a-zA-Z][^>]*>|&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,11});/g);
+    if (!leaked) ok(`${name}: no literal markup, tag or entity left in the visible text`);
+    else bad(`${name}: no literal markup, tag or entity left in the visible text`, `leaked ${JSON.stringify(leaked)} in "${p.text}"`);
     const missing = (want.symbols || []).filter((s) => !p.text.includes(s));
     if (!missing.length) ok(`${name}: every symbol survived (${(want.symbols || []).join(' ')})`);
     else bad(`${name}: every symbol survived`, `missing ${JSON.stringify(missing)} from "${p.text}"`);
@@ -256,6 +264,24 @@ try {
   if (loaded) ok('imported a puzzle whose clues carry markup, accents, Greek and emoji');
   else throw new Error('the rich-clue puzzle never loaded into Play');
   await sleep(600);
+
+  // ===================== 0. the current clue is visible at all =====================
+  // On a desktop the on-screen dock is hidden, so before .desk-clue-bar existed there was
+  // nothing above the grid naming the entry you were in — the only way to read your own
+  // clue was to hunt for the highlighted row in the side list.
+  const bar = await page.evaluate(`(() => {
+    const el = document.querySelector('.desk-clue-bar');
+    if (!el) return { present: false };
+    return { present: true, display: getComputedStyle(el).display,
+             text: (el.innerText || '').replace(/\s+/g, ' ').trim(),
+             buttons: el.querySelectorAll('button').length };
+  })()`);
+  if (bar.present && bar.display !== 'none') ok('the current-clue bar is shown above the grid');
+  else bad('the current-clue bar is shown above the grid', JSON.stringify(bar));
+  if (bar.present && bar.buttons >= 2) ok('the clue bar carries previous/next controls');
+  else bad('the clue bar carries previous/next controls', `${bar.buttons} buttons`);
+  if (bar.present && !/<\/?[a-zA-Z]|&#|\*\*/.test(bar.text || '')) ok('the clue bar renders markup rather than printing it');
+  else bad('the clue bar renders markup rather than printing it', JSON.stringify(bar.text));
 
   // ================================ 1. Play clue list ================================
   const CLUE_ROW = (n) => `([...document.querySelectorAll('.xw-grid--play')].length
@@ -445,6 +471,58 @@ try {
   // ---------------------------- page errors + screenshot ----------------------------
   if (page.errors.length === 0) ok('no page-level JS errors captured');
   else bad('no page-level JS errors captured', page.errors.slice(0, 3).join(' | '));
+
+  // ============ 5. the highlighted row must clear its sticky heading ============
+  // LAST, and after a reload. Selecting an entry changes the active clue, and doing that
+  // mid-run would break the dock and GameView assertions above, which read whichever clue
+  // is current. The session restores the puzzle, so the reload costs nothing.
+  await page.send('Page.reload');
+  await sleep(3000);
+  // The session restores whichever tab was last active, which is not necessarily Play.
+  for (let i = 0; i < 60; i++) {
+    if (await page.evaluate(`[...document.querySelectorAll('button.tab')].some(x => (x.textContent||'').trim() === 'Play')`)) break;
+    await sleep(400);
+  }
+  await clickTab('Play');
+  await sleep(900);
+  for (let i = 0; i < 40; i++) {
+    if (await page.evaluate(`!!document.querySelector('.xw-grid--play')`)) break;
+    await sleep(400);
+  }
+  // Select THROUGH THE CLUE LIST: clicking a grid square would land on a cell this
+  // two-clue fixture has no entry for, which clears the selection. 2-Down sits at the top
+  // of its section — exactly where the sticky DOWN heading used to cover the highlighted
+  // row and leave it showing as a clipped sliver.
+  const picked = await page.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => {
+      const n = x.querySelector('span.font-mono');
+      return n && n.textContent.trim() === '2' && x.className.includes('w-full');
+    });
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(700);
+  if (!picked) {
+    skip('the highlighted clue clears its sticky heading', 'no clue row to select');
+  } else {
+    const row = await page.evaluate(`(() => {
+      const active = [...document.querySelectorAll('button')].find(b => b.className.includes('bg-accent') && b.className.includes('w-full'));
+      if (!active) return { found: false };
+      const head = active.closest('div')?.previousElementSibling;
+      if (!head) return { found: true, measured: false };
+      const a = active.getBoundingClientRect();
+      const h = head.getBoundingClientRect();
+      return { found: true, measured: true, clear: a.top >= h.bottom - 1,
+               activeTop: Math.round(a.top), headerBottom: Math.round(h.bottom) };
+    })()`);
+    if (row.found && row.measured && row.clear) {
+      ok(`the highlighted clue clears its sticky heading (top ${row.activeTop} vs header bottom ${row.headerBottom})`);
+    } else if (row.found && row.measured) {
+      bad('the highlighted clue clears its sticky heading', `hidden under it: ${JSON.stringify(row)}`);
+    } else {
+      bad('the highlighted clue clears its sticky heading', JSON.stringify(row));
+    }
+  }
 
   const shot = await page.send('Page.captureScreenshot', { format: 'png' });
   if (shot.result?.data) {

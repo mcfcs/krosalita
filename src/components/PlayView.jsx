@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, Trophy, Maximize } from './Icons';
+import { ChevronDown, ChevronLeft, ChevronRight, Trophy, Maximize } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import CrosswordGrid from './CrosswordGrid';
 import { renderRich } from '../utils/richText';
@@ -73,10 +73,19 @@ const PlayView = ({
     const el = clueRefs.current[activeClueId];
     const container = cluesContainerRef.current;
     if (!el || !container) return;
+    // The ACROSS/DOWN heading is `sticky top-0`, so the first rows of a section sit
+    // underneath it. Scrolling the active clue to `top - 12` therefore parked it behind
+    // the heading, which is why the highlighted row showed as a clipped sliver. Treat the
+    // band the heading occupies as not visible.
+    const header = el.closest('div')?.previousElementSibling;
+    const headerH = header && getComputedStyle(header).position === 'sticky'
+      ? header.offsetHeight : 0;
     const top = el.offsetTop;
     const bottom = top + el.offsetHeight;
-    if (top < container.scrollTop || bottom > container.scrollTop + container.clientHeight) {
-      container.scrollTop = Math.max(0, top - 12);
+    const viewTop = container.scrollTop + headerH;
+    const viewBottom = container.scrollTop + container.clientHeight;
+    if (top < viewTop || bottom > viewBottom) {
+      container.scrollTop = Math.max(0, top - headerH - 12);
     }
   }, [activeClueId]);
 
@@ -154,6 +163,42 @@ const PlayView = ({
               <button onClick={onTogglePause} className="btn btn-accent">Resume solving</button>
             </div>
           )}
+          {/* The clue you are actually on. The phone gets this from MobileSolveDock, but the
+              dock is hidden on a wide screen with a mouse — so on a desktop there was
+              nothing above the grid saying which entry you were in, and the only way to
+              read your own clue was to hunt for the highlighted row in the side list.
+              `desk-clue-bar` is the exact complement of `.solve-dock`, so precisely one of
+              the two is ever visible. */}
+          <div className="desk-clue-bar items-stretch gap-2 mb-3">
+            <button
+              onClick={() => goToAdjacentClue(-1)}
+              className="w-9 shrink-0 flex items-center justify-center rounded-lg border border-line bg-paper-sunken hover:bg-ink/5 transition"
+              aria-label="Previous clue"
+            >
+              <ChevronLeft size={18} />
+            </button>
+            <div className="flex-1 min-w-0 flex items-center gap-3 rounded-lg border border-line bg-paper-sunken px-3.5 py-2.5">
+              <span className="font-mono font-bold text-accent tabular-nums shrink-0">
+                {activeClue?.number ?? '—'}
+                <span className="ml-1 text-[0.7rem] uppercase tracking-wide text-ink-faint">
+                  {playDirection === 'across' ? 'A' : 'D'}
+                </span>
+              </span>
+              <span className="text-ink leading-snug">
+                {activeClue?.clue
+                  ? renderRich(activeClue.clue)
+                  : <span className="text-ink-faint italic">Select a square to see its clue.</span>}
+              </span>
+            </div>
+            <button
+              onClick={() => goToAdjacentClue(1)}
+              className="w-9 shrink-0 flex items-center justify-center rounded-lg border border-line bg-paper-sunken hover:bg-ink/5 transition"
+              aria-label="Next clue"
+            >
+              <ChevronRight size={18} />
+            </button>
+          </div>
+
           <div className="overflow-x-auto pb-2">
             <CrosswordGrid
               playGrid={playGrid}
