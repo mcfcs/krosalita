@@ -879,8 +879,24 @@ const CrosswordGenerator = () => {
           },
         });
       }
-      setProgress(`Success! All ${slots.length} slots filled.`);
-      setTimeout(() => setProgress(''), 5000);
+      // An unreachable band must be said out loud, not silently rendered as a different
+      // label. The corpus floor is real: only ~5% of answers score below 21, so a 78-entry
+      // grid genuinely cannot average down to Easy however the fill is steered. Measured:
+      // Easy round-trips on every small and mid grid, and lands at the bottom of Fair on
+      // Standard 15x15 (21) and Sunday 21x21 (26).
+      const rep = result.difficultyReport;
+      if (rep && rep.onTarget === false && rep.requestedPercentile != null) {
+        const wanted = difficultyLabelFromScore(rep.requestedPercentile / 100);
+        const got = difficultyLabelFromScore(rep.achievedPercentile / 100);
+        setProgress(`Filled all ${slots.length} slots — but this grid could not reach ${wanted}. `
+          + `The closest it gets is ${got} (${rep.achievedPercentile} of 100): there are not enough `
+          + `${wanted.toLowerCase()} clues in the word list for ${slots.length} answers. `
+          + `A smaller grid can go easier.`);
+        setTimeout(() => setProgress(''), 12000);
+      } else {
+        setProgress(`Success! All ${slots.length} slots filled.`);
+        setTimeout(() => setProgress(''), 5000);
+      }
       setFailedWord(null);
     } else if (newGrid) {
       // Stopped early - show best result
