@@ -57,6 +57,29 @@ export function clueRevealsAnswer(clue, word) {
   return new RegExp(`(^|[^A-Z])${w}([^A-Z]|$)`).test(c);
 }
 
+/**
+ * The same question with punctuation and word boundaries ignored, for clue text a MODEL
+ * wrote rather than an editor.
+ *
+ * The boundary rule above is right for published clues — of 209,427 in the corpus it
+ * wrongly rejects 36, all of them legitimate (OOMPA's "___-Loompa", INKA's "___ Dinka
+ * Doo"). But it is blind to the model's favourite trick, which is to reach for the answer
+ * itself: TEUT "Teutonic: Abbr.", TREO "Treos", ATTA "Attaboy start", COLDSHOULDER "Give
+ * cold shoulder" all sail through, and that was 2% of generated output.
+ *
+ * So this is deliberately NOT wired into isClueUsableFor: applying it to the corpus would
+ * cost 36 good clues and leave two answers with none at all, to catch two bad ones. It
+ * guards the generated path, where the ratio is the other way round.
+ *
+ * Gated at 4 letters because below that the coincidences dominate — CAT would lose
+ * "Catalog opener", a real device.
+ */
+export function clueRevealsAnswerStrict(clue, word) {
+  if (clueRevealsAnswer(clue, word)) return true;
+  if (!clue || !word || word.length < 4) return false;
+  return clue.toUpperCase().replace(/[^A-Z]/g, '').includes(word.toUpperCase());
+}
+
 /** Usable for THIS puzzle: passes the filters and doesn't leak the answer. */
 export const isClueUsableFor = (clue, word) =>
   isClueUsable(clue) && !clueRevealsAnswer(clue, word);

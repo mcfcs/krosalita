@@ -296,10 +296,26 @@ export const auditDifficulty = async ({ baseUrl, model, entries, onProgress, sig
 const GEN_BATCH_SIZE = 15;
 const GEN_TIMEOUT_MS = 240000; // a 27B model writing ~30 clues takes a while
 
+/** Token budget for a response carrying `items` clue objects, with headroom. */
+const budgetFor = (items) => Math.min(8000, 400 + items * 45);
+
+/** Answers per request, so a big `perWord` shrinks the batch instead of overrunning. */
+export const genBatchSize = (perWord) => Math.max(1, Math.min(GEN_BATCH_SIZE,
+  Math.floor(120 / Math.max(1, perWord))));
+
+// Length is the single biggest thing the model gets wrong when asked for an easy clue.
+// Measured on the shipped scorer, same answer and same meaning each time:
+//   SLED  "Snow rider" p22   ->  "A vehicle used for riding down snowy hills" p65
+//   ETSY  "Craft site" p15   ->  "Site for handmade goods sellers"            p45
+//   ATTA  "___ boy"    p29   ->  "Common prefix for 'boy' and 'girl' phrases" p67
+// Asked for EASY, the model wrote the 30-45 character versions almost every time and
+// missed the band it had just been asked for. That is not the scorer being fooled: a
+// printed Monday clue really is a two-word fragment, and the model was writing glossary
+// definitions. Spelling the length out moves more than any adjective about difficulty.
 const GEN_RUBRIC = {
-  easy: 'a plain, direct definition of the answer, the kind a Monday solver gets instantly',
-  medium: 'moderately challenging, with light wordplay or a slightly indirect angle',
-  hard: 'genuinely tough — wordplay, misdirection, or a less obvious sense of the word',
+  easy: 'a plain, direct definition — and TERSE, the length a printed Monday clue actually is: two to four words, a fragment and never a sentence ("Snow rider", "Craft site", "Sport with mallets")',
+  medium: 'moderately challenging, with light wordplay or a slightly indirect angle, and still short — a printed clue, not a definition',
+  hard: 'genuinely tough — wordplay, misdirection, or a less obvious sense of the word, still phrased as a short printed clue',
 };
 
 /**
@@ -311,14 +327,24 @@ export const parseGenerateResponse = (text, batchSize) => {
   if (!text) return [];
   const cleaned = String(text).replace(/^```(?:json)?|```$/gm, '').trim();
   const match = cleaned.match(/\[[\s\S]*\]/);
-  if (!match) return [];
-  let arr;
-  try {
-    arr = JSON.parse(match[0]);
-  } catch {
-    return [];
+  let arr = null;
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch { /* fall through to salvage */ }
   }
-  if (!Array.isArray(arr)) return [];
+  // A response cut off by num_predict has no closing bracket, so the whole array fails to
+  // parse and every clue in the batch is lost -- measured: asking for 8 clues x 15 answers
+  // returned 0 usable clues, twice, because both attempts ran past the token budget.
+  // The items themselves are complete up to the cut, so salvage them one by one.
+  if (!arr) {
+    arr = [];
+    for (const m of cleaned.matchAll(/\{[^{}]*\}/g)) {
+      try { arr.push(JSON.parse(m[0])); } catch { /* skip this one item */ }
+    }
+    if (!arr.length) return [];
+  }
   const out = [];
   for (const item of arr) {
     if (!item || typeof item !== 'object') continue;
@@ -365,7 +391,10 @@ Rules:
 - Never include the answer, or any part of it, in its own clue.
 - Never refer to another entry ("see 14-Across", "with 3-Down") — these puzzles are generated, so the numbers would be meaningless.
 - Never refer to the grid, its theme, circled or shaded squares.
-- Keep each clue short, the way a printed crossword clue is short.
+- Keep each clue short, the way a printed crossword clue is short: a noun phrase or
+  fragment of two to five words. "Snow rider", not "A vehicle for riding down snow".
+- Vary the length across the ${perWord} clues for an answer. Make at least two of them as
+  short as you can while still being fair.
 - Clue only the meaning indicated. If none is given, work out the most likely reading first.
 
 Reply with ONLY a JSON array of {"i":<answer number>,"r":"<the reading you clued, e.g. AM I NOT>","c":"<clue>"}, ${perWord} entries per answer. No prose, no code fences.
@@ -394,9 +423,10 @@ export const generateCluesBatch = async ({
   if (mc) throw new Error(mc);
 
   let done = 0;
-  for (let start = 0; start < list.length; start += GEN_BATCH_SIZE) {
+  const step = genBatchSize(perWord);
+  for (let start = 0; start < list.length; start += step) {
     if (signal?.aborted) throw new Error('Clue generation cancelled.');
-    const batch = list.slice(start, start + GEN_BATCH_SIZE);
+    const batch = list.slice(start, start + step);
     let items = [];
 
     for (let attempt = 0; attempt < 2 && !items.length; attempt += 1) {
@@ -410,7 +440,11 @@ export const generateCluesBatch = async ({
             prompt: generatePrompt(batch, band, perWord),
             stream: false,
             think: false,
-            options: { temperature: 0.8, num_predict: 1400 },
+            // One returned item is `{"i":1,"r":"ERNE","c":"Heraldic eagle"}, ` -- about 25
+            // tokens, more when the reading is a spelled-out phrase. A flat 1400 was
+            // enough for the 30 clues the UI used to ask for and silently truncated
+            // anything larger, so size the budget to what was actually requested.
+            options: { temperature: 0.8, num_predict: budgetFor(batch.length * perWord) },
           }),
           signal: t.signal,
         });

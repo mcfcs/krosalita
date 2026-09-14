@@ -2453,11 +2453,20 @@ const CrosswordGenerator = () => {
       ]);
       const corpus = shimCorpus(data);
       const generate = ollamaConfig.enabled
-        ? makeGenerator({ baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 4, signal: ctrl.signal })
+        // perWord was 4, but the batch request was silently truncating: at 4 the model
+        // returned ONE clue per answer, at 8 it returned none at all, twice, and gave up.
+        // With the budget fixed, over-generating is where the in-band hits come from —
+        // scoring is local and instant, so the only cost is a little model time.
+        ? makeGenerator({ baseUrl: ollamaConfig.baseUrl, model: ollamaConfig.model, perWord: 8, signal: ctrl.signal })
         : null;
       const out = await recluePuzzle(corpus, model, entries, {
         band,
         generate,
+        // Embeddings live on localhost, not on the generation host — the remote box has no
+        // embedding model. This populates `chosen.suspect`, which ReclueReview has always
+        // rendered as a "check accuracy" badge and which nothing has ever set, so the
+        // warning has never once appeared. 21-26% of generated clues are flagged by it.
+        embed: { baseUrl: 'http://localhost:11434' },
         onProgress: (p) => setReclue((r) => (r ? { ...r, progress: p } : r)),
       });
       // Pre-tick only the proposals that actually landed in the requested band. A

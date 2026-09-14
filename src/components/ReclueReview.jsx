@@ -13,6 +13,7 @@ const STATUS = {
   generated: { label: 'written', tone: 'text-grass' },
   already: { label: 'already right', tone: 'text-ink-faint' },
   missed: { label: 'closest available', tone: 'text-gold' },
+  kept: { label: 'yours is better', tone: 'text-ink-faint' },
   unreachable: { label: "answer can't go there", tone: 'text-ink-faint' },
   failed: { label: 'nothing found', tone: 'text-accent' },
 };
@@ -77,6 +78,7 @@ export default function ReclueReview({
         <div className="px-3 py-2 text-xs text-ink-soft border-b border-line">
           <b>{s.corpus}</b> from published clues · <b>{s.generated}</b> written ·{' '}
           <b>{s.already}</b> already in band
+          {s.kept > 0 && <> · <b>{s.kept}</b> where yours is already better</>}
           {s.missed > 0 && <> · <b>{s.missed}</b> closest available</>}
           {s.unreachable > 0 && (
             <> · <b>{s.unreachable}</b> whose answer can&apos;t reach {BANDS[band].label.toLowerCase()}</>

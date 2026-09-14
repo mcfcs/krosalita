@@ -14,7 +14,7 @@
 //      range, and ERNE cannot be given a Monday clue. Saying so beats silently returning
 //      something else.
 
-import { isClueUsableFor } from './clueFilters.js';
+import { isClueUsableFor, isClueUsable, clueRevealsAnswerStrict } from './clueFilters.js';
 import { cluesForWord } from './clueIndex.js';
 import { cluePercentile, scoreClue, scorePercentile, answerFeaturesFrom } from './clueScore.js';
 import { generateCluesBatch, embedTexts, discoverSenses } from './ollama.js';
@@ -70,7 +70,9 @@ export function scoreCandidates(corpus, model, word, clues, { band = 'medium', e
   const seen = new Set();
   return (clues || [])
     .map((c) => String(c).trim())
-    .filter((c) => c && isClueUsableFor(c, word))
+    // Generated text, so the strict leak check applies: a model reaches for its own
+    // answer far more readily than an editor does.
+    .filter((c) => c && isClueUsable(c) && !clueRevealsAnswerStrict(c, word))
     .filter((c) => {
       const k = c.toLowerCase();
       if (seen.has(k) || exclude?.has(k)) return false;
@@ -238,15 +240,82 @@ export async function cluesForAnswer(corpus, model, word, {
 }
 
 /**
+ * How far a percentile sits outside a band. 0 means inside.
+ *
+ * Used to decide whether a proposal is actually an improvement. Without it the pipeline
+ * would hand back a p52 generated clue to replace a p43 published one during an EASY
+ * pass — measured, and exactly backwards.
+ */
+const missBy = (win, percentile) => {
+  if (percentile == null) return Infinity;
+  if (percentile >= win.min && percentile < win.max) return 0;
+  return percentile < win.min ? win.min - percentile : percentile - (win.max - 1);
+};
+
+/**
+ * Decide one entry's outcome given the best candidate found for it, and record why.
+ *
+ * The single rule: a proposal has to be closer to the band than the clue already on the
+ * puzzle. Anything else is offered as nothing at all, because a re-clue that quietly
+ * makes an entry harder during an EASY pass is worse than leaving it alone.
+ */
+function settle(r, win, used, best, { noOption } = {}) {
+  r.best = best || null;
+  const here = missBy(win, r.current?.percentile);
+  if (best && best.inBand) {
+    used.add(best.clue.toLowerCase());
+    r.chosen = best;
+    r.status = best.source === 'corpus' ? 'corpus' : 'generated';
+    r.why = best.source === 'corpus'
+      ? 'a published clue for this answer sits in the band'
+      : `written to order at p${Math.round(best.percentile)}`;
+  } else if (best && missBy(win, best.percentile) < here) {
+    // Outside the band, but closer than what the entry has now. Offered as an explicit
+    // near miss — callers must not tick these by default.
+    used.add(best.clue.toLowerCase());
+    r.chosen = best;
+    r.status = r.reachable ? 'missed' : 'unreachable';
+    r.why = `closest reached was p${Math.round(best.percentile)}, still outside ${win.label.toLowerCase()}`;
+  } else if (best) {
+    // The honest case: something was found, and the clue already there is still better.
+    r.chosen = null;
+    r.status = r.reachable ? 'kept' : 'unreachable';
+    r.why = r.reachable
+      ? `nothing found beat the clue already there (best p${Math.round(best.percentile)} `
+        + `vs p${Math.round(r.current?.percentile ?? NaN)})`
+      : `this answer has never been clued ${win.label.toLowerCase()} and nothing written `
+        + `got there either (best p${Math.round(best.percentile)})`;
+  } else {
+    r.chosen = null;
+    r.status = r.reachable ? 'failed' : 'unreachable';
+    r.why = noOption || 'nothing usable was found for this answer';
+  }
+}
+
+/**
  * Re-clue a whole puzzle at a target band.
  *
  * Corpus swaps happen first and for free; only the answers that still need help go to the
  * model, in batches. Nothing is applied — the caller reviews and accepts.
  *
+ * Three rules the measurements forced (scripts/bench-easify.mjs):
+ *
+ *   - A proposal must BEAT what is already there. Over 48 answers whose Easy-puzzle clue
+ *     scored out of band, the model's best attempt was worse than the existing clue for
+ *     several of them; proposing those would have made the puzzle harder while claiming
+ *     to make it easier. `chosen` is now null in that case and `best` carries the attempt.
+ *   - With the model off, an answer that cannot be helped says so immediately rather than
+ *     sitting in a pending state the summary then reports as a failure.
+ *   - Generated clues get the embedding plausibility check when `embed` is supplied, so
+ *     `chosen.suspect` is populated. 21-26% of generated clues were flagged as reading
+ *     nothing like any published clue for their answer.
+ *
+ * @param {object} [opts.embed] `{ baseUrl, model }` for the plausibility check. Optional;
+ *   without it `suspect` is simply absent and nothing else changes.
  * @returns {Promise<{results, summary}>}
  */
 export async function recluePuzzle(corpus, model, entries, {
-  band = 'medium', generate = null, onProgress,
+  band = 'medium', generate = null, embed = null, onProgress, signal,
 } = {}) {
   const win = BANDS[band] || BANDS.medium;
   const used = new Set();
@@ -260,25 +329,52 @@ export async function recluePuzzle(corpus, model, entries, {
       : null;
     const range = answerRange(corpus, model, e.word);
     const reachable = !range || (range.min < win.max && range.max >= win.min);
-    const pick = corpusCandidates(corpus, model, e.word, { band, exclude: used })
-      .find((c) => c.inBand);
+    const fromCorpus = corpusCandidates(corpus, model, e.word, { band, exclude: used });
+    const pick = fromCorpus.find((c) => c.inBand);
+    // The best PUBLISHED clue even when none lands in band. A human-written near miss
+    // beats a generated one at the same distance, so it is the baseline generation has
+    // to clear rather than something only consulted when generation fails.
+    const nearest = fromCorpus[0] || null;
 
     if (current && current.percentile >= win.min && current.percentile < win.max) {
       used.add(current.clue.toLowerCase());
-      results.push({ ...e, current, chosen: null, status: 'already', range, reachable });
+      results.push({
+        ...e, current, chosen: null, best: null, status: 'already', range, reachable,
+        why: `already ${win.label.toLowerCase()} (p${Math.round(current.percentile)})`,
+      });
     } else if (pick) {
       used.add(pick.clue.toLowerCase());
-      results.push({ ...e, current, chosen: pick, status: 'corpus', range, reachable });
+      results.push({
+        ...e, current, chosen: pick, best: pick, status: 'corpus', range, reachable,
+        why: 'a published clue for this answer already sits in the band',
+      });
     } else {
       // Always try generating, even when no PUBLISHED clue for this answer reaches the
       // band. The published range is evidence, not a ceiling — asked for hard clues for
       // PUZZLE the model produced ones scoring p53 while its published clues topped out
       // lower. Whether the band is truly out of reach is decided after trying, not before.
-      results.push({ ...e, current, chosen: null, status: 'pending', range, reachable });
+      results.push({
+        ...e, current, chosen: null, best: null, nearest, status: 'pending', range, reachable,
+      });
       needsLLM.push(e);
     }
   }
   onProgress?.({ phase: 'corpus', done: entries.length, total: entries.length, needsLLM: needsLLM.length });
+
+  // With no model there is nothing further to try. A published near miss that still beats
+  // what the entry has is worth offering; otherwise say plainly what could not be
+  // improved, rather than leaving these pending for the summary to report as failures.
+  if (!generate) {
+    for (const r of results) {
+      if (r.status !== 'pending') continue;
+      settle(r, win, used, r.nearest, {
+        noOption: r.reachable
+          ? 'no published clue for this answer is free in this band, and AI is off'
+          : `no clue ever published for this answer is ${win.label.toLowerCase()} — `
+            + 'the answer itself carries the difficulty, not the clue',
+      });
+    }
+  }
 
   if (generate && needsLLM.length) {
     const withContext = needsLLM.map((e) => ({
@@ -290,18 +386,22 @@ export async function recluePuzzle(corpus, model, entries, {
       if (r.status !== 'pending') continue;
       const got = fresh.get(r.word) || { clues: [], reading: '' };
       r.reading = got.reading || '';
-      const scored = scoreCandidates(corpus, model, r.word, got.clues, { band, exclude: used });
-      const best = scored.find((c) => c.inBand) || scored[0];
-      if (best) {
-        used.add(best.clue.toLowerCase());
-        r.chosen = best;
-        // A miss where the answer's published clues never reached this band either is
-        // the honest "this answer can't be that hard/easy" case; a miss inside the
-        // published range just means this attempt fell short.
-        r.status = best.inBand ? 'generated' : (r.reachable ? 'missed' : 'unreachable');
-      } else {
-        r.status = r.reachable ? 'failed' : 'unreachable';
+      let scored = scoreCandidates(corpus, model, r.word, got.clues, { band, exclude: used });
+      // A generated clue can be confidently false in a way no difficulty score can see.
+      // Annotate rather than drop — it is a warning for the author, and it only works for
+      // answers with enough published clues to form a centroid.
+      if (embed?.baseUrl && scored.length) {
+        scored = await flagImplausible(corpus, r.word, scored,
+          { baseUrl: embed.baseUrl, model: embed.model, signal });
       }
+      // Published clues and generated ones compete on the same scale, but a human-written
+      // clue wins a tie: it is already known to be true, which no score can check.
+      const options = [...scored, ...(r.nearest ? [r.nearest] : [])]
+        .sort((a, b) => (b.inBand - a.inBand)
+          || missBy(win, a.percentile) - missBy(win, b.percentile)
+          || (a.source === 'corpus' ? -1 : 0) - (b.source === 'corpus' ? -1 : 0));
+      settle(r, win, used, options[0] || null,
+        { noOption: 'the model returned nothing usable for this answer' });
     }
   }
 
@@ -314,8 +414,12 @@ export async function recluePuzzle(corpus, model, entries, {
       corpus: count('corpus'),
       generated: count('generated'),
       missed: count('missed'),
+      kept: count('kept'),
       unreachable: count('unreachable'),
       failed: count('failed') + count('pending'),
+      // Entries that needed help at all — the denominator the user cares about.
+      outOfBand: results.length - count('already'),
+      usedLLM: Boolean(generate),
     },
   };
 }
