@@ -54,6 +54,7 @@ if errorlevel 1 (
   exit /b 1
 )
 start "Krosalita app %APP_PORT%" cmd /k npx vite preview --port %APP_PORT% --strictPort --host
+call :verify %APP_PORT% "the app"
 goto :monitor
 
 :dev
@@ -84,15 +85,35 @@ exit /b 0
 
 REM ---------------------------------------------------------------------------
 :freeport
-REM Kill whatever owns the given TCP port. Matches on ":PORT " followed by the
-REM listening state so ":99950" or an outbound connection to that port is left alone.
+REM Kill whatever owns the given TCP port.
+REM
+REM This used to parse netstat with `findstr /r /c:":PORT .*LISTENING"`. findstr treats
+REM /c: as a LITERAL string, so that pattern matched nothing and freeport silently freed
+REM nothing. A preview server from the previous day was still holding 9995, the new one
+REM could not bind because of --strictPort, and it died in its own window without a word.
+REM The symptom was a stale build being served -- exactly what the note at the top of this
+REM file warns about -- and it is why Browse appeared broken. Get-NetTCPConnection is
+REM exact and does not depend on netstat's column spacing or locale.
 set "P=%~1"
 set "KILLED="
-for /f "tokens=5" %%a in ('netstat -ano -p TCP ^| findstr /r /c:":%P% .*LISTENING"') do (
+for /f %%a in ('powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort %~1 -State Listen -ErrorAction SilentlyContinue).OwningProcess" 2^>nul') do (
   if not "%%a"=="0" (
     taskkill /F /T /PID %%a >nul 2>&1
     set "KILLED=1"
   )
 )
-if defined KILLED (echo Freed port %P%.) else (echo Port %P% was free.)
+if defined KILLED (
+  REM taskkill returns before Windows releases the socket; binding too soon still fails.
+  powershell -NoProfile -Command "Start-Sleep -Milliseconds 800" >nul 2>&1
+  echo Freed port %P%.
+) else (
+  echo Port %P% was free.
+)
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+:verify
+REM --strictPort makes a failed bind fatal, but the child dies in its own window where
+REM nobody looks. Check the port really answers and say so if it does not.
+powershell -NoProfile -Command "$ok=$false; foreach($i in 1..25){ try { if((Invoke-WebRequest -UseBasicParsing -Uri ('http://localhost:%~1/') -TimeoutSec 2).StatusCode -eq 200){$ok=$true;break} } catch {}; Start-Sleep -Milliseconds 600 }; if($ok){ Write-Host ('  %~2 is up on %~1.') } else { Write-Host ''; Write-Host ('  WARNING: nothing is answering on %~1 -- %~2 did not start.'); Write-Host '  Look at the window it opened; usually the port was still held.' }"
 exit /b 0
