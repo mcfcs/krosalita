@@ -93,7 +93,16 @@ const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted
 const REVISE_MAX_LETTERS = 18;
 const LUBY_BASE = 200;         // backtracks per restart unit
 const REQUIRED_RETRY_RESTARTS = 24; // restarts spent chasing every required word
-const ALPHA_QUALITY = 1.2;     // weight of static word quality in value ordering
+// Weight of static word quality in value ordering. Exposed as `qualityWeight` so it can be
+// swept; the sweep has been done and the answer was NO, so don't repeat it. Raising it
+// 1.2 -> 4.5 over four layouts x three seeds barely moved the fill: answers with zipf < 2
+// (IOWE, HTEN, IERE, OSEE — words that barely occur in English) went 23% -> 21%, mean
+// answer score 27,145 -> 28,250, and p50 solve time got worse. Quality already separates
+// junk cleanly (junk scores 5k-19k, good fill 30k-52k) — the problem is that a
+// tightly-crossed slot often has only a handful of candidates, so the ranking has nothing
+// better to promote. Improving that fill means a better word list or a kinder grid, not a
+// bigger coefficient.
+const ALPHA_QUALITY = 1.2;
 const DEFAULT_BETA_DIFF = 6.0; // weight of difficulty-target matching
 
 const ABORT = Symbol('abort');
@@ -133,6 +142,7 @@ export function solveCrossword(opts) {
     seed = 1,
     difficultyTarget = null,
     difficultyWeight = DEFAULT_BETA_DIFF,
+    qualityWeight = ALPHA_QUALITY,
     // Answers to steer away from -- pass the previous fill's words so a Regenerate press
     // cannot hand back the same grid. A soft bias, never a constraint.
     avoidWords = [],
@@ -901,7 +911,7 @@ export function solveCrossword(opts) {
       // both the quality and difficulty terms -- difficulty was effectively ignored, and
       // asking for "easy" moved the finished puzzle's rating by about two points.
       const suppAvg = nSupp ? supp / nSupp : Math.log1p(LOOKAHEAD_CAP);
-      let q = suppAvg + ALPHA_QUALITY * (li.score[w] / 65535);
+      let q = suppAvg + qualityWeight * (li.score[w] / 65535);
       if (jitter > 0) q += jitter * (rng() * 2 - 1);
       if (avoidSet !== undefined && avoidSet.has(w)) q -= AVOID_PENALTY;
       if (reqSet && reqSet.has(w) && !usedRequired.has(reqKey(len, w))) q += 1000;
