@@ -222,14 +222,19 @@ export const mirrorOf = (r, c, rows, cols) => [rows - 1 - r, cols - 1 - c];
 /**
  * What is wrong with a hand-drawn grid, split by whether the solver can live with it.
  *
- * errors   — the fill cannot succeed: 2-letter entries (the corpus has none), entries over
- *            15 letters, and white squares that belong to no entry at all (they would stay
- *            empty forever and the puzzle could never be played).
+ * errors   — the fill cannot succeed: 2-letter entries (the corpus has none) and white
+ *            squares that belong to no entry at all (they would stay empty forever and the
+ *            puzzle could never be played).
+ *
+ * Entries over 15 letters are deliberately NOT flagged. The word list cannot supply one,
+ * but an author can type it, and the solver treats a fully typed long entry as fixed
+ * letters and fills around it — so nagging about it while drawing was just noise. An
+ * untyped one is reported by the fill itself, with what to do about it.
  * warnings — legal but unusual: unchecked squares (in only one entry) and white areas cut
  *            off from the rest of the grid.
  * Each issue lists the "r,c" keys involved so the editor can mark them.
  */
-export const analyzeGrid = (layout, maxLen = 15) => {
+export const analyzeGrid = (layout) => {
   const empty = { errors: [], warnings: [], words: 0, blocks: 0, symmetric: true, badCells: new Set() };
   if (!layout || !layout.length || !layout[0].length) return empty;
   const rows = layout.length;
@@ -241,7 +246,6 @@ export const analyzeGrid = (layout, maxLen = 15) => {
   for (const s of slots) for (const k of cellsOf(s)) cover.set(k, (cover.get(k) || 0) + 1);
 
   const short = slots.filter((s) => s.length < 3);
-  const long = slots.filter((s) => s.length > maxLen);
   const orphan = [];
   const unchecked = [];
   let blocks = 0;
@@ -287,9 +291,6 @@ export const analyzeGrid = (layout, maxLen = 15) => {
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   if (short.length) {
     errors.push({ code: 'SHORT', text: `${plural(short.length, 'entry is', 'entries are')} only 2 letters — the word list has no 2-letter answers. Add or remove a block beside ${short.length === 1 ? 'it' : 'them'}.`, cells: short.flatMap(cellsOf) });
-  }
-  if (long.length) {
-    errors.push({ code: 'LONG', text: `${plural(long.length, 'entry is', 'entries are')} longer than ${maxLen} letters — break ${long.length === 1 ? 'it' : 'them'} up with a block.`, cells: long.flatMap(cellsOf) });
   }
   if (orphan.length) {
     errors.push({ code: 'ORPHAN', text: `${plural(orphan.length, 'white square belongs', 'white squares belong')} to no entry — make ${orphan.length === 1 ? 'it' : 'them'} black or open up a neighbour.`, cells: orphan });

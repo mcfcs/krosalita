@@ -236,6 +236,41 @@ for (const [name, opts] of ADVERSARIAL) {
   }
 }
 
+// ---------------------------------------------------------------- typed long entries
+// The word list stops at 15 letters, but an author can type a longer entry by hand. A
+// fully typed one must be treated as fixed letters and filled AROUND; a blank one must be
+// refused fast and say what to do. Grid: the Corner mini, with its top row running on to
+// a 16-letter across entry whose first four letters cross the mini's down entries.
+console.log('\n=== typed entries longer than 15 ===');
+{
+  const corner = DEFAULT_LAYOUTS.find((l) => l.name === 'Mini 5x5 - Corner').grid;
+  const seedFill = solveCrossword({ index, seed: 7, timeoutMs: TIMEOUT, layout: corner });
+  const head = seedFill.grid?.[0].slice(1, 5).join('') || '';
+  const LONG = (head + 'THEMEANSWERS').slice(0, 16);
+  const layout = corner.map((row, r) => row + (r === 0 ? '.'.repeat(12) : '#'.repeat(12)));
+  const preset = layout.map((row) => Array(row.length).fill(null));
+  for (let i = 0; i < 16; i++) preset[0][1 + i] = LONG[i];
+
+  const st = Date.now();
+  const r = solveCrossword({ index, seed: 42, timeoutMs: TIMEOUT, layout, presetGrid: preset });
+  const ms = Date.now() - st;
+  const row0 = (r.grid?.[0] || []).slice(1).join('');
+  const blanks = (r.grid || []).flat().filter((ch) => ch !== '#' && !ch).length;
+  const solvedOk = head.length === 4 && r.complete && !r.error && row0 === LONG && blanks === 0;
+  console.log(`${'typed 16-letter entry'.padEnd(32)}${String(ms + 'ms').padStart(8)}  `
+    + (r.error ? `refused [${r.error.code}] ${r.error.message}` : `solved ${r.placements.length} answers, row 0 = ${row0}`));
+  if (!solvedOk) note(`typed long entry: expected a complete fill keeping "${LONG}" (got complete=${r.complete}, row0="${row0}", blanks=${blanks})`);
+
+  const st2 = Date.now();
+  const r2 = solveCrossword({ index, seed: 42, timeoutMs: TIMEOUT, layout });
+  const ms2 = Date.now() - st2;
+  console.log(`${'untyped 16-letter entry'.padEnd(32)}${String(ms2 + 'ms').padStart(8)}  `
+    + (r2.error ? `refused [${r2.error.code}]` : 'solved?!'));
+  if (r2.error?.code !== 'LONG_ENTRY_NOT_TYPED') note(`untyped long entry: expected LONG_ENTRY_NOT_TYPED, got ${r2.error?.code || 'a fill'}`);
+  else if (!/1-Across/.test(r2.error.message)) note(`untyped long entry: message should name 1-Across, got "${r2.error.message}"`);
+  if (ms2 > 200) note(`untyped long entry: refusal took ${ms2}ms — must be under 200ms`);
+}
+
 // ---------------------------------------------------------------- old solver
 if (RUN_OLD) {
   console.log('\n=== previous solver (from git HEAD) ===');

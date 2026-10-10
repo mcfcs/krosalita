@@ -183,22 +183,42 @@ export function solveCrossword(opts) {
     }
   }
 
-  const slots = findSlots(rowsArr);
+  // An entry longer than MAXLEN can never come from the word list, but a constructor may
+  // type one in by hand (a 16x16 or 17x17 grid with a full-width theme answer). When it is
+  // fully typed it is not a variable at all: drop it from the slot list and let its
+  // letters stand as fixed squares that the crossing entries must honour. Only a long
+  // entry with blanks in it is unfillable.
+  //
+  // It has to go before the topology is built: slotCellOf/crossSlot are strided by MAXLEN,
+  // so a longer run would write into the NEXT slot's rows and silently corrupt it.
+  const allSlots = findSlots(rowsArr);
+  const allNumbers = numberSlots(allSlots);
+  const longFixedChar = (r, c) => {
+    const v = presetGrid && presetGrid[r] && presetGrid[r][c];
+    return v && /^[A-Z]$/i.test(String(v)) ? String(v).toUpperCase() : null;
+  };
+  const slots = [];
+  const slotNumbers = [];
+  for (let k = 0; k < allSlots.length; k++) {
+    const sl = allSlots[k];
+    if (sl.length <= MAXLEN) { slots.push(sl); slotNumbers.push(allNumbers[k]); continue; }
+    let typed = true;
+    for (let i = 0; i < sl.length && typed; i++) {
+      const r = sl.direction === 'across' ? sl.row : sl.row + i;
+      const c = sl.direction === 'across' ? sl.col + i : sl.col;
+      if (!longFixedChar(r, c)) typed = false;
+    }
+    if (!typed) {
+      return fail(err('LONG_ENTRY_NOT_TYPED',
+        `${allNumbers[k]}-${dirLabel(sl.direction)} is ${sl.length} letters — longer than the `
+        + `${MAXLEN}-letter answers the word list holds. Type it in yourself and the fill will work around it.`,
+        { len: sl.length }));
+    }
+  }
   const S = slots.length;
   if (S === 0) {
     return fail(err('NO_SLOTS',
       'This layout has no word slots — every run of white cells is a single square.'));
-  }
-
-  // slotCellOf/crossSlot are strided by MAXLEN, so a longer run would write into the
-  // NEXT slot's rows and silently corrupt the topology -- before preflight could reject
-  // it. Unreachable with the shipped 15-wide layouts; reachable with a hand-drawn grid.
-  for (const sl of slots) {
-    if (sl.length > MAXLEN) {
-      return fail(err('NO_WORDS_FOR_LENGTH',
-        `This layout has a ${sl.length}-letter slot, longer than the ${MAXLEN}-letter maximum.`,
-        { len: sl.length }));
-    }
   }
 
   const CELLS = rows * cols;
@@ -239,7 +259,9 @@ export function solveCrossword(opts) {
     }
   }
 
-  const clueNumbers = numberSlots(slots);
+  // Numbered over EVERY entry, typed long ones included, so a message's "34-Across" is
+  // the 34-Across on the author's grid.
+  const clueNumbers = slotNumbers;
   const slotName = (s) => `${clueNumbers[s]}-${dirLabel(slots[s].direction)}`;
 
   // ---- ad-hoc words (required + fully-preset, off-dictionary) ------------
@@ -1212,7 +1234,11 @@ export function solveCrossword(opts) {
       const row = [];
       for (let c = 0; c < cols; c++) {
         if (rowsArr[r][c] === '#') { row.push('#'); continue; }
-        const m = cellMask[cellIndex(r, c)];
+        const ci = cellIndex(r, c);
+        // A square only a typed long entry runs through is in no slot, so it has no mask;
+        // its letter is the author's.
+        if (cellSlot[ci * 2] < 0) { row.push(longFixedChar(r, c)); continue; }
+        const m = cellMask[ci];
         row.push(popcount32(m) === 1 ? String.fromCharCode(A_CODE + ctz32(m)) : null);
       }
       g.push(row);

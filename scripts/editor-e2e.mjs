@@ -203,6 +203,27 @@ try {
   check(g && g.length === 15 && g[0].length === 15 && blocksOf(g).length === 0,
     'Create opens on a blank 15x15 grid', g ? `${g.length}x${g[0]?.length}, ${blocksOf(g).length} blocks` : 'no grid');
 
+  // ---------- entries over 15 letters are the author's call, not an error ----------
+  await setInput('input[aria-label="Rows"]', 17);
+  await setInput('input[aria-label="Columns"]', 17);
+  await sleep(100);
+  await clickButton('resize');
+  await sleep(300);
+  g = await grid();
+  let ht17 = await healthText();
+  const outlined = await page.evaluate(`document.querySelectorAll('[data-testid="create-grid"] .xw-cell--bad').length`);
+  check(g.length === 17 && /17×17/.test(ht17) && !/longer than/i.test(ht17) && outlined === 0,
+    'a 17×17 with 17-letter entries is not flagged while drawing', ht17.replace(/\n/g, ' | '));
+  await clickButton('fill remaining');
+  await sleep(1500);
+  const msg17 = await page.evaluate(`document.body.innerText`);
+  check(/Type it in yourself/i.test(msg17), 'filling with an untyped 17-letter entry says to type it in');
+  await setInput('input[aria-label="Rows"]', 15);
+  await setInput('input[aria-label="Columns"]', 15);
+  await sleep(100);
+  await clickButton('resize');
+  await sleep(300);
+
   // ---------- Blocks tool: click, symmetry, drag ----------
   await clickSel('[data-tool="block"]');
   await clickCell(0, 0);

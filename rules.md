@@ -53,9 +53,11 @@ output; never describe an unrun gate as passing.
 - The worker is a **session-long singleton** that owns the corpus. Never spawn one per
   generation.
 - The solver's word index is per length; the clue store is global. Do not mix the indexes.
-- The corpus has **no 2-letter answers** and nothing over 15 letters. A hand-drawn grid
-  with either cannot be filled; `analyzeGrid` (src/utils/crosswordUtils.js) reports both
-  before a fill is attempted.
+- The corpus has **no 2-letter answers** and nothing over 15 letters. `analyzeGrid`
+  (src/utils/crosswordUtils.js) flags 2-letter entries while you draw. Entries over 15
+  are the author's call (owner's decision), so they are NOT flagged. The solver treats a
+  fully typed long entry as fixed letters and fills around it, and refuses an untyped one
+  with `LONG_ENTRY_NOT_TYPED`. `bench-solver` gates both cases.
 - Difficulty is a 0–100 scale that is not uniformly populated. Bands are mapped onto the
   corpus quantiles and reported as a percentile. If you change difficulty features, re-run
   `s5_fit → s6_score → s7_pack` and re-check that the bands still separate.

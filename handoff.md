@@ -53,8 +53,10 @@ type letters. Now:
   there are letters to lose.
 - **"Clear Letters"** replaced "Clear Grid". It keeps the blocks, circles and shades.
 - **Grid check (`analyzeGrid`).**
-  - These stop the fill, and their squares are outlined in red: 2-letter entries, entries
-    over 15 letters, and white squares that belong to no entry.
+  - These stop the fill, and their squares are outlined in red: 2-letter entries and
+    white squares that belong to no entry.
+  - Entries over 15 letters are allowed. The fill works around one you've typed in, and
+    asks you to type it if it's blank.
   - These are listed but don't block the fill: unchecked squares and disconnected areas.
   - Fill Remaining refuses an unfillable grid and says why.
 - **The Create grid, its clues, shades and symmetry setting are saved in the session.**
@@ -80,7 +82,7 @@ Play toolbar).
   from clues in the PDF.
 
 ### Verification run this session
-`editor-e2e` 26/26 · `create-e2e` 23/23 · `generate-e2e` 23/23 · `responsive-e2e` 17/17 ·
+`editor-e2e` 28/28 · `create-e2e` 23/23 · `generate-e2e` 23/23 · `responsive-e2e` 17/17 ·
 `bench-solver` passed · `test:pdf` passed (8 PDFs, every page rendered and inspected).
 
 To look at PDF pages, install PyMuPDF into a temp target

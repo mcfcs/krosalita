@@ -584,9 +584,18 @@ const CrosswordGenerator = () => {
     
     // assignNumbers only numbers the slots that were PLACED, so an incomplete fill would
     // drop the unplaced entries and misnumber the rest. Re-key onto the full layout.
-    const newManualClues = cluesForLayout(layout, finalGrid, generatedClues?.across ? generatedClues : {
+    //
+    // A typed entry longer than 15 letters is fixed letters to the solver, not a slot, so
+    // it never comes back as a placement. Its clue is the author's: seed it in first, and
+    // let anything the solver returned for the same slot win.
+    const solved = generatedClues?.across ? generatedClues : {
       across: updateClueList(manualClues.across, 'across'),
       down: updateClueList(manualClues.down, 'down')
+    };
+    const longOnes = (list) => list.filter((c) => c.length > 15 && c.clue);
+    const newManualClues = cluesForLayout(layout, finalGrid, {
+      across: [...longOnes(manualClues.across), ...solved.across],
+      down: [...longOnes(manualClues.down), ...solved.down],
     });
     setManualClues(newManualClues);
     setLatestGrid(finalGrid);
