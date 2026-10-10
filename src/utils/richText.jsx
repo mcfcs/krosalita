@@ -1,4 +1,5 @@
 import React from 'react';
+import { decodeEntities } from './entities.js';
 
 // Clue markup, rendered as React elements — never as raw HTML.
 //
@@ -17,34 +18,8 @@ import React from 'react';
 // a <script> or an onerror attribute straight into the page. Only the inline tags below
 // mean anything; everything else is dropped and its text kept.
 
-const ENTITIES = {
-  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
-  mdash: '—', ndash: '–', hellip: '…', times: '×', deg: '°',
-  hearts: '♥', spades: '♠', diams: '♦', clubs: '♣',
-  larr: '←', uarr: '↑', rarr: '→', darr: '↓',
-  bigcirc: '◯', bigtriangleup: '△', bull: '•', middot: '·',
-  eacute: 'é', egrave: 'è', agrave: 'à', ccedil: 'ç',
-  ntilde: 'ñ', uuml: 'ü', ouml: 'ö', auml: 'ä',
-};
-
-/** Turn &mdash; / &#8212; / &#x1F602; into the characters they stand for. */
-export function decodeEntities(text) {
-  if (!text || typeof text !== 'string' || !text.includes('&')) return text;
-  return text.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z][a-zA-Z0-9]{1,11});/g, (whole, body) => {
-    if (body[0] === '#') {
-      const cp = body[1] === 'x' || body[1] === 'X'
-        ? parseInt(body.slice(2), 16)
-        : parseInt(body.slice(1), 10);
-      // Astral-plane code points are the emoji ones, so String.fromCodePoint, not fromCharCode.
-      if (Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff) {
-        try { return String.fromCodePoint(cp); } catch { return whole; }
-      }
-      return whole;
-    }
-    const v = ENTITIES[body.toLowerCase()];
-    return v === undefined ? whole : v;
-  });
-}
+// decodeEntities lives in a JSX-free module so Node scripts (the PDF export) can share it.
+export { decodeEntities };
 
 // The inline tags worth honouring. Anything else keeps its text and loses its tag.
 const TAG_ELEMENT = { i: 'em', em: 'em', b: 'strong', strong: 'strong', sup: 'sup', sub: 'sub', u: 'u' };
