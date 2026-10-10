@@ -240,6 +240,22 @@ try {
   else bad('opened the Create tab', 'no Create tab button');
   await sleep(700);
 
+  // Create now opens on a blank, all-white grid (the author draws the blocks), which no
+  // fill can satisfy. These checks are about letters and fills, so start from a template.
+  const loadedTemplate = await page.evaluate(`(async () => {
+    const t = [...document.querySelectorAll('button')].find(x => /^templates$/i.test((x.textContent||'').trim()));
+    if (!t) return false;
+    t.click();
+    await new Promise(r => setTimeout(r, 300));
+    const item = [...document.querySelectorAll('button')].find(x => /^Classic 15x15/.test((x.textContent||'').trim()));
+    if (!item) return false;
+    item.click();
+    return true;
+  })()`);
+  await sleep(500);
+  if (loadedTemplate) ok('loaded the Classic 15x15 template into Create');
+  else bad('loaded the Classic 15x15 template into Create', 'no Templates button or item');
+
   // ---------- type a word; it must pin ----------
   if (!(await clickCell(0))) throw new Error('no Create grid rendered');
   const TYPED = 'ZEBRA';
@@ -252,7 +268,7 @@ try {
   else bad('typing pins my squares', `pinned ${st.pinned} = "${st.pinnedLetters}"`);
 
   // ---------- 2A regression: typing must still work after clicking a button ----------
-  await clickByLabel('clear grid');
+  await clickByLabel('clear letters');
   await sleep(300);
   await clickCell(0);
   for (const ch of TYPED) await key(ch.toLowerCase());
@@ -391,7 +407,7 @@ try {
   // showing the current layout's name opens it.
   await page.evaluate(`(() => {
     const b = [...document.querySelectorAll('button')]
-      .find(x => /15x15|5x5|layout/i.test((x.textContent||'').trim()) && x.classList.contains('btn'));
+      .find(x => /15x15|5x5|layout|templates/i.test((x.textContent||'').trim()) && x.classList.contains('btn'));
     if (b) b.click();
     return !!b;
   })()`);

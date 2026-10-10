@@ -23,6 +23,7 @@ export function useMultiplayerGame(game, me) {
   const slots = useMemo(() => findSlots(layout), [layout]);
   const circles = useMemo(() => new Set(puzzle.circles || []), [puzzle]);
   const shades = useMemo(() => new Set(puzzle.shades || []), [puzzle]);
+  const shadeColors = puzzle.shadeColors || null;
 
   const [grid, setGrid] = useState(() => game.state?.grid || blank(answers));
   const [selectedCell, setSelectedCell] = useState(null);
@@ -496,6 +497,7 @@ export function useMultiplayerGame(game, me) {
     remoteCells,
     circles,
     shades,
+    shadeColors,
     // multiplayer shell + social
     isHost,
     isSpectator,

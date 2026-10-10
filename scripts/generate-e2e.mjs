@@ -744,7 +744,7 @@ const USE_LLM = process.argv.includes('--llm') || process.env.KROSALITA_E2E_LLM 
   // grid, refill it from scratch, and check the solver's own message reaches the UI.
   await page.evaluate(`(() => {
     const b = [...document.querySelectorAll('button')]
-      .find(x => (x.textContent || '').trim() === 'Clear Grid' && !x.disabled);
+      .find(x => (x.textContent || '').trim() === 'Clear Letters' && !x.disabled);
     if (b) b.click();
   })()`);
   await sleep(600);

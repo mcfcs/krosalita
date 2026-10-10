@@ -15,7 +15,7 @@ const ROW3 = 'ZXCVBNM'.split('');
 const GameView = (props) => {
   const {
     playGrid, playAnswers, playClues, playSelectedCell, playDirection, playComplete, playTimer,
-    playAutoCheck, revealedCells, checkedCells, circles, shades,
+    playAutoCheck, revealedCells, checkedCells, circles, shades, shadeColors,
     getNumberForCell, getPlayCurrentSlot, handlePlayCellClick, setPlaySelectedCell, setPlayDirection,
     onVirtualKey, goToAdjacentClue, formatTime,
     setPlayAutoCheck, revealCell, revealWord, revealAll, onCheckSquare, onCheckWord, onCheckPuzzle, onClearWord,
@@ -112,6 +112,7 @@ const GameView = (props) => {
           checkedCells={checkedCells}
           circles={circles}
           shades={shades}
+          shadeColors={shadeColors}
           remoteCells={remoteCells}
           getNumberForCell={getNumberForCell}
           onCellClick={handlePlayCellClick}

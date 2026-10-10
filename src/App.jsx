@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo, useLayoutEffect } from 'react';
 import { Upload, Download, RefreshCw, Bug, Puzzle, PenTool, X, Check, ChevronRight, ChevronDown, Save, FolderOpen, Grid3X3, Play, BookOpen, Languages, Settings, Flame, DownloadCloud, Zap, Share, Search, Volume2, VolumeX, Maximize, Trophy } from './components/Icons';
 import BrowseView from './components/BrowseView';
 import MultiplayerView from './components/MultiplayerView';
@@ -17,7 +17,11 @@ import GameView from './components/GameView';
 import RequiredWordsModal from './components/RequiredWordsModal';
 import SettingsModal from './components/SettingsModal';
 import { DEFAULT_LAYOUTS } from './data/layouts';
-import { parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, getCellNumber } from './utils/crosswordUtils';
+import {
+  parseCSV, findSlots, assignNumbers, getWordFromGrid, getLayoutStats, getCellNumber,
+  layoutOfGrid, cluesForLayout, analyzeGrid, mirrorOf,
+} from './utils/crosswordUtils';
+import PdfExportModal from './components/PdfExportModal';
 import { isClueUsableFor } from './utils/clueFilters';
 import { loadJSON, saveJSON } from './utils/storage';
 
@@ -123,6 +127,48 @@ const CrosswordGenerator = () => {
   // Rebus authoring: several letters typed into one square, the way LEBRON[JAM]ES and
   // [JAM]PACKED share a square.
   const [manualRebusMode, setManualRebusMode] = useState(false);
+  // Theme fills in Create, "r,c" -> colour id (utils/cellColors). Imported puzzles only
+  // ever carry grey `shades`; the colour rides alongside as `shadeColors`.
+  const [manualShades, setManualShades] = useState(() => new Map());
+  const [playShadeColors, setPlayShadeColors] = useState(null);
+  // What a press on the Create grid does: type letters, toggle blocks, ring or fill squares.
+  const [createTool, setCreateTool] = useState('letter');
+  const [shadeColorId, setShadeColorId] = useState('yellow');
+  // Blocks mirror through the centre — the American convention. A themed grid that has
+  // to break it can switch it off.
+  const [blockSymmetry, setBlockSymmetry] = useState(true);
+  const [showPdfModal, setShowPdfModal] = useState(false);
+
+  // Create's black squares live in manualGrid itself. They used to come from a fixed
+  // entry in `layouts`, so an author could type letters but never move a block or change
+  // the size. Everything that asks "what are the slots?" reads this derived layout. It is
+  // keyed on the block pattern alone, so typing a letter does not rebuild it (and
+  // findSlots's per-array cache keeps hitting).
+  const manualBlockSig = manualGrid
+    ? manualGrid.map((row) => row.map((c) => (c === '#' ? '#' : '.')).join('')).join('|')
+    : '';
+  const manualLayout = useMemo(() => (manualBlockSig ? manualBlockSig.split('|') : null), [manualBlockSig]);
+  const manualHealth = useMemo(() => analyzeGrid(manualLayout), [manualLayout]);
+
+  // The clue lists follow the blocks. Anything that reshapes the grid only has to set
+  // manualGrid; this renumbers and keeps every clue whose entry survived unchanged.
+  // cluesForLayout hands back the same object when nothing moved, so this is a no-op for
+  // the paths that already set grid and clues together.
+  useLayoutEffect(() => {
+    if (!manualLayout) return;
+    setManualClues((prev) => cluesForLayout(manualLayout, manualGrid, prev));
+    // manualGrid is read for new entries' letters only; re-running on every keystroke
+    // would be wasted work.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manualLayout]);
+  // ...but that effect lands one render late, and the render in between pairs the NEW
+  // grid with the OLD clue lists — after shrinking the grid, the editor indexed rows that
+  // no longer existed and crashed. Anything rendered gets clues re-keyed synchronously.
+  // (When nothing structural changed this is manualClues itself.)
+  const editorClues = useMemo(
+    () => (manualLayout ? cluesForLayout(manualLayout, manualGrid, manualClues) : manualClues),
+    [manualLayout, manualGrid, manualClues],
+  );
   const [shareCodeInput, setShareCodeInput] = useState('');
   const [shareCodeBusy, setShareCodeBusy] = useState(false);
   const [shareCodeError, setShareCodeError] = useState('');
@@ -244,9 +290,10 @@ const CrosswordGenerator = () => {
     return list[0];
   }, [puzzleDateInfo]);
 
+  // Generate passes a layout index; Create passes its own derived layout.
   const hasWordInGrid = useCallback((gridData, layoutIdx, word) => {
     if (!gridData || !word) return false;
-    const layout = layouts[layoutIdx]?.grid;
+    const layout = Array.isArray(layoutIdx) ? layoutIdx : layouts[layoutIdx]?.grid;
     if (!layout) return false;
     const slots = findSlots(layout);
     const target = word.toUpperCase();
@@ -366,11 +413,11 @@ const CrosswordGenerator = () => {
   useEffect(() => {
     if (!failedWord) return;
     const currentGrid = activeTab === 'auto' ? grid : manualGrid;
-    const layoutIdx = activeTab === 'auto' ? selectedLayoutIndex : currentLayoutIndex;
-    if (!hasWordInGrid(currentGrid, layoutIdx, failedWord)) {
+    const layoutArg = activeTab === 'auto' ? selectedLayoutIndex : manualLayout;
+    if (!hasWordInGrid(currentGrid, layoutArg, failedWord)) {
       setFailedWord(null);
     }
-  }, [failedWord, grid, manualGrid, activeTab, selectedLayoutIndex, currentLayoutIndex, hasWordInGrid]);
+  }, [failedWord, grid, manualGrid, activeTab, selectedLayoutIndex, manualLayout, hasWordInGrid]);
 
   const handleRequiredConfirm = (wordsList, mode, difficulty) => {
     const chosenMode = mode || 'anchor';
@@ -402,7 +449,14 @@ const CrosswordGenerator = () => {
     const { mode = 'fill', seed: seedArg = null } = opts;
     if (!manualGrid) { setError('Create a grid first'); return; }
     if (wordList.length === 0) { setError('Please upload a CSV file first'); return; }
-    if (!layouts[currentLayoutIndex]) { setError('Please select a valid layout'); return; }
+    if (!manualLayout) { setError('Create a grid first'); return; }
+    // A hand-drawn grid can ask for something the solver cannot do at all (a 2-letter
+    // entry, a 16-letter one, a white square in no entry). Say which, before spending the
+    // whole time budget proving it.
+    if (manualHealth.errors.length) {
+      setError(`This grid can't be filled yet: ${manualHealth.errors[0].text}`);
+      return;
+    }
     
     cancelRef.current = false;
     setIsGenerating(true);
@@ -410,7 +464,7 @@ const CrosswordGenerator = () => {
     setProgress('Filling remaining slots...');
     setError('');
     
-    const layout = layouts[currentLayoutIndex].grid;
+    const layout = manualLayout;
     // 'fill' treats every letter on the grid as fixed. 'regenerate' keeps only what the
     // author pinned, so the solver is free to replace its own previous answers — which is
     // the whole point: before this there was no way to ask for another fill without
@@ -505,6 +559,12 @@ const CrosswordGenerator = () => {
     const finalGrid = newGrid || presetGrid;
     setManualGrid(finalGrid);
     lastFillSigRef.current = gridSignature(finalGrid);
+    // Generate hands the solver's measured difficulty to the scoring effect; Create
+    // computed it and dropped it, so a fill asked for "easy" was then re-labelled from the
+    // clue text alone (often a band off). Only a complete fill describes the whole grid.
+    solverDiffRef.current = complete && picked?.difficultyMeta?.score != null
+      ? { sig: gridSignature(finalGrid), score: picked.difficultyMeta.score, label: picked.difficultyMeta.label }
+      : null;
     startCooldown();
     
     const placementMap = new Map();
@@ -522,14 +582,16 @@ const CrosswordGenerator = () => {
       };
     });
     
-    const newManualClues = generatedClues?.across ? generatedClues : {
+    // assignNumbers only numbers the slots that were PLACED, so an incomplete fill would
+    // drop the unplaced entries and misnumber the rest. Re-key onto the full layout.
+    const newManualClues = cluesForLayout(layout, finalGrid, generatedClues?.across ? generatedClues : {
       across: updateClueList(manualClues.across, 'across'),
       down: updateClueList(manualClues.down, 'down')
-    };
+    });
     setManualClues(newManualClues);
     setLatestGrid(finalGrid);
     setLatestClues(newManualClues);
-    const placedReq = computePlacedRequired(finalGrid, currentLayoutIndex, requiredMerged);
+    const placedReq = computePlacedRequired(finalGrid, layout, requiredMerged);
     setRequiredHighlights(new Set(placedReq));
     setShowRequiredHighlights(placedReq.length > 0);
     setHighlightMissingRequired(true);
@@ -612,24 +674,19 @@ const CrosswordGenerator = () => {
     let updatedLayouts = layouts;
 
     if (layoutEditorMode === 'edit' && editingLayoutIndex !== null) {
-      // The re-init used to be gated on being ON the Create tab, which left manualGrid —
-      // and now the pinned-square coordinates — describing the OLD shape while every slot
-      // lookup read the new one. Gate it on the shape actually changing instead, so a
-      // rename leaves the author's work alone but a real edit rebuilds the grid.
-      const shapeChanged = (layouts[editingLayoutIndex]?.grid || []).join('|') !== normalizedGrid.join('|');
+      // Create's blocks live in its own grid now, so editing a saved layout no longer
+      // rebuilds the author's work; only a layout drawn while ON Create is loaded into it.
       updatedLayouts = layouts.map((layout, idx) => idx === editingLayoutIndex ? { ...layout, name, grid: normalizedGrid } : layout);
       setLayouts(updatedLayouts);
       setSelectedLayoutIndex(editingLayoutIndex);
       setCurrentLayoutIndex(editingLayoutIndex);
-      if (shapeChanged || activeTab === 'create') initializeManualGrid(editingLayoutIndex, updatedLayouts);
     } else {
       updatedLayouts = [...layouts, { name, grid: normalizedGrid }];
       const newIndex = updatedLayouts.length - 1;
       setLayouts(updatedLayouts);
       setSelectedLayoutIndex(newIndex);
       setCurrentLayoutIndex(newIndex);
-      // A brand-new layout always has a new shape, so this is unconditional.
-      initializeManualGrid(newIndex, updatedLayouts);
+      if (activeTab === 'create') initializeManualGrid(newIndex, updatedLayouts);
     }
 
     return true;
@@ -650,7 +707,18 @@ const CrosswordGenerator = () => {
   const handleSelectLayout = (layoutIdx, tab = activeTab) => {
     if (!layouts[layoutIdx]) return;
     if (tab === 'create') {
-      initializeManualGrid(layoutIdx);
+      const hasLetters = manualGrid?.some((row) => row.some((c) => c && c !== '#'));
+      if (hasLetters) {
+        setConfirmDialog({
+          title: 'Start from this template?',
+          message: `Loading "${layouts[layoutIdx].name}" replaces the grid, its letters and its clues.`,
+          confirmLabel: 'Load template',
+          danger: true,
+          onConfirm: () => { setConfirmDialog(null); initializeManualGrid(layoutIdx); },
+        });
+      } else {
+        initializeManualGrid(layoutIdx);
+      }
     } else {
       setSelectedLayoutIndex(layoutIdx);
     }
@@ -1021,14 +1089,14 @@ const CrosswordGenerator = () => {
 
   const syncManualFromAuto = (newGrid, generatedClues, layoutIdx) => {
     if (!newGrid || !generatedClues) return;
-    const layout = layouts[layoutIdx]?.grid || layouts[0]?.grid;
-    if (!layout) return;
+    const layout = layoutOfGrid(newGrid);
     setCurrentLayoutIndex(layoutIdx);
     setManualGrid(newGrid.map(row => row.map(cell => cell === null ? '' : cell)));
     // Every letter here came from the solver, so nothing is pinned: a Regenerate in Create
     // is free to reroll all of it.
     setLockedCells(new Set());
     setManualCircles(new Set());
+    setManualShades(new Map());
     const slots = findSlots(layout);
     const numbered = [];
     const numberMap = new Map();
@@ -1058,14 +1126,16 @@ const CrosswordGenerator = () => {
   const exportPuzzle = () => {
     const currentGrid = activeTab === 'auto' ? grid : manualGrid;
     const currentClues = activeTab === 'auto' ? clues : manualClues;
-    const layoutIdx = activeTab === 'auto' ? selectedLayoutIndex : currentLayoutIndex;
+    const layoutIdx = activeTab === 'auto' ? selectedLayoutIndex : null;
     if (!currentGrid) return;
-    if (!layouts[layoutIdx]) return;
+    const layoutGrid = activeTab === 'auto' ? layouts[layoutIdx]?.grid : manualLayout;
+    if (!layoutGrid) return;
+    const isCreate = activeTab !== 'auto';
     const puzzleData = {
       version: "1.0",
-      layoutIndex: layoutIdx,
-      layoutName: layouts[layoutIdx].name,
-      layout: layouts[layoutIdx].grid,
+      ...(isCreate ? {} : { layoutIndex: layoutIdx }),
+      layoutName: isCreate ? 'Custom grid' : layouts[layoutIdx].name,
+      layout: layoutGrid,
       grid: currentGrid,
       clues: {
         across: currentClues.across.map(c => ({ number: c.number, row: c.row, col: c.col, length: c.length || c.word?.length, word: c.word || getWordFromGrid(currentGrid, c.row, c.col, c.length, 'across'), clue: c.clue })),
@@ -1073,7 +1143,10 @@ const CrosswordGenerator = () => {
       },
       // Circles and rebus squares are part of the puzzle, not decoration — a grid exported
       // without them comes back as a different puzzle.
-      circles: [...manualCircles],
+      // (Generate's grid has none of these — manualCircles belong to Create.)
+      circles: isCreate ? [...manualCircles] : [],
+      shades: isCreate ? [...manualShades.keys()] : [],
+      shadeColors: isCreate ? Object.fromEntries(manualShades) : {},
       hasRebus: currentGrid.some((row) => row.some((c) => c && c !== '#' && c.length > 1)),
       exportedAt: new Date().toISOString()
     };
@@ -1180,6 +1253,7 @@ const CrosswordGenerator = () => {
         startPlayMode(puzzleData.grid, importedClues, {
           circles: puzzleData.circles,
           shades: puzzleData.shades,
+          shadeColors: puzzleData.shadeColors,
           meta: { source: 'imported', title: puzzleData.meta?.title || puzzleData.layoutName },
         });
         
@@ -1404,35 +1478,174 @@ const CrosswordGenerator = () => {
 
   const getNumberForCell = (r, c, clueSet = clues) => getCellNumber(clueSet, r, c);
 
-  const initializeManualGrid = useCallback((layoutIdx = currentLayoutIndex, layoutList = layouts) => {
-    if (!layoutList[layoutIdx]) return;
-    const layout = layoutList[layoutIdx].grid;
-    const rows = layout.length;
-    const cols = layout[0].length;
-    const newGrid = Array(rows).fill(null).map((_, r) => Array(cols).fill(null).map((_, c) => layout[r][c] === '#' ? '#' : ''));
+  /**
+   * Start Create over. With a layout index the blocks come from that template; without
+   * one it is an empty, all-white grid of `size` (15x15 by default) for the author to
+   * draw blocks on.
+   */
+  const initializeManualGrid = useCallback((layoutIdx = null, layoutList = layouts, size = null) => {
+    let newGrid;
+    if (layoutIdx != null && layoutList[layoutIdx]) {
+      newGrid = layoutList[layoutIdx].grid.map((row) => [...row].map((ch) => (ch === '#' ? '#' : '')));
+      setCurrentLayoutIndex(layoutIdx);
+    } else {
+      const rows = size?.rows || 15;
+      const cols = size?.cols || 15;
+      newGrid = Array.from({ length: rows }, () => Array(cols).fill(''));
+    }
     setManualGrid(newGrid);
     setLockedCells(new Set());   // no letters left, so no pins
     setManualCircles(new Set());
+    setManualShades(new Map());
     setManualRebusMode(false);
-    setCurrentLayoutIndex(layoutIdx);
-    const slots = findSlots(layout);
-    const numbered = [];
-    const numberMap = new Map();
-    let currentNumber = 1;
-    const sortedSlots = [...slots].sort((a, b) => a.row !== b.row ? a.row - b.row : a.col - b.col);
-    for (const slot of sortedSlots) {
-      const key = `${slot.row},${slot.col}`;
-      if (!numberMap.has(key)) numberMap.set(key, currentNumber++);
-      numbered.push({ number: numberMap.get(key), direction: slot.direction, word: '', clue: '', row: slot.row, col: slot.col, length: slot.length });
-    }
-    setManualClues({ across: numbered.filter(n => n.direction === 'across'), down: numbered.filter(n => n.direction === 'down') });
+    setManualClues(cluesForLayout(layoutOfGrid(newGrid), newGrid, null));
     setSelectedCell(null);
-  }, [currentLayoutIndex, layouts]);
+  }, [layouts]);
+
+  const MIN_SIZE = 3;
+  const MAX_SIZE = 25;
+  const clampSize = (n) => Math.min(MAX_SIZE, Math.max(MIN_SIZE, Math.round(Number(n) || 0)));
+  const manualHasLetters = () => !!manualGrid?.some((row) => row.some((c) => c && c !== '#'));
+
+  /** A fresh blank grid, asking first if that would throw away letters. */
+  const newManualGrid = (rows, cols) => {
+    const size = { rows: clampSize(rows), cols: clampSize(cols) };
+    if (!manualHasLetters()) { initializeManualGrid(null, layouts, size); return; }
+    setConfirmDialog({
+      title: 'Start a new grid?',
+      message: `A blank ${size.rows}×${size.cols} grid replaces this one — its letters, blocks, marks and clues.`,
+      confirmLabel: 'New grid',
+      danger: true,
+      onConfirm: () => { setConfirmDialog(null); initializeManualGrid(null, layouts, size); },
+    });
+  };
+
+  /**
+   * Change the size without starting over. The grid is anchored at the top-left: rows and
+   * columns are added or cut at the bottom and right, and everything that still fits —
+   * letters, blocks, pins, circles, shades — stays where it was.
+   */
+  const resizeManualGrid = (rowsIn, colsIn) => {
+    if (!manualGrid) return;
+    const rows = clampSize(rowsIn);
+    const cols = clampSize(colsIn);
+    const R = manualGrid.length;
+    const C = manualGrid[0].length;
+    if (rows === R && cols === C) return;
+    const apply = () => {
+      setConfirmDialog(null);
+      const inside = (k) => { const [r, c] = k.split(',').map(Number); return r < rows && c < cols; };
+      setManualGrid(Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => (
+        r < R && c < C ? manualGrid[r][c] : ''))));
+      setLockedCells((prev) => new Set([...prev].filter(inside)));
+      setManualCircles((prev) => new Set([...prev].filter(inside)));
+      setManualShades((prev) => new Map([...prev].filter(([k]) => inside(k))));
+      setSelectedCell((sel) => (sel && sel.row < rows && sel.col < cols ? sel : null));
+    };
+    const loses = manualGrid.some((row, r) => row.some((ch, c) => (r >= rows || c >= cols) && ch && ch !== '#'));
+    if (!loses) { apply(); return; }
+    setConfirmDialog({
+      title: 'Shrink the grid?',
+      message: `Letters outside ${rows}×${cols} will be removed.`,
+      confirmLabel: 'Resize',
+      danger: true,
+      onConfirm: apply,
+    });
+  };
+
+  /** Wipe the letters (and with them the pins and clues) but keep the blocks and marks. */
+  const clearManualLetters = () => {
+    if (!manualGrid) return;
+    setManualGrid((prev) => prev && prev.map((row) => row.map((c) => (c === '#' ? '#' : ''))));
+    setLockedCells(new Set());
+    setManualClues((prev) => ({
+      across: prev.across.map((c) => ({ ...c, word: '', clue: '' })),
+      down: prev.down.map((c) => ({ ...c, word: '', clue: '' })),
+    }));
+    setRequiredHighlights(new Set());
+    setFailedWord(null);
+    setManualRebusMode(false);
+  };
+
+  /**
+   * Apply one stroke of a Create tool to a run of squares.
+   *   'block'  value true/false — black or white. With symmetry on, each square's
+   *            180-degree partner follows. A square that turns black loses its letter,
+   *            pin, circle and shade.
+   *   'circle' value true/false.
+   *   'shade'  value = a colour id, or null to clear.
+   * Uses functional updates throughout: a drag calls this once per square, faster than
+   * React re-renders, and must not work from a stale grid.
+   */
+  const paintCells = (keys, op, value) => {
+    if (!manualGrid || !keys.length) return;
+    const rows = manualGrid.length;
+    const cols = manualGrid[0].length;
+    const parse = (k) => k.split(',').map(Number);
+    if (op === 'block') {
+      const all = new Set(keys);
+      if (blockSymmetry) {
+        for (const k of keys) { const [r, c] = parse(k); const [mr, mc] = mirrorOf(r, c, rows, cols); all.add(cellKey(mr, mc)); }
+      }
+      setManualGrid((prev) => {
+        if (!prev) return prev;
+        let changed = false;
+        const next = prev.map((row) => [...row]);
+        for (const k of all) {
+          const [r, c] = parse(k);
+          if (next[r]?.[c] === undefined) continue;
+          if (value && next[r][c] !== '#') { next[r][c] = '#'; changed = true; }
+          else if (!value && next[r][c] === '#') { next[r][c] = ''; changed = true; }
+        }
+        return changed ? next : prev;
+      });
+      if (value) {
+        const dropSet = (prev) => {
+          let hit = false;
+          const next = new Set(prev);
+          for (const k of all) if (next.delete(k)) hit = true;
+          return hit ? next : prev;
+        };
+        setLockedCells(dropSet);
+        setManualCircles(dropSet);
+        setManualShades((prev) => {
+          let hit = false;
+          const next = new Map(prev);
+          for (const k of all) if (next.delete(k)) hit = true;
+          return hit ? next : prev;
+        });
+      }
+      sfx.move();
+      return;
+    }
+    const open = keys.filter((k) => { const [r, c] = parse(k); return manualGrid[r]?.[c] !== undefined && manualGrid[r][c] !== '#'; });
+    if (!open.length) return;
+    if (op === 'circle') {
+      setManualCircles((prev) => {
+        const next = new Set(prev);
+        open.forEach((k) => (value ? next.add(k) : next.delete(k)));
+        return next;
+      });
+    } else if (op === 'shade') {
+      setManualShades((prev) => {
+        const next = new Map(prev);
+        open.forEach((k) => (value ? next.set(k, value) : next.delete(k)));
+        return next;
+      });
+    }
+  };
+
+  /** Flip one square between black and white from the keyboard, symmetry included. */
+  const toggleBlockAt = (r, c) => {
+    if (!manualGrid?.[r]) return;
+    paintCells([cellKey(r, c)], 'block', manualGrid[r][c] !== '#');
+  };
 
   const handleCellClick = (r, c) => {
-    if (manualGrid[r][c] === '#') return;
-    const layout = layouts[currentLayoutIndex]?.grid;
-    if (!layout) return;
+    const layout = manualLayout;
+    if (!manualGrid || !layout) return;
+    // A black square can be selected too, so '.' or a typed letter can open it again.
+    if (manualGrid[r][c] === '#') { setSelectedCell({ row: r, col: c }); return; }
     const slots = findSlots(layout);
     const acrossSlot = slots.find(s => s.direction === 'across' && s.row === r && c >= s.col && c < s.col + s.length);
     const downSlot = slots.find(s => s.direction === 'down' && s.col === c && r >= s.row && r < s.row + s.length);
@@ -1561,6 +1774,37 @@ const CrosswordGenerator = () => {
     const { row, col } = selectedCell;
     if (key === 'Enter') { setManualRebusMode(false); return; }
 
+    // '.' toggles a black square, as in every grid editor. Moving on afterwards lets a
+    // run of blocks be typed the way letters are.
+    if (key === '.') {
+      const becomesBlock = manualGrid[row][col] !== '#';
+      toggleBlockAt(row, col);
+      if (becomesBlock) {
+        if (selectedDirection === 'across' && col < manualGrid[0].length - 1) setSelectedCell({ row, col: col + 1 });
+        else if (selectedDirection === 'down' && row < manualGrid.length - 1) setSelectedCell({ row: row + 1, col });
+      }
+      return;
+    }
+    if (manualGrid[row][col] === '#') {
+      // On a black square: a letter opens it (and its mirror) and lands there; Backspace
+      // just opens it. Arrows fall through and move as usual.
+      if (key === 'Backspace') { toggleBlockAt(row, col); sfx.erase(); return; }
+      if (key.length === 1 && /[a-zA-Z]/.test(key)) {
+        const newGrid = manualGrid.map((r) => [...r]);
+        newGrid[row][col] = key.toUpperCase();
+        if (blockSymmetry) {
+          const [mr, mc] = mirrorOf(row, col, manualGrid.length, manualGrid[0].length);
+          if (newGrid[mr][mc] === '#') newGrid[mr][mc] = '';
+        }
+        setManualGrid(newGrid);
+        lockCell(row, col);
+        sfx.type();
+        if (selectedDirection === 'across' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') setSelectedCell({ row, col: col + 1 });
+        else if (selectedDirection === 'down' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') setSelectedCell({ row: row + 1, col });
+        return;
+      }
+    }
+
     // In rebus mode backspace trims the square rather than clearing it outright.
     if (manualRebusMode && key === 'Backspace') {
       const cur = manualGrid[row][col] && manualGrid[row][col] !== '#' ? manualGrid[row][col] : '';
@@ -1618,10 +1862,12 @@ const CrosswordGenerator = () => {
       else if (selectedDirection === 'down' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') setSelectedCell({ row: row + 1, col });
       return;
     }
-    if (key === 'ArrowRight' && col < manualGrid[0].length - 1 && manualGrid[row][col + 1] !== '#') { setSelectedCell({ row, col: col + 1 }); setSelectedDirection('across'); sfx.move(); }
-    else if (key === 'ArrowLeft' && col > 0 && manualGrid[row][col - 1] !== '#') { setSelectedCell({ row, col: col - 1 }); setSelectedDirection('across'); sfx.move(); }
-    else if (key === 'ArrowDown' && row < manualGrid.length - 1 && manualGrid[row + 1][col] !== '#') { setSelectedCell({ row: row + 1, col }); setSelectedDirection('down'); sfx.move(); }
-    else if (key === 'ArrowUp' && row > 0 && manualGrid[row - 1][col] !== '#') { setSelectedCell({ row: row - 1, col }); setSelectedDirection('down'); sfx.move(); }
+    // Arrows walk onto black squares too — in an editor they are squares like any other,
+    // and there is no other keyboard route to one.
+    if (key === 'ArrowRight' && col < manualGrid[0].length - 1) { setSelectedCell({ row, col: col + 1 }); setSelectedDirection('across'); sfx.move(); }
+    else if (key === 'ArrowLeft' && col > 0) { setSelectedCell({ row, col: col - 1 }); setSelectedDirection('across'); sfx.move(); }
+    else if (key === 'ArrowDown' && row < manualGrid.length - 1) { setSelectedCell({ row: row + 1, col }); setSelectedDirection('down'); sfx.move(); }
+    else if (key === 'ArrowUp' && row > 0) { setSelectedCell({ row: row - 1, col }); setSelectedDirection('down'); sfx.move(); }
   };
 
   const handleKeyDown = (e) => {
@@ -1629,7 +1875,7 @@ const CrosswordGenerator = () => {
     if (isFormElement(e.target)) return;
     if (editingClue) return;
     if (!selectedCell || !manualGrid) return;
-    if (e.key === 'Backspace' || e.key.startsWith('Arrow') || (e.key.length === 1 && /[a-zA-Z]/.test(e.key))) {
+    if (e.key === 'Backspace' || e.key === '.' || e.key.startsWith('Arrow') || (e.key.length === 1 && /[a-zA-Z]/.test(e.key))) {
       e.preventDefault();
     }
     applyManualKey(e.key);
@@ -1637,7 +1883,7 @@ const CrosswordGenerator = () => {
 
   const getCurrentWord = () => {
     if (!selectedCell || !manualGrid) return { word: '', slot: null };
-    const layout = layouts[currentLayoutIndex]?.grid;
+    const layout = manualLayout;
     if (!layout) return { word: '', slot: null };
     const slots = findSlots(layout);
     const slot = slots.find(s => {
@@ -1693,7 +1939,7 @@ const CrosswordGenerator = () => {
   // slot is not yet an answer.
   const answersInGrid = (excludeSlot = null) => {
     const used = new Set();
-    const layout = layouts[currentLayoutIndex]?.grid;
+    const layout = manualLayout;
     if (!layout || !manualGrid) return used;
     for (const s of findSlots(layout)) {
       if (excludeSlot && s.direction === excludeSlot.direction
@@ -1823,6 +2069,7 @@ const CrosswordGenerator = () => {
 
     setPlayCircles(new Set(extras.circles || []));
     setPlayShades(new Set(extras.shades || []));
+    setPlayShadeColors(extras.shadeColors || null);
     setRebusMode(false);
     // Store the answers
     setPlayAnswers(sourceGrid);
@@ -2876,6 +3123,14 @@ const CrosswordGenerator = () => {
     if (typeof s.currentLayoutIndex === 'number') setCurrentLayoutIndex(clampIdx(s.currentLayoutIndex));
     if (Array.isArray(s.lockedCells)) setLockedCells(new Set(s.lockedCells));
     if (Array.isArray(s.manualCircles)) setManualCircles(new Set(s.manualCircles));
+    // The Create grid itself was never saved, so a reload lost the author's work while
+    // keeping their pins — pinned coordinates on a grid that was no longer there.
+    if (Array.isArray(s.manualGrid) && s.manualGrid.length && Array.isArray(s.manualGrid[0])) {
+      setManualGrid(s.manualGrid);
+      setManualClues(cluesForLayout(layoutOfGrid(s.manualGrid), s.manualGrid, s.manualClues || null));
+    }
+    if (Array.isArray(s.manualShades)) setManualShades(new Map(s.manualShades));
+    if (typeof s.blockSymmetry === 'boolean') setBlockSymmetry(s.blockSymmetry);
     if (s.difficultyChoice) setDifficultyChoice(s.difficultyChoice);
     if (s.grid) { setGrid(s.grid); setClues(s.clues || { across: [], down: [] }); }
     if (s.latestGrid) { setLatestGrid(s.latestGrid); setLatestClues(s.latestClues || null); }
@@ -2890,6 +3145,7 @@ const CrosswordGenerator = () => {
       setPlayComplete(!!s.play.playComplete);
       setPlayCircles(new Set(s.play.circles || []));
       setPlayShades(new Set(s.play.shades || []));
+      setPlayShadeColors(s.play.shadeColors || null);
       resultShownRef.current = !!s.play.playComplete; // don't re-pop the result card on resume
       setPlayDirection(s.play.playDirection || 'across');
       setIsDailyMode(!!s.play.isDailyMode);
@@ -2910,6 +3166,10 @@ const CrosswordGenerator = () => {
       layouts,
       lockedCells: [...lockedCells],
       manualCircles: [...manualCircles],
+      manualGrid,
+      manualClues,
+      manualShades: [...manualShades],
+      blockSymmetry,
       difficultyChoice,
       grid,
       clues,
@@ -2931,6 +3191,7 @@ const CrosswordGenerator = () => {
         isDailyMode,
         circles: [...playCircles],
         shades: [...playShades],
+        shadeColors: playShadeColors,
       } : null,
     });
     // playTimer is deliberately absent from the dependency list. It ticks once a second,
@@ -2938,7 +3199,7 @@ const CrosswordGenerator = () => {
     // JSON.stringify'd and written to localStorage every second of every solve. The
     // interval below picks up the clock instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, selectedLayoutIndex, currentLayoutIndex, layouts, lockedCells, manualCircles, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, checkedCells, usedAssist, playComplete, playDirection, isDailyMode, playCircles, playShades]);
+  }, [activeTab, selectedLayoutIndex, currentLayoutIndex, layouts, lockedCells, manualCircles, manualGrid, manualClues, manualShades, blockSymmetry, difficultyChoice, grid, clues, latestGrid, latestClues, playAnswers, playGrid, playClues, revealedCells, checkedCells, usedAssist, playComplete, playDirection, isDailyMode, playCircles, playShades, playShadeColors]);
 
   // Catch up the clock roughly, rather than on every tick. Losing a few seconds of
   // elapsed time to a hard refresh is a far better trade than a 6 MB-per-minute write
@@ -2968,9 +3229,27 @@ const CrosswordGenerator = () => {
     };
   }, [layouts, selectedLayoutIndex]);
 
+  // What the PDF dialog prints: whichever puzzle the current tab is showing, with its
+  // circles and shading. Memoised so the dialog's live preview only rebuilds on a change.
+  const pdfPuzzle = useMemo(() => {
+    if (activeTab === 'create') {
+      return manualGrid ? {
+        grid: manualGrid, clues: manualClues, circles: [...manualCircles],
+        shades: [...manualShades.keys()], shadeColors: Object.fromEntries(manualShades),
+      } : null;
+    }
+    if (activeTab === 'play') {
+      return playAnswers ? {
+        grid: playAnswers, clues: playClues, circles: [...playCircles],
+        shades: [...playShades], shadeColors: playShadeColors || {},
+      } : null;
+    }
+    return grid ? { grid, clues, circles: [], shades: [], shadeColors: {} } : null;
+  }, [activeTab, manualGrid, manualClues, manualCircles, manualShades, playAnswers, playClues, playCircles, playShades, playShadeColors, grid, clues]);
+
   // Best complete puzzle to host in multiplayer (a full solution grid + clues).
   const hostablePuzzle = playAnswers
-    ? { grid: playAnswers, clues: playClues, meta: { title: 'Current puzzle' } }
+    ? { grid: playAnswers, clues: playClues, circles: [...playCircles], shades: [...playShades], shadeColors: playShadeColors, meta: { title: 'Current puzzle' } }
     : grid
       ? { grid, clues, meta: { title: 'Generated puzzle' } }
       : latestGrid
@@ -3019,6 +3298,7 @@ const CrosswordGenerator = () => {
       startPlayMode(d.grid, d.clues, {
         circles: d.circles,
         shades: d.shades,
+        shadeColors: d.shadeColors,
         meta: { source: 'shared', remoteId: row.id, title: row.title || 'Shared puzzle' },
       });
       setShareCodeInput('');
@@ -3037,10 +3317,11 @@ const CrosswordGenerator = () => {
     const cc = activeTab === 'auto' ? clues : activeTab === 'play' ? playClues : manualClues;
     if (!cg) return null;
     const layout = cg.map((row) => row.map((c) => (c === '#' ? '#' : '.')).join(''));
-    const circles = activeTab === 'play' ? [...playCircles] : [...manualCircles];
-    const shades = activeTab === 'play' ? [...playShades] : [];
+    const circles = activeTab === 'play' ? [...playCircles] : activeTab === 'create' ? [...manualCircles] : [];
+    const shades = activeTab === 'play' ? [...playShades] : activeTab === 'create' ? [...manualShades.keys()] : [];
+    const shadeColors = activeTab === 'play' ? (playShadeColors || {}) : activeTab === 'create' ? Object.fromEntries(manualShades) : {};
     return {
-      version: '1.0', layout, grid: cg, clues: cc, circles, shades,
+      version: '1.0', layout, grid: cg, clues: cc, circles, shades, shadeColors,
       hasRebus: cg.some((row) => row.some((c) => c && c !== '#' && c.length > 1)),
       meta: { title: 'My puzzle' },
     };
@@ -3061,18 +3342,18 @@ const CrosswordGenerator = () => {
 
   const loadPuzzleIntoCreate = (data) => {
     if (!data?.grid) return;
-    const layoutGrid = data.grid.map((row) => row.map((c) => (c === '#' ? '#' : '.')).join(''));
-    const newIndex = layouts.length;
-    setLayouts((prev) => [...prev, { name: data.meta?.title || 'Saved puzzle', grid: layoutGrid }]);
-    setCurrentLayoutIndex(newIndex);
-    setManualGrid(data.grid.map((row) => row.map((c) => (c === '#' ? '#' : (c || '')))));
+    // Create carries its own blocks now, so a loaded puzzle no longer has to be appended
+    // to `layouts` (which used to grow by one entry per Edit, forever).
+    const loaded = data.grid.map((row) => row.map((c) => (c === '#' ? '#' : (c || ''))));
+    setManualGrid(loaded);
     // A loaded puzzle is not the author's hand-typed work, so nothing is pinned and a
     // Regenerate may reroll all of it. Hand-written clues still survive, because a clue is
     // only dropped when its answer changes under it.
     setLockedCells(new Set());
     setManualCircles(new Set(data.circles || []));
+    setManualShades(new Map((data.shades || []).map((k) => [k, data.shadeColors?.[k] || 'gray'])));
     setManualRebusMode(false);
-    setManualClues({ across: data.clues?.across || [], down: data.clues?.down || [] });
+    setManualClues(cluesForLayout(layoutOfGrid(loaded), loaded, { across: data.clues?.across || [], down: data.clues?.down || [] }));
     setSelectedCell(null);
     setActiveTab('create');
   };
@@ -3196,8 +3477,8 @@ const CrosswordGenerator = () => {
             </label>
 
             <div className="relative">
-              <button onClick={() => setShowLayoutSelector(!showLayoutSelector)} className="btn">
-                <Grid3X3 size={16} />{layouts[layoutIndexForTab]?.name}
+              <button onClick={() => setShowLayoutSelector(!showLayoutSelector)} className="btn" title={activeTab === 'create' ? 'Start from one of the saved block patterns' : 'Choose the block pattern to fill'}>
+                <Grid3X3 size={16} />{activeTab === 'create' ? 'Templates' : layouts[layoutIndexForTab]?.name}
               </button>
             </div>
 
@@ -3228,7 +3509,9 @@ const CrosswordGenerator = () => {
                   if (empty) { setError('Fill every square before playing this puzzle.'); return; }
                   startPlayMode(manualGrid, manualClues, {
                     circles: [...manualCircles],
-                    meta: { source: 'generated', layoutName: layouts[currentLayoutIndex]?.name, title: 'My puzzle' },
+                    shades: [...manualShades.keys()],
+                    shadeColors: Object.fromEntries(manualShades),
+                    meta: { source: 'generated', layoutName: 'Custom grid', title: 'My puzzle' },
                   });
                 }}
                 className="btn btn-ink"
@@ -3238,8 +3521,8 @@ const CrosswordGenerator = () => {
             )}
 
             {activeTab === 'create' && (
-              <button onClick={() => initializeManualGrid(currentLayoutIndex)} className="btn btn-ghost">
-                <RefreshCw size={16} />Clear Grid
+              <button onClick={clearManualLetters} className="btn btn-ghost" title="Remove every letter and clue; keep the blocks, circles and shading">
+                <RefreshCw size={16} />Clear Letters
               </button>
             )}
 
@@ -3314,7 +3597,7 @@ const CrosswordGenerator = () => {
               <div className="w-full flex flex-col gap-3 md:max-w-3xl border-t border-ink/12 mt-1 pt-4">
                 <div className="eyebrow text-ink-soft">Specific Words for Create</div>
                 <div className="text-xs text-ink-faint font-mono leading-relaxed">
-                  Layout {layouts[currentLayoutIndex]?.grid.length}×{layouts[currentLayoutIndex]?.grid[0]?.length} · Max words {findSlots(layouts[currentLayoutIndex]?.grid || []).length} · Lengths {Object.entries(getLayoutStats(layouts[currentLayoutIndex]?.grid || []).lengthCounts || {}).sort((a,b)=>a[0]-b[0]).map(([len,count]) => `${len}(${count})`).join(', ')}
+                  Grid {manualLayout?.length}×{manualLayout?.[0]?.length} · Max words {manualLayout ? findSlots(manualLayout).length : 0} · Lengths {Object.entries(getLayoutStats(manualLayout || []).lengthCounts || {}).sort((a,b)=>a[0]-b[0]).map(([len,count]) => `${len}(${count})`).join(', ')}
                 </div>
                 <div className="flex flex-wrap gap-1.5 items-center">
                   <span className="eyebrow mr-1">Difficulty</span>
@@ -3352,8 +3635,8 @@ const CrosswordGenerator = () => {
 
             <span className="hidden md:block ml-auto h-6 w-px bg-ink/15" />
 
-            <button onClick={downloadPuzzle} disabled={activeTab === 'auto' ? !grid : !manualGrid} className="btn">
-              <Download size={16} />Download
+            <button onClick={() => setShowPdfModal(true)} disabled={activeTab === 'auto' ? !grid : !manualGrid} className="btn" title="A print-ready, newspaper-style PDF (with an answer key)">
+              <Download size={16} />PDF
             </button>
 
             <button onClick={exportPuzzle} disabled={activeTab === 'auto' ? !grid : !manualGrid} className="btn">
@@ -3462,6 +3745,10 @@ const CrosswordGenerator = () => {
               <Share size={16} />Share
             </button>
 
+            <button onClick={() => setShowPdfModal(true)} disabled={!playAnswers} className="btn" title="A print-ready, newspaper-style PDF (with an answer key)">
+              <Download size={16} />PDF
+            </button>
+
             {auth.enabled && (
               <button onClick={saveCurrentPuzzle} disabled={!playAnswers} className="btn">
                 <Save size={16} />Save
@@ -3520,10 +3807,11 @@ const CrosswordGenerator = () => {
             onPlay={(data, row) => startPlayMode(data.grid, data.clues, {
               circles: data.circles,
               shades: data.shades,
+              shadeColors: data.shadeColors,
               meta: { source: 'imported', remoteId: row?.id, title: row?.title || data.meta?.title },
             })}
             onEdit={(data) => loadPuzzleIntoCreate(data)}
-            onHost={(data) => { setMpSeedPuzzle({ grid: data.grid, clues: data.clues, meta: data.meta }); setActiveTab('multiplayer'); }}
+            onHost={(data) => { setMpSeedPuzzle({ grid: data.grid, clues: data.clues, circles: data.circles, shades: data.shades, shadeColors: data.shadeColors, meta: data.meta }); setActiveTab('multiplayer'); }}
           />
         )}
 
@@ -3650,7 +3938,7 @@ const CrosswordGenerator = () => {
         {activeTab === 'create' && manualGrid && (
           <ManualEditor
             manualGrid={manualGrid}
-            manualClues={manualClues}
+            manualClues={editorClues}
             selectedCell={selectedCell}
             selectedDirection={selectedDirection}
             handleCellClick={handleCellClick}
@@ -3704,6 +3992,18 @@ const CrosswordGenerator = () => {
             onToggleCellLock={toggleCellLock}
             onToggleWordLock={toggleCurrentWordLock}
             onUnpinAll={unpinAll}
+            layout={manualLayout}
+            health={manualHealth}
+            tool={createTool}
+            onToolChange={setCreateTool}
+            shades={manualShades}
+            shadeColorId={shadeColorId}
+            onShadeColorChange={setShadeColorId}
+            symmetry={blockSymmetry}
+            onSymmetryChange={setBlockSymmetry}
+            onPaintCells={paintCells}
+            onResize={resizeManualGrid}
+            onNewGrid={newManualGrid}
             onOpenReclue={() => setReclue((r) => (r ? null : { band: 'medium', selected: new Set() }))}
           />
         )}
@@ -3785,6 +4085,7 @@ const CrosswordGenerator = () => {
             onClearWord={clearCurrentWord}
             circles={playCircles}
             shades={playShades}
+            shadeColors={playShadeColors}
             rebusOn={rebusMode}
             onToggleRebus={() => setRebusMode(v => !v)}
             onExit={() => setGameView(false)}
@@ -3823,6 +4124,7 @@ const CrosswordGenerator = () => {
             onClearWord={clearCurrentWord}
             circles={playCircles}
             shades={playShades}
+            shadeColors={playShadeColors}
             rebusOn={rebusMode}
             onToggleRebus={() => setRebusMode(v => !v)}
             onEnterGameView={() => setGameView(true)}
@@ -3847,11 +4149,22 @@ const CrosswordGenerator = () => {
         )}
       </div>
       
+      <PdfExportModal
+        open={showPdfModal}
+        puzzle={pdfPuzzle}
+        defaultTitle={activeTab === 'play' ? (playMetaRef.current?.title || '') : ''}
+        difficultyLabel={difficultyInfo?.label || ''}
+        onClose={() => setShowPdfModal(false)}
+        onDownloadPng={activeTab === 'play' ? null : downloadPuzzle}
+      />
+
       <LayoutSelector
         isOpen={showLayoutSelector}
         layouts={layouts}
         activeTab={activeTab}
-        layoutIndexForTab={layoutIndexForTab}
+        // Create no longer has a "current" layout — a template is a starting point only.
+        layoutIndexForTab={activeTab === 'create' ? -1 : layoutIndexForTab}
+        title={activeTab === 'create' ? 'Start from a template' : 'Select Layout'}
         onSelect={handleSelectLayout}
         onClose={() => setShowLayoutSelector(false)}
         onCreateLayout={() => { setShowLayoutSelector(false); openCreateLayoutModal(); }}

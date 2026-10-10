@@ -1,10 +1,20 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { PenTool, Sparkles, X, Check, ChevronRight, ChevronDown, Zap, Lock, Unlock, Circle } from './Icons';
 import MobileSolveDock from './MobileSolveDock';
 import { renderRich } from '../utils/richText';
 import { keepClearOfDock } from '../utils/keepClearOfDock';
 import ClueStudio from './ClueStudio';
 import { difficultyColorClass } from '../utils/difficulty';
+import { SHADE_COLORS, shadeFillFor } from '../utils/cellColors';
+
+// What a press on the grid does. Letters is the default and the only tool that selects.
+const TOOLS = [
+  { id: 'letter', label: 'Letters', hint: 'Type answers. "." toggles a black square at the cursor.' },
+  { id: 'block', label: 'Blocks', hint: 'Click or drag to toggle black squares.' },
+  { id: 'circle', label: 'Circles', hint: 'Click or drag to ring squares — a hint to the theme.' },
+  { id: 'shade', label: 'Shade', hint: 'Click or drag to fill squares with the chosen colour; again to clear.' },
+];
+const SIZE_PRESETS = [5, 7, 9, 11, 13, 15, 17, 21];
 
 const ManualEditor = ({
   manualGrid,
@@ -59,7 +69,18 @@ const ManualEditor = ({
   rebusOn = false,
   onToggleRebus = () => {},
   onToggleWordLock = () => {},
-  onUnpinAll = () => {}
+  onUnpinAll = () => {},
+  health = { errors: [], warnings: [], words: 0, blocks: 0, symmetric: true, badCells: new Set() },
+  tool = 'letter',
+  onToolChange = () => {},
+  shades = new Map(),
+  shadeColorId = 'yellow',
+  onShadeColorChange = () => {},
+  symmetry = true,
+  onSymmetryChange = () => {},
+  onPaintCells = () => {},
+  onResize = () => {},
+  onNewGrid = () => {},
 }) => {
 
 
@@ -117,6 +138,55 @@ const ManualEditor = ({
   };
   const cancelLongPress = () => clearTimeout(longPress.current.timer);
   useEffect(() => () => clearTimeout(longPress.current.timer), []);
+
+  // ---- painting tools (blocks / circles / shade) ----
+  // One stroke sets every square it crosses to the SAME state, decided by the first
+  // square: start on a white square and the drag paints black, start on a black one and
+  // it erases. Squares are found with elementFromPoint because a touch pointer stays
+  // captured by the element it went down on, so pointerenter never fires on the others.
+  const stroke = useRef(null);
+  const painting = tool !== 'letter';
+  const rcAt = (x, y) => document.elementFromPoint(x, y)?.closest?.('[data-rc]')?.dataset.rc || null;
+  const onGridPointerDown = (e) => {
+    if (!painting || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    const k = e.target.closest?.('[data-rc]')?.dataset.rc;
+    if (!k) return;
+    e.preventDefault();
+    const [r, c] = k.split(',').map(Number);
+    const isBlock = manualGrid[r]?.[c] === '#';
+    let value;
+    if (tool === 'block') value = !isBlock;
+    else if (isBlock) return;                       // nothing to ring or fill on a block
+    else if (tool === 'circle') value = !circles.has(k);
+    else value = shades.get(k) === shadeColorId ? null : shadeColorId;
+    stroke.current = { op: tool, value, done: new Set([k]) };
+    onPaintCells([k], tool, value);
+  };
+  const onGridPointerMove = (e) => {
+    const st = stroke.current;
+    if (!st) return;
+    const k = rcAt(e.clientX, e.clientY);
+    if (!k || st.done.has(k)) return;
+    st.done.add(k);
+    onPaintCells([k], st.op, st.value);
+  };
+  useEffect(() => {
+    const endStroke = () => { stroke.current = null; };
+    window.addEventListener('pointerup', endStroke);
+    window.addEventListener('pointercancel', endStroke);
+    return () => {
+      window.removeEventListener('pointerup', endStroke);
+      window.removeEventListener('pointercancel', endStroke);
+    };
+  }, []);
+
+  const rows = manualGrid?.length || 0;
+  const cols = manualGrid?.[0]?.length || 0;
+  const [sizeDraft, setSizeDraft] = useState({ rows, cols });
+  // Follow the grid when something else resizes it (a template, a loaded puzzle).
+  useEffect(() => { setSizeDraft({ rows, cols }); }, [rows, cols]);
+  const draftChanged = Number(sizeDraft.rows) !== rows || Number(sizeDraft.cols) !== cols;
+  const selectedIsBlock = !!selectedCell && manualGrid?.[selectedCell.row]?.[selectedCell.col] === '#';
 
   const pinnedCount = lockedCells.size;
   const currentWordPinned = (() => {
@@ -194,9 +264,89 @@ const ManualEditor = ({
               )}
             </div>
           </div>
-          <p className="text-ink-faint text-sm mt-1 mb-4">Click a cell to select · click again to flip Across/Down · type letters to fill.</p>
+          <p className="text-ink-faint text-sm mt-1 mb-3">{TOOLS.find((t) => t.id === tool)?.hint} {tool === 'letter' && 'Click a square again to flip Across/Down.'}</p>
+
+          {/* ---- grid tools ---- */}
+          <div className="flex flex-col gap-3 mb-4" data-testid="grid-tools">
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="inline-flex rounded-sm border border-ink/25 overflow-hidden" role="radiogroup" aria-label="Grid tool">
+                {TOOLS.map((t) => (
+                  <button
+                    key={t.id}
+                    role="radio"
+                    aria-checked={tool === t.id}
+                    data-tool={t.id}
+                    onClick={() => onToolChange(t.id)}
+                    className={`inline-flex items-center whitespace-nowrap px-2.5 sm:px-3 py-1.5 text-xs font-bold uppercase tracking-wide transition border-r border-ink/15 last:border-r-0 ${tool === t.id ? 'bg-ink text-paper-raised' : 'text-ink-soft hover:bg-ink/5'}`}
+                  >
+                    {t.id === 'block' && <span className="inline-block w-2.5 h-2.5 bg-current mr-1.5 align-[-1px]" />}
+                    {t.id === 'circle' && <Circle size={12} className="mr-1" />}
+                    {t.id === 'shade' && <span className="inline-block w-2.5 h-2.5 rounded-[2px] mr-1.5 align-[-1px] border border-ink/30" style={{ backgroundColor: shadeFillFor('x', { x: shadeColorId }) }} />}
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              {tool === 'shade' && (
+                <div className="flex items-center gap-1" role="radiogroup" aria-label="Shade colour">
+                  {SHADE_COLORS.map((col) => (
+                    <button
+                      key={col.id}
+                      role="radio"
+                      aria-checked={shadeColorId === col.id}
+                      aria-label={col.label}
+                      title={col.label}
+                      onClick={() => onShadeColorChange(col.id)}
+                      className={`w-6 h-6 rounded-sm border transition ${shadeColorId === col.id ? 'border-ink ring-2 ring-ink/30' : 'border-ink/25 hover:border-ink/60'}`}
+                      style={{ backgroundColor: col.screen }}
+                    />
+                  ))}
+                </div>
+              )}
+              <label className="flex items-center gap-1.5 text-xs text-ink-soft cursor-pointer select-none ml-auto" title="Mirror every block through the centre of the grid, the way American crosswords are built">
+                <input type="checkbox" checked={symmetry} onChange={(e) => onSymmetryChange(e.target.checked)} />
+                Symmetric blocks
+              </label>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              <span className="eyebrow">Size</span>
+              <input
+                type="number" min={3} max={25} aria-label="Rows"
+                value={sizeDraft.rows}
+                onChange={(e) => setSizeDraft((d) => ({ ...d, rows: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === 'Enter') onResize(sizeDraft.rows, sizeDraft.cols); }}
+                className="w-14 px-2 py-1 rounded-sm border border-ink/25 bg-paper-raised font-mono text-sm"
+              />
+              <span className="text-ink-faint">×</span>
+              <input
+                type="number" min={3} max={25} aria-label="Columns"
+                value={sizeDraft.cols}
+                onChange={(e) => setSizeDraft((d) => ({ ...d, cols: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === 'Enter') onResize(sizeDraft.rows, sizeDraft.cols); }}
+                className="w-14 px-2 py-1 rounded-sm border border-ink/25 bg-paper-raised font-mono text-sm"
+              />
+              <button onClick={() => onResize(sizeDraft.rows, sizeDraft.cols)} disabled={!draftChanged} className="btn btn-sm" title="Keep everything that still fits, anchored at the top-left">Resize</button>
+              <button onClick={() => onNewGrid(sizeDraft.rows, sizeDraft.cols)} className="btn btn-sm btn-ghost" title="Start over with an empty grid of this size">New blank</button>
+              <div className="flex gap-1 flex-wrap">
+                {SIZE_PRESETS.map((n) => (
+                  <button
+                    key={n}
+                    onClick={() => setSizeDraft({ rows: n, cols: n })}
+                    title={`${n}×${n}`}
+                    className={`px-1.5 py-0.5 rounded-sm border font-mono text-[11px] ${Number(sizeDraft.rows) === n && Number(sizeDraft.cols) === n ? 'border-ink bg-ink text-paper-raised' : 'border-ink/20 text-ink-soft hover:bg-ink/5'}`}
+                  >{n}</button>
+                ))}
+              </div>
+            </div>
+          </div>
           <div className="rule-hair mb-4" />
-          <div className="overflow-x-auto pb-2"><div className="xw-grid" style={{ '--cols': manualGrid[0]?.length || 15 }}>
+          <div className="overflow-x-auto pb-2"><div
+            className={`xw-grid ${painting ? 'select-none' : ''}`}
+            style={{ '--cols': manualGrid[0]?.length || 15, touchAction: painting ? 'none' : undefined }}
+            onPointerDown={onGridPointerDown}
+            onPointerMove={onGridPointerMove}
+            data-testid="create-grid"
+          >
             {manualGrid.map((row, r) => <div key={r} className="flex">{row.map((cell, c) => {
               const isSelected = selectedCell?.row === r && selectedCell?.col === c;
               const isInWord = isInCurrentWord(r, c);
@@ -230,7 +380,7 @@ const ManualEditor = ({
               // "required word that still needs a clue" state was unreachable.
               const shouldShowRequiredMissing = inHighlightedWord && missingClue && highlightMissingRequired;
               const cellClass = cell === '#'
-                ? 'xw-cell--block'
+                ? `xw-cell--block ${isSelected ? 'xw-cell--block-sel' : ''}`
                 : inFailedWord
                   ? 'xw-cell--failed'
                   : isSelected
@@ -246,22 +396,26 @@ const ManualEditor = ({
                             : '';
               const pinned = cell !== '#' && cell && lockedCells.has(`${r},${c}`);
               const circled = cell !== '#' && circles.has(`${r},${c}`);
+              const shadeId = cell !== '#' ? shades.get(`${r},${c}`) : null;
+              const bad = cell !== '#' && health.badCells?.has(`${r},${c}`);
               // A rebus square holds several letters, so it needs the smaller type the play
               // grid already uses — otherwise JAM overflows the square.
               const isRebus = cell && cell !== '#' && cell.length > 1;
               return (
                 <div
                   key={c}
+                  data-rc={`${r},${c}`}
                   data-sel={isSelected ? '1' : undefined}
                   onClick={(e) => {
+                    if (painting) return;                 // the stroke already handled it
                     if (longPress.current.fired) return;
                     // Shift-click toggles a circle: quick for the common case of ringing a
                     // run of squares, without leaving the grid for the toolbar.
                     if (e.shiftKey && cell !== '#') { onToggleCircle(r, c); return; }
                     handleCellClick(r, c);
                   }}
-                  onContextMenu={(e) => { if (cell !== '#' && cell) { e.preventDefault(); onToggleCellLock(r, c); } }}
-                  onTouchStart={() => { if (cell !== '#' && cell) startLongPress(r, c); }}
+                  onContextMenu={(e) => { if (painting) { e.preventDefault(); return; } if (cell !== '#' && cell) { e.preventDefault(); onToggleCellLock(r, c); } }}
+                  onTouchStart={() => { if (!painting && cell !== '#' && cell) startLongPress(r, c); }}
                   onTouchEnd={cancelLongPress}
                   onTouchMove={cancelLongPress}
                   onTouchCancel={cancelLongPress}
@@ -269,8 +423,10 @@ const ManualEditor = ({
                     ? (pinned ? 'Pinned — Regenerate will keep this letter. Right-click or long-press to unpin.'
                       : 'Right-click or long-press to pin this letter')
                     : undefined}
-                  className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${cellClass} ${pinned ? 'xw-cell--pinned' : ''}`}
+                  className={`xw-cell ${cell === '#' && !painting ? '' : 'cursor-pointer'} ${cellClass} ${pinned ? 'xw-cell--pinned' : ''} ${bad ? 'xw-cell--bad' : ''}`}
                 >
+                  {/* multiply keeps the selection / active-word tint visible through the fill */}
+                  {shadeId && <span className="absolute inset-0 pointer-events-none mix-blend-multiply" style={{ backgroundColor: shadeFillFor(`${r},${c}`, shades) }} />}
                   {circled && <span className="absolute inset-[9%] pointer-events-none rounded-full border border-ink/45" />}
                   {cell !== '#' && clueNumber && <span className="xw-num">{clueNumber}</span>}
                   {cell !== '#' && cell && (
@@ -280,6 +436,20 @@ const ManualEditor = ({
               );
             })}</div>)}
           </div></div>
+
+          {/* Grid check: errors stop the fill, so they are spelled out; warnings are legal
+              (real puzzles have unchecked squares) and stay quiet. */}
+          <div className="mt-3 text-xs space-y-1" data-testid="grid-health">
+            <div className="text-ink-faint font-mono">
+              {rows}×{cols} · {health.words} {health.words === 1 ? 'entry' : 'entries'} · {health.blocks} {health.blocks === 1 ? 'block' : 'blocks'} · {health.symmetric ? 'symmetric' : 'not symmetric'}
+            </div>
+            {health.errors.map((e) => (
+              <div key={e.code} className="border-l-2 border-accent pl-2 text-accent-deep">{e.text}</div>
+            ))}
+            {health.warnings.map((w) => (
+              <div key={w.code} className="pl-2.5 text-ink-faint">{w.text}</div>
+            ))}
+          </div>
 
           {/* Pinned squares are the contract between the author and Regenerate, so say
               plainly how many there are and offer the way out. */}
@@ -311,8 +481,17 @@ const ManualEditor = ({
             <div className="flex items-end justify-between gap-3 flex-wrap">
               <div>
                 <span className="eyebrow">Current Selection</span>
-                <div className="font-mono text-2xl font-medium text-ink tracking-[0.28em] mt-1.5">{currentWord.word || '·····'}</div>
-                <div className="text-ink-faint text-sm mt-1">Direction — <span className="text-ink capitalize font-semibold">{selectedDirection}</span></div>
+                {selectedIsBlock ? (
+                  <>
+                    <div className="font-mono text-2xl font-medium text-ink mt-1.5">■ Black square</div>
+                    <div className="text-ink-faint text-sm mt-1">Press <kbd className="chip">.</kbd> or type a letter to open it.</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="font-mono text-2xl font-medium text-ink tracking-[0.28em] mt-1.5">{currentWord.word || '·····'}</div>
+                    <div className="text-ink-faint text-sm mt-1">Direction — <span className="text-ink capitalize font-semibold">{selectedDirection}</span></div>
+                  </>
+                )}
               </div>
               <div className="flex gap-2 flex-wrap">
                 <button onClick={() => { setClueInput(getClueForCurrentSlot()?.clue || ''); setEditingClue(true); }} className="btn btn-sm"><PenTool size={15} />Edit Clue</button>
@@ -486,7 +665,8 @@ const ManualEditor = ({
         </div>
       </div>
 
-      <MobileSolveDock
+      {/* The keyboard only types letters; while painting it would just cover the grid. */}
+      {tool === 'letter' && <MobileSolveDock
         clueNumber={activeClue?.number}
         clueDirection={selectedDirection}
         clueText={activeClue?.clue || (currentWord?.word ? currentWord.word.replace(/_/g, '·') : '')}
@@ -495,7 +675,7 @@ const ManualEditor = ({
         onToggleDir={() => setSelectedDirection(selectedDirection === 'across' ? 'down' : 'across')}
         onKey={(ch) => onVirtualKey(ch)}
         onBackspace={() => onVirtualKey('Backspace')}
-      />
+      />}
     </div>
   );
 };

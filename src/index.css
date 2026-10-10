@@ -349,6 +349,11 @@
   .xw-cell--failed {
     background-image: linear-gradient(rgb(var(--wrong-rgb) / 0.3), rgb(var(--wrong-rgb) / 0.3));
   }
+  /* a black square under the Create cursor — selectable so '.' can open it again */
+  .xw-cell--block-sel { box-shadow: inset 0 0 0 3px var(--select); }
+  /* a square in an entry the solver cannot fill (2 letters, >15, or no entry at all).
+     An outline, not a fill, so it never hides a letter, a shade or the selection. */
+  .xw-cell--bad { box-shadow: inset 0 0 0 1.5px rgb(var(--wrong-rgb) / 0.7); }
   .xw-num {
     position: absolute;
     top: 1px;

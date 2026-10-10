@@ -1,4 +1,5 @@
 import React from 'react';
+import { shadeFillFor } from '../utils/cellColors';
 
 // Shared crossword grid renderer used by both the studio Play view and the
 // immersive Game view. Purely presentational — all state comes via props.
@@ -14,6 +15,7 @@ const CrosswordGrid = ({
   checkedCells = null,
   circles = null,
   shades = null,
+  shadeColors = null,
   remoteCells = {},
   getNumberForCell,
   onCellClick,
@@ -87,7 +89,8 @@ const CrosswordGrid = ({
                     + (isRevealed ? ', revealed' : '')}
                 className={`xw-cell ${cell === '#' ? '' : 'cursor-pointer'} ${fill} ${isWrong ? `xw-cell--mark-wrong ${letterColor}` : ''}`}
               >
-                {shaded && <span className="absolute inset-0 pointer-events-none bg-ink/15" />}
+                {/* multiply, so the selection and active-word tints still read through a coloured square */}
+                {shaded && <span className="absolute inset-0 pointer-events-none mix-blend-multiply" style={{ backgroundColor: shadeFillFor(cellKey, shadeColors) }} />}
                 {circled && <span className="absolute inset-[9%] pointer-events-none rounded-full border border-ink/45" />}
                 {remote && (
                   <span

@@ -9,7 +9,8 @@ const LayoutSelector = ({
   onSelect,
   onClose,
   onCreateLayout,
-  onEditLayout
+  onEditLayout,
+  title = 'Select Layout',
 }) => {
   if (!isOpen) return null;
 
@@ -17,11 +18,11 @@ const LayoutSelector = ({
     <>
       <div className="fixed inset-0 z-[998]" onClick={onClose} />
       <div
-        className="fixed z-[999] panel shadow-press overflow-hidden min-w-[244px] animate-rise-in"
+        className="fixed z-[999] panel shadow-press overflow-hidden min-w-[244px] max-h-[70vh] flex flex-col animate-rise-in"
         style={{ top: '300px', left: '50%', transform: 'translateX(-50%)' }}
       >
         <div className="bg-paper-sunken px-4 py-2.5 border-b border-ink/12 flex items-center justify-between gap-3">
-          <span className="eyebrow">Select Layout</span>
+          <span className="eyebrow">{title}</span>
           <div className="flex gap-1.5">
             <button onClick={onCreateLayout} className="btn btn-sm btn-accent">
               <Plus size={13} />New
@@ -31,6 +32,7 @@ const LayoutSelector = ({
             </button>
           </div>
         </div>
+        <div className="overflow-y-auto">
         {layouts.map((layout, idx) => (
           <button
             key={idx}
@@ -41,6 +43,7 @@ const LayoutSelector = ({
             <span className="font-mono text-xs text-ink-faint">{layout.grid.length}×{layout.grid[0].length}</span>
           </button>
         ))}
+        </div>
       </div>
     </>
   );
