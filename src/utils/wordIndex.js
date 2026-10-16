@@ -16,7 +16,10 @@ import { setBit } from './bitset.js';
 
 export const MIN_WORD_LEN = 3;
 export const MAX_WORD_LEN = 15;
-export const ADHOC_CAPACITY = 32; // reserved bit-slots per length for off-dictionary words
+// Reserved bit-slots per length for off-dictionary words: the author's own entries, plus
+// the OneLook supplement (src/utils/onelook.js) when the corpus alone can't fill a grid.
+// Was 32 before the supplement existed; 128 costs three extra u32 per bitset row.
+export const ADHOC_CAPACITY = 128;
 
 const A_CODE = 65;
 
@@ -115,8 +118,11 @@ export function buildWordIndex(entries, { fingerprint = '', presorted = false } 
  * out-of-dictionary slot string) into the reserved tail. Returns its index, or -1 if the
  * tail is full — which preflight reports as TOO_MANY_CUSTOM_WORDS rather than silently
  * dropping the user's word.
+ *
+ * `score` defaults to the top of the scale, which is right for the author's words. A
+ * OneLook supplement passes 0 so it ranks below every corpus answer.
  */
-export function addAdHocWord(index, word) {
+export function addAdHocWord(index, word, score = 65535) {
   const len = word.length;
   if (len < MIN_WORD_LEN || len > MAX_WORD_LEN) return -1;
   let li = index.byLen[len];
@@ -131,7 +137,7 @@ export function addAdHocWord(index, word) {
   const idx = li.count + li.extra;
   li.extra++;
   // Score 65535 so a required word is always among the first candidates tried.
-  writeWord(li, idx, word, 65535, 0, 128);
+  writeWord(li, idx, word, score, 0, 128);
   index.lookup[len].set(word, idx);
   return idx;
 }

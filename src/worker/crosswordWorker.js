@@ -21,8 +21,10 @@ import {
   decodeCorpus, buildWordIndex, entriesFromRows, fingerprintOf,
 } from '../utils/wordIndex.js';
 import { randomSeed } from '../utils/rng.js';
+import { planQueries, fetchSupplements, supplementList } from '../utils/onelook.js';
 
 let cancelled = false;
+let runId = 0; // a OneLook fetch awaits, so a newer 'start' can overtake it
 let cached = null; // { fingerprint, index, clueStore, rowIndex, quantiles, clueQuantiles }
 
 // The 0..1 difficulty scale is absolute, but it is not uniformly populated: in the
@@ -43,6 +45,13 @@ let cached = null; // { fingerprint, index, clueStore, rowIndex, quantiles, clue
 // (sd 0.124 vs 0.143). Feeding the answer-scale target to assignClues (what this file used
 // to do) squeezed the request: "easy" asked for the 16th clue percentile instead of the
 // 10th, "fair" for the 37th instead of the 30th.
+// Failures a wider word list can fix. Not REQUIRED_WORD_*, DUPLICATE_PRESET_WORD and the
+// like: those are about the author's words, and more answers change nothing.
+const ONELOOK_RETRY = new Set([
+  'SLOT_EMPTY_AFTER_AC', 'CELL_NO_LETTER', 'NO_SOLUTION', 'TIMEOUT',
+  'INSUFFICIENT_WORDS_FOR_LENGTH',
+]);
+
 const quantilesOf = (entries) => quantilesFromValues(entries.map((e) => (e.diff || 0) / 255));
 
 async function loadFromUrl(url) {
@@ -136,6 +145,8 @@ self.onmessage = async (e) => {
   if (msg.type !== 'start') return;
 
   cancelled = false;
+  const myRun = ++runId;
+  const stale = () => cancelled || myRun !== runId;
   const p = msg.payload || {};
 
   if (!cached || (p.corpusFingerprint && p.corpusFingerprint !== cached.fingerprint)) {
@@ -145,7 +156,7 @@ self.onmessage = async (e) => {
 
   try {
     const seed = p.seed != null ? p.seed : randomSeed();
-    const result = solveCrossword({
+    const solve = (supplementWords) => solveCrossword({
       index: cached.index,
       layout: p.layout,
       presetGrid: p.presetGrid,
@@ -161,7 +172,32 @@ self.onmessage = async (e) => {
       onBest: (best) => self.postMessage({ type: 'best', result: best }),
       now: () => performance.now(),
       isCancelled: () => cancelled,
+      supplementWords,
     });
+
+    // The corpus alone, always first. OneLook is only asked once that has failed, and
+    // only for the slots that ran dry -- see src/utils/onelook.js.
+    let result = solve([]);
+    let supplements = null;
+    if (!result.complete && p.onelook !== false && cached.clueStore && !stale()
+        && ONELOOK_RETRY.has(result.error?.code)) {
+      const patterns = planQueries({
+        index: cached.index, layout: p.layout, presetGrid: p.presetGrid, failed: result,
+      });
+      if (patterns.length) {
+        self.postMessage({ type: 'progress',
+          text: `The word list can't fill this grid. Asking OneLook about ${patterns.length} `
+            + `${patterns.length === 1 ? 'entry' : 'entries'}...` });
+        supplements = await fetchSupplements(patterns, { index: cached.index, isCancelled: stale });
+        if (myRun !== runId) return; // overtaken; that run reports, not this one
+        if (supplements.size && !cancelled) {
+          self.postMessage({ type: 'progress',
+            text: `Retrying with ${supplements.size} OneLook ${supplements.size === 1 ? 'word' : 'words'}...` });
+          const retry = solve(supplementList(supplements));
+          if (retry.complete || retry.placements.length > result.placements.length) result = retry;
+        }
+      }
+    }
 
     // Clues are chosen after the fill, so selection can weigh difficulty and variety
     // instead of always taking a word's oldest clue.
@@ -175,6 +211,20 @@ self.onmessage = async (e) => {
       rng: (() => { let s = (seed ^ 0x9e3779b9) >>> 0;
         return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; })(),
     });
+
+    // A OneLook answer has no corpus clue, so it is clued from its definition, and the
+    // placement says where that came from so the author knows to look at it.
+    if (supplements?.size) {
+      const used = [];
+      result.placements = result.placements.map((pl) => {
+        const s = supplements.get(pl.word);
+        if (!s) return pl;
+        used.push(pl.word);
+        return pl.clue ? { ...pl, clueSource: 'onelook' }
+          : { ...pl, clue: s.clue, clueSource: 'onelook' };
+      });
+      result.onelook = { offered: supplements.size, used };
+    }
 
     // ---- what the puzzle ACTUALLY came out as -------------------------------
     //

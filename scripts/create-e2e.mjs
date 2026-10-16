@@ -366,6 +366,37 @@ try {
     bad('Unpin all releases every square', `no clickable control — ${JSON.stringify(probe)}`);
   }
 
+  // ---------- OneLook, the last resort ----------
+  // KLOT_ has no 5-letter answer in the corpus, so the corpus-only fill fails and the
+  // worker asks OneLook, which offers KLOTZ. Row 1 of Classic 15x15 opens with a 5-letter
+  // across entry; row 0 has 12 white squares, so its first square is non-block #12.
+  // Live network: a machine that can't reach onelook.com gets a SKIP line, not a pass.
+  await clickByLabel('clear letters');
+  await sleep(2200);
+  await clickCell(12);
+  for (const ch of 'klot') await key(ch);
+  const onelookUp = await page.evaluate(`fetch('https://www.onelook.com/api/words?sp=cat&max=1&ck=e2eprobe' + Date.now()).then(r => r.ok, () => false)`);
+  if (!onelookUp) console.log('  SKIP  OneLook unreachable; last-resort fill not checked');
+  else if (await clickByLabel('fill remaining')) {
+    let text = '';
+    for (let i = 0; i < 80; i++) {
+      text = await page.evaluate(`document.body.innerText || ''`);
+      if (/came from OneLook/.test(text) || /can't be filled|No complete fill|Couldn't fill/i.test(text)) break;
+      await sleep(400);
+    }
+    const row1 = await page.evaluate(`(() => {
+      const cells = [...document.querySelectorAll('.xw-cell')].slice(15, 20);
+      return cells.map(d => d.querySelector('.xw-letter')?.textContent || '').join('');
+    })()`);
+    if (row1 === 'KLOTZ') ok('a slot the corpus cannot fill took KLOTZ from OneLook');
+    else bad('a slot the corpus cannot fill took KLOTZ from OneLook', `row 1 reads "${row1}"`);
+    if (/came from OneLook[^.]*KLOTZ/.test(text)) ok('the author is told which answers came from OneLook');
+    else bad('the author is told which answers came from OneLook', text.match(/.{0,80}(OneLook|fill).{0,80}/i)?.[0] || 'no message');
+    if (/clumsy/i.test(text)) ok('KLOTZ is clued from its OneLook definition');
+    else bad('KLOTZ is clued from its OneLook definition', 'no "clumsy" clue on the page');
+  } else bad('a slot the corpus cannot fill took KLOTZ from OneLook', 'no Fill Remaining button');
+  await sleep(2200);
+
   // ---------- 3A: generating must NOT touch Create ----------
   await sleep(2200);
   await clickCell(0);

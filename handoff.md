@@ -1,6 +1,6 @@
 # handoff.md — Krosalita, current state
 
-_Last updated 2026-10-11. Read `rules.md` first for the rules; this file covers where things stand._
+_Last updated 2026-10-17. Read `rules.md` first for the rules; this file covers where things stand._
 
 ## What this is
 
@@ -32,6 +32,46 @@ puzzles from crosswithfriends, and **play** solo or in real-time multiplayer.
 | `pipeline/` | Python corpus build (`python pipeline/build.py --stage all`) |
 | `scripts/*` | Benches and headless-Edge e2e suites (see rules.md for which to run) |
 | `docs/solver-v2-spec.md` | Solver design notes |
+
+## Done in the 2026-10-17 session
+
+### OneLook as the last-resort word source
+When a fill fails because the corpus has no answer for a slot (usually because the author's
+own letters or theme words cross it into an impossible pattern), the worker now asks
+OneLook (`https://www.onelook.com/api/words?sp=<pattern>&md=df`) and solves again.
+- **Order.** The corpus-only solve always runs first. OneLook is asked only when that
+  fails with `SLOT_EMPTY_AFTER_AC`, `CELL_NO_LETTER`, `NO_SOLUTION`, `TIMEOUT` or
+  `INSUFFICIENT_WORDS_FOR_LENGTH`. A grid the corpus can fill sends no requests at all.
+- **What gets asked** (`planQueries`): slots whose fixed letters leave fewer than 40 corpus
+  answers, plus unfilled slots in the failed run's best partial grid that have no corpus
+  answer. At most 16 patterns, 6 at a time, with a 6 s timeout each.
+- **What gets kept** (`fetchSupplements`): words not already in the corpus that fit the
+  pattern letter for letter. Phrases squeezed to the wrong length are dropped. Words must
+  have a frequency of at least 0.01 per million and a definition usable as a clue. Names,
+  surnames and "alternative form of" senses are rejected. At most 40 per pattern.
+- **Retry.** Supplements go into the index's ad-hoc tail with score 0–16000 (ranked by
+  frequency) plus a `SUPPLEMENT_PENALTY`. They only win where nothing from the corpus fits.
+  The retry is kept if it is complete or places more answers than the first run.
+- **Clues.** A supplement's clue is its first usable definition (for example, KLOTZ is
+  clued "A clumsy, awkward person"). The placement carries `clueSource: 'onelook'`. Create
+  and Generate list the OneLook answers in the status line so the author can review them.
+- **Off by:** CSV uploads and Tagalog mode (no packed clue store), `payload.onelook:
+  false`, or the network being down (the fill then fails with the corpus's own reason).
+- `ADHOC_CAPACITY` went from 32 to 128 per length to make room.
+- **CORS trap (found by the browser e2e, invisible to Node):** OneLook's CloudFront caches
+  each response together with the first requester's `Access-Control-Allow-Origin`, and
+  does not `Vary: Origin`. So for up to a week, every other site asking the same URL got
+  "Failed to fetch". Each request therefore carries `&ck=<hash of origin>`, which gives
+  this site its own cache entries (OneLook ignores the parameter; the results are
+  byte-identical). Don't name it `v`: OneLook uses that itself and returns HTTP 500. Don't
+  pass a URL-shaped value either: the firewall returns 403.
+- **Fallback:** if onelook.com fails, the same query goes to `api.datamuse.com`. Datamuse
+  is OneLook's engine, with the same scores, and handles CORS per origin. It has fewer
+  definitions (KLOTZ has none there, so it's dropped).
+
+Verification: `test-onelook` 4 scenarios (new; real worker module, live network) ·
+`bench-solver` 2760/2760 · `create-e2e` 26/26 (3 new KLOTZ checks in real Edge) ·
+`generate-e2e` 23/23 · `editor-e2e` 28/28 · `eslint` (only the 4 known issues).
 
 ## Done in the 2026-10-11 session
 
@@ -99,5 +139,9 @@ view the PNGs.
   splitting App.jsx by tab would help mobile.
 - **Template list:** `LayoutSelector` lists all 23 layouts in one scrolling menu. Grouping
   them by size would read better.
+- **OneLook toggle:** the fallback is always on for the English corpus. A settings switch
+  (and a per-clue "from OneLook" badge in the clue list, using `clueSource`) would let the
+  author opt out or spot those clues later. Today the status line is the only signal, and
+  `clueSource` is not persisted with the puzzle.
 - **Not yet live-tested:** the real crosswithfriends fetch, 2-device multiplayer and
   Supabase auth (carried over from earlier sessions).

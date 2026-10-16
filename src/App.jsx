@@ -49,6 +49,7 @@ import { formatCode, codeError } from './lib/shareCode';
 import { sfx, isSoundOn, setSoundOn, getVolume, setVolume } from './utils/sound';
 import { burstConfetti } from './utils/confetti';
 import { renderRich, plainRich } from './utils/richText';
+import { describeOnelook } from './utils/onelook';
 
 const CrosswordGenerator = () => {
   const [activeTab, setActiveTab] = useState('auto');
@@ -606,8 +607,11 @@ const CrosswordGenerator = () => {
     setHighlightMissingRequired(true);
     
     if (complete) {
-      setProgress('Filled all remaining slots!');
-      setTimeout(() => setProgress(''), 3000);
+      // A OneLook answer is a last resort with a dictionary-definition clue: say which
+      // ones, and leave the line up long enough to read the list.
+      const fromOnelook = describeOnelook(picked?.onelook);
+      setProgress(fromOnelook ? `Filled all remaining slots. ${fromOnelook}` : 'Filled all remaining slots!');
+      setTimeout(() => setProgress(''), fromOnelook ? 15000 : 3000);
       setFailedWord(null);
     } else {
       const slots = findSlots(layout);
@@ -1027,17 +1031,18 @@ const CrosswordGenerator = () => {
       // Easy round-trips on every small and mid grid, and lands at the bottom of Fair on
       // Standard 15x15 (21) and Sunday 21x21 (26).
       const rep = result.difficultyReport;
+      const fromOnelook = describeOnelook(result.onelook);
       if (rep && rep.onTarget === false && rep.requestedPercentile != null) {
         const wanted = difficultyLabelFromScore(rep.requestedPercentile / 100);
         const got = difficultyLabelFromScore(rep.achievedPercentile / 100);
         setProgress(`Filled all ${slots.length} slots — but this grid could not reach ${wanted}. `
           + `The closest it gets is ${got} (${rep.achievedPercentile} of 100): there are not enough `
           + `${wanted.toLowerCase()} clues in the word list for ${slots.length} answers. `
-          + `A smaller grid can go easier.`);
-        setTimeout(() => setProgress(''), 12000);
+          + `A smaller grid can go easier.${fromOnelook ? ` ${fromOnelook}` : ''}`);
+        setTimeout(() => setProgress(''), fromOnelook ? 18000 : 12000);
       } else {
-        setProgress(`Success! All ${slots.length} slots filled.`);
-        setTimeout(() => setProgress(''), 5000);
+        setProgress(`Success! All ${slots.length} slots filled.${fromOnelook ? ` ${fromOnelook}` : ''}`);
+        setTimeout(() => setProgress(''), fromOnelook ? 15000 : 5000);
       }
       setFailedWord(null);
     } else if (newGrid) {

@@ -39,6 +39,7 @@ Read this before changing anything. Read `handoff.md` for where the project stan
 | Layout / responsive UI | `node scripts/responsive-e2e.mjs` |
 | PDF export | `npm run test:pdf`, then rasterise and *look* at a page (see handoff.md) |
 | Clue scoring features | `node scripts/test-clue-score.mjs` |
+| OneLook last-resort fill (`src/utils/onelook.js`, the worker's retry) | `node scripts/test-onelook.mjs` (live network; drives the real worker module) |
 | Multiplayer | `npm run build && node scripts/mp-e2e.mjs` (needs Supabase env) |
 | Always | `npx eslint src scripts api` (not `eslint .`, which walks the Python `venv/`). Known pre-existing: 2 `set-state-in-effect` errors in LayoutEditorModal/RequiredWordsModal and 2 exhaustive-deps warnings in App.jsx |
 
@@ -63,6 +64,14 @@ output; never describe an unrun gate as passing.
   `s5_fit → s6_score → s7_pack` and re-check that the bands still separate.
 - The solver's measured difficulty is handed to the display through `solverDiffRef`, keyed
   by grid signature. A fill path that skips it gets re-labelled from clue text alone.
+- **OneLook is the last resort, never a peer of the corpus.** The worker always solves with
+  the corpus alone first. Only a fill that fails with a code a wider word list can fix
+  (`ONELOOK_RETRY` in the worker) asks onelook.com, and only about the slots that ran
+  dry. The retry still ranks those words under every corpus answer (`SUPPLEMENT_PENALTY`).
+  `test-onelook.mjs` gates "a fillable grid makes zero OneLook requests". Keep it that way.
+- Off-dictionary words (the author's own and OneLook's) share `ADHOC_CAPACITY` (128 per
+  length) in the index tail. The author's words are added first, so a supplement can never
+  take their room.
 
 **Create editor**
 - The black squares live in `manualGrid` itself (`'#'`). `manualLayout` is *derived* from
@@ -107,3 +116,7 @@ output; never describe an unrun gate as passing.
 - Clue text is third-party data. It is rendered by hand-parsed `renderRich`, never
   `dangerouslySetInnerHTML`.
 - The user's email and Supabase keys stay in `.env` / Vercel env. Never commit them.
+- A OneLook fallback sends slot patterns (e.g. `klot?`) from the browser to onelook.com
+  (and to api.datamuse.com if OneLook fails).
+  It sends patterns only, never clues or account data, and only for the packed English
+  corpus. CSV uploads and Tagalog mode never call it.

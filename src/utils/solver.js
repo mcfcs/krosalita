@@ -25,7 +25,7 @@ import {
   popcount32, ctz32, popcountRange, anyAnd,
   andCountCapped, nextSetBit, firstNonZeroWord, lastNonZeroWord,
 } from './bitset.js';
-import { addAdHocWord, resetAdHoc } from './wordIndex.js';
+import { addAdHocWord, resetAdHoc, ADHOC_CAPACITY } from './wordIndex.js';
 
 const MAXLEN = 15;
 const A_CODE = 65;
@@ -84,6 +84,10 @@ const VARIETY_GIVEUP_WORK = 900;
 // lose a near-tie, small enough that a clearly better word still wins, and never a hard
 // exclusion -- so a grid with only one possible fill still fills.
 const AVOID_PENALTY = 0.6;
+// A OneLook supplement (an answer the corpus doesn't have) is a last resort, so it loses to
+// any corpus word that keeps the crossings alive: this is more than the whole quality term.
+// It is not an exclusion. Where nothing else fits, the supplement is the only candidate.
+const SUPPLEMENT_PENALTY = 1.5;
 const LOOKAHEAD_WORDS = 32;    // u32 words scanned when sizing a crossing domain
 const LOOKAHEAD_CAP = 64;      // enough resolution for ordering; more is wasted work
 // Skip an arc whose allowed-letter set is this wide: it prunes little for its cost.
@@ -146,6 +150,10 @@ export function solveCrossword(opts) {
     // Answers to steer away from -- pass the previous fill's words so a Regenerate press
     // cannot hand back the same grid. A soft bias, never a constraint.
     avoidWords = [],
+    // Off-dictionary answers to fall back on (OneLook, fetched by the worker after a
+    // corpus-only fill failed). Ranked below every corpus word, and dropped quietly once
+    // the reserved tail is full, since unlike the author's words they are optional.
+    supplementWords = [],
     varietyWindow = VARIETY_WINDOW,
     varietyJitter = VARIETY_JITTER,
     varietyBacktracks = VARIETY_BACKTRACKS,
@@ -282,7 +290,7 @@ export function solveCrossword(opts) {
       if (addAdHocWord(index, w) < 0) {
         cleanup();
         return fail(err('TOO_MANY_CUSTOM_WORDS',
-          `At most 32 custom ${w.length}-letter words are supported per puzzle.`, { word: w }));
+          `At most ${ADHOC_CAPACITY} custom ${w.length}-letter words are supported per puzzle.`, { word: w }));
       }
     }
   }
@@ -307,7 +315,7 @@ export function solveCrossword(opts) {
         if (addAdHocWord(index, str) < 0) {
           cleanup();
           return fail(err('TOO_MANY_CUSTOM_WORDS',
-            `At most 32 custom ${str.length}-letter words are supported per puzzle.`,
+            `At most ${ADHOC_CAPACITY} custom ${str.length}-letter words are supported per puzzle.`,
             { word: str }));
         }
       }
@@ -325,6 +333,21 @@ export function solveCrossword(opts) {
       }
       seen.set(w, s);
     }
+  }
+
+  // Supplements go in AFTER the author's words, so they can never take the reserved room
+  // a required or typed entry needed.
+  const supplementIdx = new Map();
+  for (const raw of supplementWords) {
+    // A bare string, or { word, score } to rank supplements among themselves.
+    const w = String((raw && raw.word) || raw || '').toUpperCase();
+    if (!/^[A-Z]+$/.test(w) || w.length < 3 || w.length > MAXLEN) continue;
+    if (index.lookup[w.length]?.get(w) !== undefined) continue; // corpus or author's word
+    const wi = addAdHocWord(index, w, Math.max(0, Math.min(65535, (raw && raw.score) | 0)));
+    if (wi < 0) continue;
+    let set = supplementIdx.get(w.length);
+    if (!set) supplementIdx.set(w.length, (set = new Set()));
+    set.add(wi);
   }
 
   // ---- preflight: length availability ------------------------------------
@@ -908,6 +931,7 @@ export function solveCrossword(opts) {
     const target = residualDiffTarget();
     const reqSet = requiredIdx.get(len);
     const avoidSet = avoidIdx.get(len);
+    const suppSet = supplementIdx.get(len);
     const jitter = varietyJitter * vs;
     let n = 0;
     for (let ci = 0; ci < nc; ci++) {
@@ -936,6 +960,7 @@ export function solveCrossword(opts) {
       let q = suppAvg + qualityWeight * (li.score[w] / 65535);
       if (jitter > 0) q += jitter * (rng() * 2 - 1);
       if (avoidSet !== undefined && avoidSet.has(w)) q -= AVOID_PENALTY;
+      if (suppSet !== undefined && suppSet.has(w)) q -= SUPPLEMENT_PENALTY;
       if (reqSet && reqSet.has(w) && !usedRequired.has(reqKey(len, w))) q += 1000;
       if (target != null) q -= difficultyWeight * Math.abs(li.diff[w] / 255 - target);
       // insertion sort, descending
