@@ -1440,7 +1440,10 @@ export function solveCrossword(opts) {
         const c = ac.cell % cols;
         const a = cellSlot[ac.cell * 2];
         const b = cellSlot[ac.cell * 2 + 1];
-        const names = [a, b].filter((x) => x >= 0).map(slotName).join(' and ');
+        // With the letters each entry is held to, so the author can see WHY: "84-Across
+        // (_O_P) and 80-Down (S__T_O)" says which of their own letters to move.
+        const names = [a, b].filter((x) => x >= 0)
+          .map((x) => `${slotName(x)} (${patternOf(x)})`).join(' and ');
         preflightError = err('CELL_NO_LETTER',
           `No letter works for both ${names} at row ${r + 1}, column ${c + 1}.`,
           { row: r, col: c });

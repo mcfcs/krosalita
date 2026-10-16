@@ -82,11 +82,20 @@ export function planQueries({ index, layout, presetGrid, failed }) {
   const want = new Map(); // pattern -> corpus matches (lower = more urgent)
   const add = (p, n) => { if (!want.has(p) || want.get(p) > n) want.set(p, n); };
 
+  // A CELL_NO_LETTER names the square where two entries collide. Both are asked about
+  // whatever their corpus count: a roomy _O_P can still be the side that needs a new
+  // letter in that square.
+  const conflict = failed?.error?.code === 'CELL_NO_LETTER' ? failed.error.detail : null;
+  const throughConflict = (s) => conflict && (s.direction === 'across'
+    ? s.row === conflict.row && conflict.col >= s.col && conflict.col < s.col + s.length
+    : s.col === conflict.col && conflict.row >= s.row && conflict.row < s.row + s.length);
+
   for (const slot of slots) {
     const fixed = slotPattern(slot, presetGrid);
     if (hasLetter(fixed) && hasBlank(fixed)) {
       const n = countMatches(index, fixed);
-      if (n < THIN_DOMAIN) add(fixed, n);
+      if (throughConflict(slot)) add(fixed, -1);
+      else if (n < THIN_DOMAIN) add(fixed, n);
     }
     if (!failed?.grid || placed.has(`${slot.direction}-${slot.row}-${slot.col}`)) continue;
     const partial = slotPattern(slot, failed.grid);

@@ -152,6 +152,33 @@ for (const sc of STARVED) {
 
 function m2ok(m) { return m.type === 'done' && !!m.result.complete; }
 
+// ---- 2b. an owner's theme-heavy 18x18 that NOTHING can fill ----------------------
+// OneLook clears the first collision (89-Across/90-Down) and exposes a second, 84-Across
+// _O_P against 80-Down S__T_O, which no word anywhere satisfies. The failure must name the
+// collision still standing, with its letters, and say OneLook was asked. It used to show
+// the first, already-cleared collision with no mention of OneLook at all.
+console.log('\n2b. theme-heavy 18x18 with an impossible corner');
+if (!online) console.log('   SKIP  no network');
+else {
+  const G = [
+    'CHLOE#KHAN#DIAMOND', '.....#....#.......', '.....#....#.......', '......#....#......',
+    '....#.......#.....', '#IMMORTALDAYS#...#', '###....###....#..M', 'R..#ERNEST#......A',
+    'U...#......##....N', 'B....##......#...G', 'I......#COLLAB#..A', 'K..#....###....###',
+    '#...#LEZHINCOMICS#', '.....#.......#.O.P', '......#....#...S.H', '.......#....#ISITI',
+    '.......#....#..N.L', 'MATILDA#LILY#MYEOL'];
+  const layout = G.map((r) => r.replace(/[A-Z]/g, '.'));
+  const preset = G.map((r) => [...r].map((c) => (c === '#' ? '#' : c === '.' ? null : c)));
+  onelookCalls = 0;
+  const m = await solve({ layout, presetGrid: preset });
+  const msg = m.result?.error?.message || '';
+  check(!m.result?.complete && onelookCalls > 0, `fails after asking OneLook (${onelookCalls} requests)`);
+  // 80-Down S__T_O is the dead entry: SENTTO, STETHO and SCOTTO are all there is, and each
+  // puts a letter on 84-Across _O_P that nothing takes. Which crossing gets named depends on
+  // propagation order, so assert on 80-Down rather than on one particular pair.
+  check(/80-Down \(S._T_O\)/.test(msg), `names the collision still standing: ${msg.slice(0, 100)}`);
+  check(/OneLook was asked too/.test(msg) && !/90-Down/.test(msg), 'says OneLook was tried, not the cleared collision');
+}
+
 // ---- 3. onelook.com down: Datamuse stands in --------------------------------------
 console.log('\n3. onelook.com unreachable, Datamuse up');
 if (!online) console.log('   SKIP  no network');

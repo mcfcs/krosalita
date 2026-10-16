@@ -47,6 +47,7 @@ let cached = null; // { fingerprint, index, clueStore, rowIndex, quantiles, clue
 // 10th, "fair" for the 37th instead of the 30th.
 // Failures a wider word list can fix. Not REQUIRED_WORD_*, DUPLICATE_PRESET_WORD and the
 // like: those are about the author's words, and more answers change nothing.
+const ONELOOK_ROUNDS = 3;
 const ONELOOK_RETRY = new Set([
   'SLOT_EMPTY_AFTER_AC', 'CELL_NO_LETTER', 'NO_SOLUTION', 'TIMEOUT',
   'INSUFFICIENT_WORDS_FOR_LENGTH',
@@ -178,25 +179,46 @@ self.onmessage = async (e) => {
     // The corpus alone, always first. OneLook is only asked once that has failed, and
     // only for the slots that ran dry -- see src/utils/onelook.js.
     let result = solve([]);
-    let supplements = null;
-    if (!result.complete && p.onelook !== false && cached.clueStore && !stale()
-        && ONELOOK_RETRY.has(result.error?.code)) {
+    // Rounds, not one shot: fixing one collision with OneLook words can expose the next
+    // (a theme-heavy 18x18 cleared 89-Across/90-Down only to stop at 84-Across/80-Down),
+    // and that one needs its own patterns asked about.
+    const supplements = new Map();
+    const asked = new Set();
+    let last = result;
+    for (let round = 0; round < ONELOOK_ROUNDS; round++) {
+      if (last.complete || p.onelook === false || !cached.clueStore || stale()
+          || !ONELOOK_RETRY.has(last.error?.code)) break;
       const patterns = planQueries({
-        index: cached.index, layout: p.layout, presetGrid: p.presetGrid, failed: result,
-      });
-      if (patterns.length) {
-        self.postMessage({ type: 'progress',
-          text: `The word list can't fill this grid. Asking OneLook about ${patterns.length} `
-            + `${patterns.length === 1 ? 'entry' : 'entries'}...` });
-        supplements = await fetchSupplements(patterns, { index: cached.index, isCancelled: stale });
-        if (myRun !== runId) return; // overtaken; that run reports, not this one
-        if (supplements.size && !cancelled) {
-          self.postMessage({ type: 'progress',
-            text: `Retrying with ${supplements.size} OneLook ${supplements.size === 1 ? 'word' : 'words'}...` });
-          const retry = solve(supplementList(supplements));
-          if (retry.complete || retry.placements.length > result.placements.length) result = retry;
-        }
-      }
+        index: cached.index, layout: p.layout, presetGrid: p.presetGrid, failed: last,
+      }).filter((q) => !asked.has(q));
+      if (!patterns.length) break;
+      patterns.forEach((q) => asked.add(q));
+      self.postMessage({ type: 'progress',
+        text: `The word list can't fill this grid. Asking OneLook about ${patterns.length} `
+          + `${patterns.length === 1 ? 'entry' : 'entries'}...` });
+      const got = await fetchSupplements(patterns, { index: cached.index, isCancelled: stale });
+      if (myRun !== runId) return; // overtaken; that run reports, not this one
+      if (cancelled) break;
+      let added = 0;
+      for (const [w, s] of got) if (!supplements.has(w)) { supplements.set(w, s); added++; }
+      if (!added) break;
+      self.postMessage({ type: 'progress',
+        text: `Retrying with ${supplements.size} OneLook ${supplements.size === 1 ? 'word' : 'words'}...` });
+      last = solve(supplementList(supplements));
+      // On a tie the newer run wins: its blocker is the one still standing. Showing the
+      // first run's error after OneLook had already cleared it sent the author to fix a
+      // square that was no longer the problem.
+      if (last.complete || last.placements.length >= result.placements.length) result = last;
+    }
+    if (asked.size && !result.complete && result.error) {
+      result.error = {
+        ...result.error,
+        message: `${result.error.message} OneLook was asked too (${asked.size} `
+          + `${asked.size === 1 ? 'pattern' : 'patterns'}, ${supplements.size} extra `
+          + `${supplements.size === 1 ? 'word' : 'words'}) and has nothing that fits here either`
+          + (result.error.code === 'CELL_NO_LETTER' || result.error.code === 'SLOT_EMPTY_AFTER_AC'
+            ? ', so one of the letters already in those entries has to change.' : '.'),
+      };
     }
 
     // Clues are chosen after the fill, so selection can weigh difficulty and variety

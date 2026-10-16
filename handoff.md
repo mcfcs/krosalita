@@ -65,6 +65,13 @@ OneLook (`https://www.onelook.com/api/words?sp=<pattern>&md=df`) and solves agai
   this site its own cache entries (OneLook ignores the parameter; the results are
   byte-identical). Don't name it `v`: OneLook uses that itself and returns HTTP 500. Don't
   pass a URL-shaped value either: the firewall returns 403.
+- **Rounds:** up to 3. Clearing one collision with OneLook words can expose the next, so each
+  retry's failure is planned again, and only new patterns are asked about. A CELL_NO_LETTER
+  always asks about both entries through that square, whatever their corpus count. On a tie,
+  the newest run's error is shown, because it is the blocker still standing. A fill that
+  still fails says "OneLook was asked too" and shows each entry's letters, e.g. "84-Across
+  (_O_P) and 80-Down (S__T_O)". Before this, the owner saw a collision OneLook had already
+  cleared, with no sign OneLook had run.
 - **Fallback:** if onelook.com fails, the same query goes to `api.datamuse.com`. Datamuse
   is OneLook's engine, with the same scores, and handles CORS per origin. It has fewer
   definitions (KLOTZ has none there, so it's dropped).
